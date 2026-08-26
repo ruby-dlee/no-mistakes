@@ -27,10 +27,11 @@ import (
 )
 
 const (
-	RequestSchema  = "no-mistakes.firstmate-worker-request/v1"
-	ResultSchema   = "no-mistakes.firstmate-worker-result/v1"
-	maxInputBytes  = 1 << 20
-	maxResultBytes = 1 << 20
+	RequestSchema       = "no-mistakes.firstmate-worker-request/v1"
+	ResultSchema        = "no-mistakes.firstmate-worker-result/v1"
+	maxInputBytes       = 1 << 20
+	maxResultBytes      = 1 << 20
+	maxStepOutcomeBytes = 1 << 20
 )
 
 var ErrDisabled = errors.New("Azure worker transport is disabled")
@@ -83,6 +84,7 @@ type ResultEnvelope struct {
 	OutputHeadSHA      string             `json:"output_head_sha"`
 	ReturnRef          string             `json:"return_ref,omitempty"`
 	ReturnBundleSHA256 string             `json:"return_bundle_sha256,omitempty"`
+	StepOutcomeSHA256  string             `json:"step_outcome_sha256,omitempty"`
 	ErrorCategory      string             `json:"error_category,omitempty"`
 	Retryable          bool               `json:"retryable,omitempty"`
 }
@@ -92,6 +94,7 @@ type Execution struct {
 	OutputHeadSHA  string
 	ResultDigest   string
 	ReturnedBranch string
+	StepOutcome    StepOutcomeEnvelope
 }
 
 type InputProvider interface {
@@ -201,6 +204,7 @@ func (s *Service) ProcessOne(ctx context.Context, kind db.PipelineJobKind) (*Exe
 	return &Execution{
 		JobID: job.ID, OutputHeadSHA: prepared.result.OutputHeadSHA,
 		ResultDigest: prepared.resultDigest, ReturnedBranch: prepared.returnedBranch,
+		StepOutcome: prepared.stepOutcome,
 	}, nil
 }
 
@@ -250,6 +254,7 @@ type preparedResult struct {
 	result         ResultEnvelope
 	resultDigest   string
 	returnedBranch string
+	stepOutcome    StepOutcomeEnvelope
 	remoteFailure  *transportFailure
 	rollbackFunc   func()
 }
@@ -322,7 +327,8 @@ func (s *Service) executeClaimed(ctx context.Context, job *db.PipelineJob) (*pre
 	}
 	resultPath := filepath.Join(stage, "result.json")
 	outcomePath := filepath.Join(stage, "outcome.bundle")
-	if err := s.runWrapper(ctx, stage, requestPath, payload, resultPath, outcomePath); err != nil {
+	stepOutcomePath := filepath.Join(stage, "step-outcome.json")
+	if err := s.runWrapper(ctx, stage, requestPath, payload, resultPath, outcomePath, stepOutcomePath); err != nil {
 		if ctx.Err() != nil {
 			return nil, failureError("wrapper_timeout", true, ctx.Err())
 		}
@@ -341,7 +347,7 @@ func (s *Service) executeClaimed(ctx context.Context, job *db.PipelineJob) (*pre
 	}
 	prepared := &preparedResult{result: result, resultDigest: digestBytes(resultBytes)}
 	if result.Outcome == "failed" {
-		if !validCategory(result.ErrorCategory) || result.OutputHeadSHA != "" || result.ReturnRef != "" || result.ReturnBundleSHA256 != "" {
+		if !validCategory(result.ErrorCategory) || result.OutputHeadSHA != "" || result.ReturnRef != "" || result.ReturnBundleSHA256 != "" || result.StepOutcomeSHA256 != "" {
 			return nil, failureError("malformed_result", false, errors.New("worker failure result has invalid metadata"))
 		}
 		prepared.remoteFailure = &transportFailure{category: result.ErrorCategory, retryable: result.Retryable}
@@ -350,6 +356,18 @@ func (s *Service) executeClaimed(ctx context.Context, job *db.PipelineJob) (*pre
 	if result.Outcome != "succeeded" || result.ErrorCategory != "" || result.Retryable {
 		return nil, failureError("malformed_result", false, errors.New("worker result outcome is invalid"))
 	}
+	stepOutcomeBytes, err := readRegularBounded(stepOutcomePath, maxStepOutcomeBytes)
+	if err != nil {
+		return nil, failureError("malformed_result", false, fmt.Errorf("read worker step outcome: %w", err))
+	}
+	if result.StepOutcomeSHA256 == "" || digestBytes(stepOutcomeBytes) != result.StepOutcomeSHA256 {
+		return nil, failureError("malformed_result", false, errors.New("worker step outcome digest mismatch"))
+	}
+	stepOutcome, err := decodeStepOutcome(stepOutcomeBytes, job.Kind, result.OutputHeadSHA)
+	if err != nil {
+		return nil, failureError("malformed_result", false, fmt.Errorf("decode worker step outcome: %w", err))
+	}
+	prepared.stepOutcome = stepOutcome
 	if job.Kind != db.PipelineJobRepair {
 		if result.OutputHeadSHA != job.DesiredHeadSHA || result.ReturnRef != "" || result.ReturnBundleSHA256 != "" {
 			return nil, failureError("stale_result", false, errors.New("read-only worker changed the exact head"))
@@ -378,7 +396,7 @@ func requestFor(job *db.PipelineJob, owner, bundleDigest string, bundleSize int6
 	}
 }
 
-func (s *Service) runWrapper(ctx context.Context, dir, request, payload, result, outcome string) error {
+func (s *Service) runWrapper(ctx context.Context, dir, request, payload, result, outcome, stepOutcome string) error {
 	// Re-check the executable trust boundary immediately before every dispatch;
 	// startup validation alone would allow a later path replacement.
 	if err := validateTrustedFile(s.cfg.RunnerPath, true, false); err != nil {
@@ -391,6 +409,7 @@ func (s *Service) runWrapper(ctx context.Context, dir, request, payload, result,
 		"--config", s.cfg.ConfigPath, "execute",
 		"--request", request, "--payload", payload,
 		"--result", result, "--outcome", outcome,
+		"--step-outcome", stepOutcome,
 	)
 	cmd.Dir = dir
 	home := filepath.Join(dir, "home")

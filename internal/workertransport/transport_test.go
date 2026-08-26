@@ -113,9 +113,25 @@ func TestAzureWorkerTransportReviewSuccess(t *testing.T) {
 	if result == nil || result.JobID != fixture.job.ID || result.OutputHeadSHA != fixture.job.DesiredHeadSHA || result.ReturnedBranch != "" {
 		t.Fatalf("result = %+v", result)
 	}
+	if result.StepOutcome.Schema != StepOutcomeSchema || result.StepOutcome.Step != StepOutcomeReview ||
+		result.StepOutcome.ReviewApprovedHeadSHA != fixture.job.DesiredHeadSHA {
+		t.Fatalf("step outcome = %+v", result.StepOutcome)
+	}
 	stored, err := fixture.database.GetPipelineJob(fixture.job.ID)
 	if err != nil || stored.Status != db.PipelineJobCompleted || stored.ResultDigest == nil {
 		t.Fatalf("stored job = %+v, err %v", stored, err)
+	}
+}
+
+func TestAzureWorkerTransportPreservesBlockingReviewFindings(t *testing.T) {
+	fixture := newTransportFixture(t, db.PipelineJobReview, 2, fakeWrapperConfig{Mode: "findings"})
+	result, err := fixture.service(t, 5*time.Second, 200*time.Millisecond, 3*time.Second).ProcessOne(context.Background(), db.PipelineJobReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.StepOutcome.NeedsApproval || !result.StepOutcome.AutoFixable ||
+		!strings.Contains(result.StepOutcome.FindingsJSON, "remote blocker") {
+		t.Fatalf("remote blocking finding was collapsed: %+v", result.StepOutcome)
 	}
 }
 
@@ -290,6 +306,32 @@ func TestFakeFirstmateWrapperProcess(t *testing.T) {
 		result.ReturnRef = control.ReturnRef
 		result.ReturnBundleSHA256 = hex.EncodeToString(sum[:])
 	}
+	step := StepOutcomeReview
+	if request.Kind == db.PipelineJobTest {
+		step = StepOutcomeTest
+	}
+	stepOutcome := StepOutcomeEnvelope{
+		Schema: StepOutcomeSchema, Step: step,
+		ReviewApprovedHeadSHA: result.OutputHeadSHA,
+	}
+	if step == StepOutcomeTest {
+		stepOutcome.ReviewApprovedHeadSHA = ""
+	}
+	if control.Mode == "findings" {
+		stepOutcome.NeedsApproval = true
+		stepOutcome.AutoFixable = true
+		stepOutcome.FindingsJSON = `{"findings":[{"severity":"error","description":"remote blocker","action":"auto-fix"}],"summary":"1 issue"}`
+	}
+	stepOutcomeBytes, err := json.Marshal(stepOutcome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stepOutcomeBytes = append(stepOutcomeBytes, '\n')
+	if err := os.WriteFile(value("--step-outcome"), stepOutcomeBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stepOutcomeDigest := sha256.Sum256(stepOutcomeBytes)
+	result.StepOutcomeSHA256 = hex.EncodeToString(stepOutcomeDigest[:])
 	writeJSONTest(t, resultPath, result, 0o600)
 }
 
