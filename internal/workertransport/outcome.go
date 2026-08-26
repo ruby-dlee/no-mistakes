@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-
-	"github.com/kunchenguid/no-mistakes/internal/db"
 )
 
 const (
@@ -41,7 +39,7 @@ type StepOutcomeEnvelope struct {
 	SkipRemaining         bool            `json:"skip_remaining"`
 }
 
-func decodeStepOutcome(data []byte, kind db.PipelineJobKind, outputHead string) (StepOutcomeEnvelope, error) {
+func decodeStepOutcome(data []byte, wantStep StepOutcomeStep, outputHead string) (StepOutcomeEnvelope, error) {
 	var outcome StepOutcomeEnvelope
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -54,9 +52,8 @@ func decodeStepOutcome(data []byte, kind db.PipelineJobKind, outputHead string) 
 	if outcome.Schema != StepOutcomeSchema {
 		return outcome, fmt.Errorf("worker step outcome schema is %q", outcome.Schema)
 	}
-	wantStep := StepOutcomeReview
-	if kind == db.PipelineJobTest {
-		wantStep = StepOutcomeTest
+	if wantStep != StepOutcomeReview && wantStep != StepOutcomeTest {
+		return outcome, fmt.Errorf("unsupported worker step outcome binding %q", wantStep)
 	}
 	if outcome.Step != wantStep {
 		return outcome, fmt.Errorf("worker step outcome is for %q, want %q", outcome.Step, wantStep)

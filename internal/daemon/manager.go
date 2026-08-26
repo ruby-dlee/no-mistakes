@@ -55,6 +55,7 @@ type RunManager struct {
 	db               *db.DB
 	paths            *paths.Paths
 	steps            StepFactory
+	remoteSteps      pipeline.RemoteStepRunner
 
 	branchLocks sync.Map // repoID+"/"+branch → *sync.Mutex
 
@@ -75,6 +76,21 @@ type RunManager struct {
 	stateRevs      map[string]int64           // runID → monotonic state revision
 	completedRuns  map[string]bool            // runIDs whose goroutines have finished
 	completedOrder []string                   // insertion order for FIFO eviction
+}
+
+func (m *RunManager) SetRemoteStepRunner(runner pipeline.RemoteStepRunner) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.remoteSteps = runner
+}
+
+func (m *RunManager) configureRemoteSteps(executor *pipeline.Executor) {
+	m.mu.Lock()
+	runner := m.remoteSteps
+	m.mu.Unlock()
+	if runner != nil {
+		executor.SetRemoteStepRunner(runner)
+	}
 }
 
 // maxSubscribersPerRun bounds the global mailbox footprint: queued bytes can
@@ -379,6 +395,7 @@ func (m *RunManager) resumeRecoveredRunArmed(plan recoveredRunPlan, expectedOwne
 		return fmt.Errorf("daemon is shutting down")
 	}
 	executor := pipeline.NewExecutor(m.db, m.paths, plan.cfg, plan.agent, plan.steps, m.broadcast)
+	m.configureRemoteSteps(executor)
 	if expectedOwnerHead != "" {
 		if err := executor.ArmOwnerDecisionHistory(plan.run.ID, expectedOwnerHead); err != nil {
 			return fmt.Errorf("arm protected recovered run: %w", err)
@@ -1197,6 +1214,7 @@ func (m *RunManager) startRunWithIntentSourceAndOwnerDecision(ctx context.Contex
 
 	// Create executor with event broadcast.
 	executor := pipeline.NewExecutor(m.db, m.paths, cfg, ag, execSteps, m.broadcast)
+	m.configureRemoteSteps(executor)
 	if ownerConfig != nil {
 		if err := executor.ArmOwnerDecisionHistory(run.ID, ownerConfig.ExpectedHead); err != nil {
 			_ = ag.Close()

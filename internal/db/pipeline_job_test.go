@@ -616,6 +616,30 @@ func TestActivePipelineWorkerLeasesIgnoreStaleRunsAndCIWaits(t *testing.T) {
 	}
 }
 
+func TestTerminalRunCannotClaimOrRetainExternalWorkerCapacity(t *testing.T) {
+	database := openTestDB(t)
+	fixture := newPipelineJobFixture(t, database, false)
+	job, _, err := database.EnqueuePipelineJob(fixture.spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatus(fixture.run.ID, types.RunFailed); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := database.ClaimPipelineJob(PipelineJobReview, "worker", time.Now(), time.Minute)
+	if err != nil || claimed != nil {
+		t.Fatalf("terminal run job claimed = %+v, err %v", claimed, err)
+	}
+	stored, err := database.GetPipelineJob(job.ID)
+	if err != nil || stored.Status != PipelineJobQueued {
+		t.Fatalf("terminal run job = %+v, err %v", stored, err)
+	}
+	active, err := database.ActivePipelineWorkerLeases(time.Now())
+	if err != nil || len(active) != 0 {
+		t.Fatalf("terminal run consumed external capacity: %+v, err %v", active, err)
+	}
+}
+
 func TestPipelineJobSchemaStoresOnlyBoundedMetadata(t *testing.T) {
 	database := openTestDB(t)
 	allowed := map[string]map[string]bool{

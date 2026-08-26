@@ -225,6 +225,14 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, globalCfg *config.GlobalConf
 	defer agent.SetServerPIDsDir("")
 
 	mgr := NewRunManager(d, p, stepFactory)
+	azureWorkers, err := newAzureWorkerRuntime(globalCfg.AzureWorker, d, p)
+	if err != nil {
+		return fmt.Errorf("initialize Azure workers: %w", err)
+	}
+	if azureWorkers != nil {
+		mgr.SetRemoteStepRunner(azureWorkers)
+		defer azureWorkers.Close()
+	}
 
 	// Publish process identity as soon as the singleton lock is held. Startup
 	// callers can now distinguish a launched child from IPC readiness and detect
@@ -269,6 +277,9 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, globalCfg *config.GlobalConf
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if azureWorkers != nil {
+		azureWorkers.Start(ctx)
+	}
 
 	coordinatorRuntime, err := startCoordinatorRuntime(ctx, coordinatorRuntimeOptions{
 		Config: globalCfg.Coordinator, DB: d, Paths: p,

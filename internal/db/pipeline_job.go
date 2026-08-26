@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 // PipelineJobKind identifies independently scalable execution work. It is
@@ -277,13 +279,15 @@ func (d *DB) ClaimPipelineJob(kind PipelineJobKind, owner string, at time.Time, 
 		        SELECT j.id
 		          FROM pipeline_jobs j
 		          JOIN runs r ON r.id = j.run_id AND r.head_sha = j.desired_head_sha
+		                     AND r.status IN (?, ?)
 		          JOIN step_results s ON s.id = j.step_result_id AND s.run_id = j.run_id
 		         WHERE j.kind = ? AND j.status = ? AND j.attempts_started < j.max_attempts
 		         ORDER BY j.created_at, j.id
 		         LIMIT 1
 		  )
 		  RETURNING `+pipelineJobColumns,
-		PipelineJobLeased, owner, ts+leaseSeconds, ts, ts, kind, PipelineJobQueued,
+		PipelineJobLeased, owner, ts+leaseSeconds, ts, ts,
+		types.RunPending, types.RunRunning, kind, PipelineJobQueued,
 	))
 	if err == sql.ErrNoRows {
 		if err := tx.Commit(); err != nil {
@@ -328,12 +332,13 @@ func (d *DB) HeartbeatPipelineJob(heartbeat PipelineJobHeartbeat) (*PipelineJob,
 		  WHERE id = ? AND status = ? AND lease_owner = ? AND lease_fence = ?
 		    AND desired_head_sha = ? AND input_digest = ? AND owner_decision_head = ? AND desired_generation = ?
 		    AND lease_expires_at > ?
-		    AND EXISTS (SELECT 1 FROM runs r WHERE r.id = pipeline_jobs.run_id AND r.head_sha = pipeline_jobs.desired_head_sha)
+		    AND EXISTS (SELECT 1 FROM runs r WHERE r.id = pipeline_jobs.run_id AND r.head_sha = pipeline_jobs.desired_head_sha AND r.status IN (?, ?))
 		    AND EXISTS (SELECT 1 FROM step_results s WHERE s.id = pipeline_jobs.step_result_id AND s.run_id = pipeline_jobs.run_id)
 		  RETURNING `+pipelineJobColumns,
 		ts+leaseSeconds, ts, ts, heartbeat.JobID, PipelineJobLeased,
 		heartbeat.LeaseOwner, heartbeat.LeaseFence, heartbeat.DesiredHeadSHA,
 		heartbeat.InputDigest, heartbeat.OwnerDecisionHead, heartbeat.DesiredGeneration, ts,
+		types.RunPending, types.RunRunning,
 	))
 	if err == sql.ErrNoRows {
 		return nil, errors.New("heartbeat pipeline job: lease or exact binding is stale")
@@ -433,12 +438,13 @@ func (d *DB) CompletePipelineJob(completion PipelineJobCompletion) (bool, error)
 		  WHERE id = ? AND status = ? AND lease_owner = ? AND lease_fence = ?
 		    AND desired_head_sha = ? AND input_digest = ? AND owner_decision_head = ? AND desired_generation = ?
 		    AND lease_expires_at > ?
-		    AND EXISTS (SELECT 1 FROM runs r WHERE r.id = pipeline_jobs.run_id AND r.head_sha = pipeline_jobs.desired_head_sha)
+		    AND EXISTS (SELECT 1 FROM runs r WHERE r.id = pipeline_jobs.run_id AND r.head_sha = pipeline_jobs.desired_head_sha AND r.status IN (?, ?))
 		    AND EXISTS (SELECT 1 FROM step_results s WHERE s.id = pipeline_jobs.step_result_id AND s.run_id = pipeline_jobs.run_id)
 		  RETURNING `+pipelineJobColumns,
 		PipelineJobCompleted, completion.ResultDigest, completion.OutputHeadSHA, ts, ts,
 		completion.JobID, PipelineJobLeased, completion.LeaseOwner, completion.LeaseFence,
 		completion.DesiredHeadSHA, completion.InputDigest, completion.OwnerDecisionHead, completion.DesiredGeneration, ts,
+		types.RunPending, types.RunRunning,
 	))
 	if err == nil {
 		if err := d.verifyPipelineJobCanonicalBindingsTx(tx, job); err != nil {
@@ -500,12 +506,13 @@ func (d *DB) FailPipelineJob(failure PipelineJobFailure) (bool, error) {
 		  WHERE id = ? AND status = ? AND lease_owner = ? AND lease_fence = ?
 		    AND desired_head_sha = ? AND input_digest = ? AND owner_decision_head = ? AND desired_generation = ?
 		    AND lease_expires_at > ?
-		    AND EXISTS (SELECT 1 FROM runs r WHERE r.id = pipeline_jobs.run_id AND r.head_sha = pipeline_jobs.desired_head_sha)
+		    AND EXISTS (SELECT 1 FROM runs r WHERE r.id = pipeline_jobs.run_id AND r.head_sha = pipeline_jobs.desired_head_sha AND r.status IN (?, ?))
 		    AND EXISTS (SELECT 1 FROM step_results s WHERE s.id = pipeline_jobs.step_result_id AND s.run_id = pipeline_jobs.run_id)
 		  RETURNING `+pipelineJobColumns,
 		terminalOnly, PipelineJobFailed, PipelineJobQueued, failure.ErrorCategory, ts,
 		failure.JobID, PipelineJobLeased, failure.LeaseOwner, failure.LeaseFence,
 		failure.DesiredHeadSHA, failure.InputDigest, failure.OwnerDecisionHead, failure.DesiredGeneration, ts,
+		types.RunPending, types.RunRunning,
 	))
 	if err == nil {
 		if err := d.verifyPipelineJobCanonicalBindingsTx(tx, job); err != nil {
@@ -683,10 +690,11 @@ func (d *DB) GetPipelineJobEvents(jobID string) ([]PipelineJobEvent, error) {
 }
 
 // ActivePipelineWorkerLeases is the capacity and updater liveness primitive.
-// It deliberately ignores runs.status, daemon-updated timestamps, agent_pid,
-// and CI-monitor leases. Only exact, unexpired, fenced review/repair/test
-// leases consume worker capacity. Invalidated Git or owner-decision bindings
-// are omitted; an unreadable/tampered owner-decision journal fails closed.
+// It deliberately ignores daemon-updated timestamps, agent_pid, and CI-monitor
+// leases. Only exact, unexpired, fenced review/repair/test leases belonging to
+// a nonterminal run consume worker capacity. Invalidated Git or owner-decision
+// bindings are omitted; an unreadable/tampered owner-decision journal fails
+// closed.
 func (d *DB) ActivePipelineWorkerLeases(at time.Time) ([]*PipelineJob, error) {
 	tx, err := d.sql.Begin()
 	if err != nil {
@@ -699,10 +707,11 @@ func (d *DB) ActivePipelineWorkerLeases(at time.Time) ([]*PipelineJob, error) {
 		  WHERE status = ? AND lease_expires_at > ?
 		    AND lease_fence > 0 AND lease_owner IS NOT NULL
 		    AND kind IN (?, ?, ?)
-		    AND EXISTS (SELECT 1 FROM runs r WHERE r.id = pipeline_jobs.run_id AND r.head_sha = pipeline_jobs.desired_head_sha)
+		    AND EXISTS (SELECT 1 FROM runs r WHERE r.id = pipeline_jobs.run_id AND r.head_sha = pipeline_jobs.desired_head_sha AND r.status IN (?, ?))
 		    AND EXISTS (SELECT 1 FROM step_results s WHERE s.id = pipeline_jobs.step_result_id AND s.run_id = pipeline_jobs.run_id)
 		  ORDER BY created_at, id`,
 		PipelineJobLeased, at.Unix(), PipelineJobReview, PipelineJobRepair, PipelineJobTest,
+		types.RunPending, types.RunRunning,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query active pipeline worker leases: %w", err)
@@ -758,17 +767,19 @@ func insertPipelineJobEventTx(tx *sql.Tx, job *PipelineJob, eventType string, at
 
 func (d *DB) verifyPipelineJobCanonicalBindingsTx(tx *sql.Tx, job *PipelineJob) error {
 	var runHead, stepRunID, repoID, branch string
+	var runStatus types.RunStatus
 	if err := tx.QueryRow(
-		`SELECT r.head_sha, s.run_id, r.repo_id, r.branch
+		`SELECT r.head_sha, s.run_id, r.repo_id, r.branch, r.status
 		   FROM runs r JOIN step_results s ON s.id = ?
 		  WHERE r.id = ?`, job.StepResultID, job.RunID,
-	).Scan(&runHead, &stepRunID, &repoID, &branch); err != nil {
+	).Scan(&runHead, &stepRunID, &repoID, &branch, &runStatus); err != nil {
 		if err == sql.ErrNoRows {
 			return errors.New("run or step binding is absent")
 		}
 		return fmt.Errorf("verify run and step binding: %w", err)
 	}
-	if stepRunID != job.RunID || runHead != job.DesiredHeadSHA {
+	if stepRunID != job.RunID || runHead != job.DesiredHeadSHA ||
+		(runStatus != types.RunPending && runStatus != types.RunRunning) {
 		return errors.New("run, step, or desired head binding changed")
 	}
 	var revision int64

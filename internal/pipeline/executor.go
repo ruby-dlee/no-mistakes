@@ -93,6 +93,7 @@ type Executor struct {
 	gateReconcileInterval time.Duration
 	gateReconcileTimeout  time.Duration
 	onPRMerged            func(context.Context, string)
+	remoteSteps           RemoteStepRunner
 }
 
 // ArmOwnerDecisionHistory supplies the controller-held expected history head.
@@ -1171,7 +1172,23 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		}
 		reviewStartingHeadSHA := run.HeadSHA
 		sctx.ReviewStartingHeadSHA = reviewStartingHeadSHA
-		outcome, err := step.Execute(sctx)
+		var outcome *StepOutcome
+		var err error
+		if e.remoteSteps != nil && (stepName == types.StepReview || stepName == types.StepTest) {
+			intent := ""
+			if run.Intent != nil {
+				intent = *run.Intent
+			}
+			outcome, err = e.executeRemoteStep(ctx, RemoteStepRequest{
+				RunID: run.ID, RepoID: run.RepoID, StepResultID: sr.ID,
+				Step: stepName, Round: roundNum + 1, DesiredHeadSHA: run.HeadSHA,
+				BaseSHA: run.BaseSHA, Branch: run.Branch, Fixing: sctx.Fixing,
+				PreviousFindings: sctx.PreviousFindings, UserIntent: intent,
+				UserIntentSource: userIntentSource, WorkDir: workDir,
+			}, &run.HeadSHA)
+		} else {
+			outcome, err = step.Execute(sctx)
+		}
 		roundNum++
 		roundDuration := time.Since(phaseStart).Milliseconds()
 		if err != nil {

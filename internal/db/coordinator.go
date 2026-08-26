@@ -34,6 +34,21 @@ type BranchDesiredUpdate struct {
 	UpdatedAt   time.Time
 }
 
+func (d *DB) GetBranchDesiredState(repoID, branch string) (*BranchDesiredState, error) {
+	var state BranchDesiredState
+	err := d.sql.QueryRow(
+		`SELECT repo_id, branch, revision, head_sha, input_digest, updated_at
+		   FROM branch_desired_state WHERE repo_id = ? AND branch = ?`, repoID, branch,
+	).Scan(&state.RepoID, &state.Branch, &state.Revision, &state.HeadSHA, &state.InputDigest, &state.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get branch desired state: %w", err)
+	}
+	return &state, nil
+}
+
 // AdvanceBranchDesiredState coalesces an exact replay and advances every new
 // semantic push by one revision. The same transaction supersedes obsolete
 // queued/leased worker jobs, which invalidates their fences before any stale

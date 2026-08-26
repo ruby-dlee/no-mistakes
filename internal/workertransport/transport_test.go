@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -62,7 +63,11 @@ func newTransportFixture(t *testing.T, kind db.PipelineJobKind, maxAttempts int,
 	if err != nil {
 		t.Fatal(err)
 	}
-	step, err := database.InsertStepResult(run.ID, types.StepReview)
+	stepName := types.StepReview
+	if kind == db.PipelineJobTest {
+		stepName = types.StepTest
+	}
+	step, err := database.InsertStepResult(run.ID, stepName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +93,15 @@ func newTransportFixture(t *testing.T, kind db.PipelineJobKind, maxAttempts int,
 }
 
 func (f transportFixture) service(t *testing.T, timeout, heartbeat, lease time.Duration) *Service {
+	return f.serviceWithResultStore(t, timeout, heartbeat, lease, nil)
+}
+
+func (f transportFixture) serviceWithResultStore(t *testing.T, timeout, heartbeat, lease time.Duration, results ResultStore) *Service {
 	t.Helper()
+	stores := []ResultStore(nil)
+	if results != nil {
+		stores = append(stores, results)
+	}
 	service, err := New(f.database, config.AzureWorkerConfig{
 		Enabled: true, RunnerPath: f.runner, ConfigPath: f.config,
 		Timeout: timeout, HeartbeatInterval: heartbeat, LeaseDuration: lease,
@@ -97,11 +110,32 @@ func (f transportFixture) service(t *testing.T, timeout, heartbeat, lease time.D
 			return nil, fmt.Errorf("unexpected job %s", job.ID)
 		}
 		return append([]byte(nil), f.input...), nil
-	}))
+	}), stores...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return service
+}
+
+type supersedingResultStore struct {
+	database *db.DB
+	store    *DurableStore
+}
+
+func (s supersedingResultStore) StoreResult(ctx context.Context, job *db.PipelineJob, execution Execution) (func(), error) {
+	rollback, err := s.store.StoreResult(ctx, job, execution)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.database.SupersedePipelineJob(db.PipelineJobSupersession{
+		JobID: job.ID, DesiredHeadSHA: job.DesiredHeadSHA, InputDigest: job.InputDigest,
+		OwnerDecisionHead: job.OwnerDecisionHead, DesiredGeneration: job.DesiredGeneration,
+		SupersededAt: time.Now(),
+	}); err != nil {
+		rollback()
+		return nil, err
+	}
+	return rollback, nil
 }
 
 func TestAzureWorkerTransportReviewSuccess(t *testing.T) {
@@ -135,8 +169,92 @@ func TestAzureWorkerTransportPreservesBlockingReviewFindings(t *testing.T) {
 	}
 }
 
+func TestWorkerStepOutcomeBindsTestRepairToCanonicalTestStep(t *testing.T) {
+	outcome := StepOutcomeEnvelope{
+		Schema: StepOutcomeSchema, Step: StepOutcomeTest, FixSummary: "repair test failure",
+	}
+	data, err := json.Marshal(outcome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeStepOutcome(data, StepOutcomeTest, strings.Repeat("a", 40))
+	if err != nil || decoded.Step != StepOutcomeTest || decoded.ReviewApprovedHeadSHA != "" {
+		t.Fatalf("test repair outcome = %+v, err %v", decoded, err)
+	}
+	if _, err := decodeStepOutcome(data, StepOutcomeReview, strings.Repeat("a", 40)); err == nil {
+		t.Fatal("test repair outcome was admitted as a review outcome")
+	}
+}
+
+func TestAzureWorkerDurableInputAndResultSurviveStoreRestart(t *testing.T) {
+	fixture := newTransportFixture(t, db.PipelineJobReview, 2, fakeWrapperConfig{Mode: "findings"})
+	root := filepath.Join(t.TempDir(), "azure-worker")
+	first, err := NewDurableStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest, err := first.PutInput(fixture.input); err != nil || digest != fixture.job.InputDigest {
+		t.Fatalf("put input digest = %q, err %v", digest, err)
+	}
+	service, err := New(fixture.database, config.AzureWorkerConfig{
+		Enabled: true, RunnerPath: fixture.runner, ConfigPath: fixture.config,
+		Timeout: 5 * time.Second, HeartbeatInterval: 200 * time.Millisecond, LeaseDuration: 3 * time.Second,
+	}, fixture.workRoot, "transport-test", first, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ProcessOne(context.Background(), db.PipelineJobReview); err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewDurableStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := fixture.database.GetPipelineJob(fixture.job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := second.ReadResult(completed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.StepOutcome.NeedsApproval || !strings.Contains(result.StepOutcome.FindingsJSON, "remote blocker") {
+		t.Fatalf("restarted durable result = %+v", result)
+	}
+	duplicate, replay, err := fixture.database.EnqueuePipelineJob(db.PipelineJobSpec{
+		RunID: fixture.job.RunID, StepResultID: fixture.job.StepResultID, Kind: fixture.job.Kind,
+		Round: fixture.job.Round, DesiredHeadSHA: fixture.job.DesiredHeadSHA,
+		InputDigest: fixture.job.InputDigest, OwnerDecisionHead: fixture.job.OwnerDecisionHead,
+		DesiredGeneration: fixture.job.DesiredGeneration, MaxAttempts: fixture.job.MaxAttempts,
+	})
+	if err != nil || !replay || duplicate.ID != completed.ID {
+		t.Fatalf("duplicate = %+v, replay %v, err %v", duplicate, replay, err)
+	}
+}
+
+func TestAzureWorkerCompletionCASFailureRollsBackDurableResult(t *testing.T) {
+	fixture := newTransportFixture(t, db.PipelineJobReview, 2, fakeWrapperConfig{Mode: "success"})
+	store, err := NewDurableStore(filepath.Join(t.TempDir(), "azure-worker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = fixture.serviceWithResultStore(t, 5*time.Second, 200*time.Millisecond, 3*time.Second, supersedingResultStore{
+		database: fixture.database, store: store,
+	}).ProcessOne(context.Background(), db.PipelineJobReview)
+	if err == nil {
+		t.Fatal("stale completion CAS succeeded")
+	}
+	job, _ := fixture.database.GetPipelineJob(fixture.job.ID)
+	if job.Status != db.PipelineJobSuperseded {
+		t.Fatalf("job status = %s", job.Status)
+	}
+	if _, err := os.Stat(filepath.Join(store.results, job.ID+".json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale durable result remains: %v", err)
+	}
+}
+
 func TestAzureWorkerTransportRejectsMalformedAndStaleResults(t *testing.T) {
-	for _, mode := range []string{"malformed", "stale"} {
+	for _, mode := range []string{"malformed", "stale", "outcome-stale"} {
 		t.Run(mode, func(t *testing.T) {
 			fixture := newTransportFixture(t, db.PipelineJobReview, 2, fakeWrapperConfig{Mode: mode})
 			if _, err := fixture.service(t, 5*time.Second, 200*time.Millisecond, 3*time.Second).ProcessOne(context.Background(), db.PipelineJobReview); err == nil {
@@ -283,7 +401,7 @@ func TestFakeFirstmateWrapperProcess(t *testing.T) {
 	readJSONTest(t, value("--request"), &request)
 	result := ResultEnvelope{
 		Schema: ResultSchema, JobID: request.JobID, RunID: request.RunID,
-		StepResultID: request.StepResultID, Kind: request.Kind, Round: request.Round,
+		StepResultID: request.StepResultID, Step: request.Step, Kind: request.Kind, Round: request.Round,
 		DesiredHeadSHA: request.DesiredHeadSHA, InputDigest: request.InputDigest,
 		OwnerDecisionHead: request.OwnerDecisionHead, DesiredGeneration: request.DesiredGeneration,
 		Attempt: request.Attempt, LeaseFence: request.LeaseFence, LeaseOwner: request.LeaseOwner,
@@ -306,13 +424,13 @@ func TestFakeFirstmateWrapperProcess(t *testing.T) {
 		result.ReturnRef = control.ReturnRef
 		result.ReturnBundleSHA256 = hex.EncodeToString(sum[:])
 	}
-	step := StepOutcomeReview
-	if request.Kind == db.PipelineJobTest {
-		step = StepOutcomeTest
-	}
+	step := StepOutcomeStep(request.Step)
 	stepOutcome := StepOutcomeEnvelope{
 		Schema: StepOutcomeSchema, Step: step,
 		ReviewApprovedHeadSHA: result.OutputHeadSHA,
+	}
+	if control.Mode == "outcome-stale" {
+		stepOutcome.ReviewApprovedHeadSHA = strings.Repeat("f", 40)
 	}
 	if step == StepOutcomeTest {
 		stepOutcome.ReviewApprovedHeadSHA = ""

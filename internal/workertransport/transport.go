@@ -24,6 +24,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	gitx "github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 const (
@@ -45,6 +46,7 @@ type Request struct {
 	JobID                   string             `json:"job_id"`
 	RunID                   string             `json:"run_id"`
 	StepResultID            string             `json:"step_result_id"`
+	Step                    types.StepName     `json:"step"`
 	Kind                    db.PipelineJobKind `json:"kind"`
 	Round                   int                `json:"round"`
 	DesiredHeadSHA          string             `json:"desired_head_sha"`
@@ -70,6 +72,7 @@ type ResultEnvelope struct {
 	JobID              string             `json:"job_id"`
 	RunID              string             `json:"run_id"`
 	StepResultID       string             `json:"step_result_id"`
+	Step               types.StepName     `json:"step"`
 	Kind               db.PipelineJobKind `json:"kind"`
 	Round              int                `json:"round"`
 	DesiredHeadSHA     string             `json:"desired_head_sha"`
@@ -107,20 +110,37 @@ func (f InputProviderFunc) InputFor(ctx context.Context, job *db.PipelineJob) ([
 	return f(ctx, job)
 }
 
+// ResultStore makes an admitted semantic result durable before the job's
+// completion CAS. Its rollback is invoked when that CAS loses its exact fence.
+type ResultStore interface {
+	StoreResult(context.Context, *db.PipelineJob, Execution) (rollback func(), err error)
+}
+
 type Service struct {
 	database *db.DB
 	cfg      config.AzureWorkerConfig
 	workRoot string
 	owner    string
 	input    InputProvider
+	results  ResultStore
 }
 
-func New(database *db.DB, cfg config.AzureWorkerConfig, workRoot, owner string, input InputProvider) (*Service, error) {
+func New(database *db.DB, cfg config.AzureWorkerConfig, workRoot, owner string, input InputProvider, resultStores ...ResultStore) (*Service, error) {
 	if database == nil || input == nil {
 		return nil, errors.New("Azure worker transport requires a database and input provider")
 	}
+	if len(resultStores) > 1 {
+		return nil, errors.New("Azure worker transport accepts at most one result store")
+	}
+	var results ResultStore
+	if len(resultStores) == 1 {
+		results = resultStores[0]
+		if results == nil {
+			return nil, errors.New("Azure worker transport result store is nil")
+		}
+	}
 	if !cfg.Enabled {
-		return &Service{database: database, cfg: cfg, workRoot: workRoot, owner: owner, input: input}, nil
+		return &Service{database: database, cfg: cfg, workRoot: workRoot, owner: owner, input: input, results: results}, nil
 	}
 	if cfg.LeaseDuration < time.Second || cfg.LeaseDuration > 24*time.Hour || cfg.LeaseDuration%time.Second != 0 {
 		return nil, errors.New("Azure worker lease duration must be whole seconds between one second and 24 hours")
@@ -140,7 +160,7 @@ func New(database *db.DB, cfg config.AzureWorkerConfig, workRoot, owner string, 
 	if !filepath.IsAbs(workRoot) || strings.TrimSpace(owner) == "" || strings.ContainsAny(owner, "\r\n\x00") {
 		return nil, errors.New("Azure worker transport requires an absolute work root and bounded lease owner")
 	}
-	return &Service{database: database, cfg: cfg, workRoot: filepath.Clean(workRoot), owner: owner, input: input}, nil
+	return &Service{database: database, cfg: cfg, workRoot: filepath.Clean(workRoot), owner: owner, input: input, results: results}, nil
 }
 
 func (s *Service) Enabled() bool { return s != nil && s.cfg.Enabled }
@@ -188,6 +208,22 @@ func (s *Service) ProcessOne(ctx context.Context, kind db.PipelineJobKind) (*Exe
 		prepared.rollback()
 		return nil, fmt.Errorf("remote worker failed with category %s", failure.category)
 	}
+	execution := Execution{
+		JobID: job.ID, OutputHeadSHA: prepared.result.OutputHeadSHA,
+		ResultDigest: prepared.resultDigest, ReturnedBranch: prepared.returnedBranch,
+		StepOutcome: prepared.stepOutcome,
+	}
+	var rollbackStored func()
+	if s.results != nil {
+		rollbackStored, err = s.results.StoreResult(workCtx, job, execution)
+		if err != nil {
+			prepared.rollback()
+			if _, failErr := s.database.FailPipelineJob(failureFor(job, "result_store_failure", true, time.Now())); failErr != nil {
+				return nil, fmt.Errorf("store Azure worker result: %v; record failure: %w", err, failErr)
+			}
+			return nil, fmt.Errorf("store Azure worker result: %w", err)
+		}
+	}
 	replay, err := s.database.CompletePipelineJob(db.PipelineJobCompletion{
 		JobID: job.ID, LeaseOwner: s.owner, LeaseFence: job.LeaseFence,
 		DesiredHeadSHA: job.DesiredHeadSHA, InputDigest: job.InputDigest,
@@ -196,16 +232,15 @@ func (s *Service) ProcessOne(ctx context.Context, kind db.PipelineJobKind) (*Exe
 		CompletedAt: time.Now(),
 	})
 	if err != nil {
+		if rollbackStored != nil {
+			rollbackStored()
+		}
 		prepared.rollback()
 		return nil, err
 	}
 	_ = replay
 	prepared.keep()
-	return &Execution{
-		JobID: job.ID, OutputHeadSHA: prepared.result.OutputHeadSHA,
-		ResultDigest: prepared.resultDigest, ReturnedBranch: prepared.returnedBranch,
-		StepOutcome: prepared.stepOutcome,
-	}, nil
+	return &execution, nil
 }
 
 type heartbeatLoop struct {
@@ -286,6 +321,16 @@ func (s *Service) executeClaimed(ctx context.Context, job *db.PipelineJob) (*pre
 	if repo == nil {
 		return nil, failureError("source_invalid", false, errors.New("bound repository is absent"))
 	}
+	stepResult, err := s.database.GetStepResult(job.StepResultID)
+	if err != nil {
+		return nil, failureError("source_invalid", false, fmt.Errorf("read bound step: %w", err))
+	}
+	if stepResult == nil || stepResult.RunID != job.RunID ||
+		(stepResult.StepName != types.StepReview && stepResult.StepName != types.StepTest) ||
+		(job.Kind == db.PipelineJobReview && stepResult.StepName != types.StepReview) ||
+		(job.Kind == db.PipelineJobTest && stepResult.StepName != types.StepTest) {
+		return nil, failureError("source_invalid", false, errors.New("worker job kind and canonical step binding mismatch"))
+	}
 	input, err := s.input.InputFor(ctx, job)
 	if err != nil {
 		return nil, failureError("input_unavailable", true, err)
@@ -320,7 +365,7 @@ func (s *Service) executeClaimed(ctx context.Context, job *db.PipelineJob) (*pre
 	if err != nil {
 		return nil, failureError("staging_failure", true, err)
 	}
-	request := requestFor(job, s.owner, bundleDigest, bundleSize)
+	request := requestFor(job, stepResult.StepName, s.owner, bundleDigest, bundleSize)
 	requestPath := filepath.Join(stage, "request.json")
 	if err := writeJSONFile(requestPath, request); err != nil {
 		return nil, failureError("staging_failure", true, err)
@@ -363,7 +408,7 @@ func (s *Service) executeClaimed(ctx context.Context, job *db.PipelineJob) (*pre
 	if result.StepOutcomeSHA256 == "" || digestBytes(stepOutcomeBytes) != result.StepOutcomeSHA256 {
 		return nil, failureError("malformed_result", false, errors.New("worker step outcome digest mismatch"))
 	}
-	stepOutcome, err := decodeStepOutcome(stepOutcomeBytes, job.Kind, result.OutputHeadSHA)
+	stepOutcome, err := decodeStepOutcome(stepOutcomeBytes, StepOutcomeStep(request.Step), result.OutputHeadSHA)
 	if err != nil {
 		return nil, failureError("malformed_result", false, fmt.Errorf("decode worker step outcome: %w", err))
 	}
@@ -383,10 +428,10 @@ func (s *Service) executeClaimed(ctx context.Context, job *db.PipelineJob) (*pre
 	return prepared, nil
 }
 
-func requestFor(job *db.PipelineJob, owner, bundleDigest string, bundleSize int64) Request {
+func requestFor(job *db.PipelineJob, step types.StepName, owner, bundleDigest string, bundleSize int64) Request {
 	return Request{
 		Schema: RequestSchema, JobID: job.ID, RunID: job.RunID, StepResultID: job.StepResultID,
-		Kind: job.Kind, Round: job.Round, DesiredHeadSHA: job.DesiredHeadSHA,
+		Step: step, Kind: job.Kind, Round: job.Round, DesiredHeadSHA: job.DesiredHeadSHA,
 		InputDigest: job.InputDigest, OwnerDecisionHead: job.OwnerDecisionHead,
 		DesiredGeneration: job.DesiredGeneration, Attempt: job.AttemptsStarted,
 		LeaseFence: job.LeaseFence, LeaseOwner: owner, SourceRef: "HEAD",
@@ -569,7 +614,7 @@ func decodeResult(data []byte) (ResultEnvelope, error) {
 func resultMatchesRequest(result ResultEnvelope, request Request) bool {
 	return result.Schema == ResultSchema && result.JobID == request.JobID &&
 		result.RunID == request.RunID && result.StepResultID == request.StepResultID &&
-		result.Kind == request.Kind && result.Round == request.Round &&
+		result.Step == request.Step && result.Kind == request.Kind && result.Round == request.Round &&
 		result.DesiredHeadSHA == request.DesiredHeadSHA && result.InputDigest == request.InputDigest &&
 		result.OwnerDecisionHead == request.OwnerDecisionHead && result.DesiredGeneration == request.DesiredGeneration &&
 		result.Attempt == request.Attempt && result.LeaseFence == request.LeaseFence && result.LeaseOwner == request.LeaseOwner &&
