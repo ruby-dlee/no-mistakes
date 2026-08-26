@@ -22,6 +22,7 @@ type fixExecutionOptions struct {
 	MissingFindingsError    string
 	LogMessage              string
 	Prompt                  string
+	PromptVersion           string
 	ErrorPrefix             string
 	FallbackSummary         string
 	AfterAgentRun           func(*agent.Result) error
@@ -272,12 +273,13 @@ func executeFixMode(sctx *pipeline.StepContext, stepName types.StepName, opts fi
 		responseSchema = commitSummarySchema
 	}
 	runOpts := agent.RunOpts{
-		Prompt:     opts.Prompt,
-		CWD:        sctx.WorkDir,
-		JSONSchema: responseSchema,
-		OnChunk:    sctx.LogChunk,
-		Purpose:    purpose,
-		Workload:   opts.Workload,
+		Prompt:        opts.Prompt,
+		PromptVersion: opts.PromptVersion,
+		CWD:           sctx.WorkDir,
+		JSONSchema:    responseSchema,
+		OnChunk:       sctx.LogChunk,
+		Purpose:       purpose,
+		Workload:      opts.Workload,
 	}
 	agentCtx := sctx.Ctx
 	if opts.AgentContext != nil {

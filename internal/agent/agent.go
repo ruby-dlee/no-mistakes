@@ -24,6 +24,11 @@ type Agent interface {
 // RunOpts configures a single agent invocation.
 type RunOpts struct {
 	Prompt string
+	// PromptVersion is a stable, content-free template revision (for example
+	// review.v1). Instrumentation stores it separately from the task-specific
+	// prompt digest so quality can be compared across template revisions. Empty
+	// means the caller has not versioned this prompt and remains unknown.
+	PromptVersion string
 	// Env appends invocation-scoped environment entries to the agent process.
 	// Entries later in the slice override inherited values.
 	Env         []string
@@ -207,6 +212,14 @@ type Result struct {
 	// ModelProvider is the provider that served the model (e.g. "openai",
 	// "anthropic"), when the adapter can report it. Instrumentation only.
 	ModelProvider string
+	// EffectiveReasoning is the provider- or harness-reported reasoning level
+	// actually used. It is empty when the harness does not expose this datum;
+	// instrumentation records that as unknown rather than inferring it from the
+	// request.
+	EffectiveReasoning string
+	// HarnessVersion is the concrete agent CLI/harness version when an adapter
+	// can report it. Empty remains unknown.
+	HarnessVersion string
 	// Provider is the adapter provider that served this invocation. It lets
 	// fallback wrappers persist a session against the provider that minted it.
 	Provider string
