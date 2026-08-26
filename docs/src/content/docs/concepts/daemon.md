@@ -55,7 +55,7 @@ no-mistakes update
 
 `no-mistakes update` stops and starts the daemon when it is running, or when stale daemon artifacts exist, so the new executable is used.
 It prefers the managed service path and falls back to a detached daemon if service startup is unavailable or fails.
-If pending or running pipeline runs exist, `update` refuses to restart the daemon by default and prints each active run's ID, status, branch, and short head SHA. Pass `--force` to restart the daemon anyway and accept that those runs may fail; `-y`/`--yes` does not bypass this guard.
+If exact, unexpired review, repair, or test worker leases exist, `update`, `daemon stop`, and `daemon restart` refuse by default and print each worker's job, run, role, head, and lease owner. Historical pending/running rows and durable CI waits are not executing workers and do not block lifecycle operations. Pass `--force` to proceed despite a real lease; `-y`/`--yes` does not bypass this guard.
 If the daemon is already running from a different executable path, update still prompts before replacing it; `-y`/`--yes` answers that prompt non-interactively.
 If the daemon executable path cannot be determined, the update aborts before replacing anything.
 

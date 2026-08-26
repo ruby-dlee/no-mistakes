@@ -257,17 +257,19 @@ func TestUpdaterRunRefusesWithActiveRunsAndListsThem(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insert repo: %v", err)
 	}
-	pendingRun, err := database.InsertRun(repo.ID, "feature-a", "aaa111", "000")
+	pendingRun, err := database.InsertRun(repo.ID, "feature-a", strings.Repeat("a", 40), strings.Repeat("0", 40))
 	if err != nil {
 		t.Fatalf("insert pending run: %v", err)
 	}
-	runningRun, err := database.InsertRun(repo.ID, "feature-b", "bbb222", "000")
+	runningRun, err := database.InsertRun(repo.ID, "feature-b", strings.Repeat("b", 40), strings.Repeat("0", 40))
 	if err != nil {
 		t.Fatalf("insert running run: %v", err)
 	}
 	if err := database.UpdateRunStatus(runningRun.ID, types.RunRunning); err != nil {
 		t.Fatalf("mark running: %v", err)
 	}
+	now := time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC)
+	lease := leaseUpdaterWorker(t, database, runningRun, now)
 	if err := database.Close(); err != nil {
 		t.Fatalf("close db: %v", err)
 	}
@@ -291,7 +293,7 @@ func TestUpdaterRunRefusesWithActiveRunsAndListsThem(t *testing.T) {
 		stdout:         stdout,
 		stderr:         stderr,
 		stdin:          strings.NewReader("y\n"),
-		now:            func() time.Time { return time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC) },
+		now:            func() time.Time { return now },
 		resetDaemon: func() error {
 			resetCalled = true
 			return nil
@@ -308,16 +310,19 @@ func TestUpdaterRunRefusesWithActiveRunsAndListsThem(t *testing.T) {
 	}
 	transcript := stderr.String()
 	for _, want := range []string{
-		"2 active pipeline runs",
-		pendingRun.ID,
-		"feature-a",
+		"1 active pipeline worker lease",
+		lease.ID,
 		runningRun.ID,
-		"feature-b",
-		"continuing can cause these pipelines to fail",
+		"head=bbbbbbbb",
+		"owner=test-worker",
+		"continuing can cause these workers to fail",
 	} {
 		if !strings.Contains(transcript, want) {
 			t.Fatalf("stderr should contain %q, got %q", want, transcript)
 		}
+	}
+	if strings.Contains(transcript, pendingRun.ID) {
+		t.Fatalf("pending legacy row was presented as executing work: %q", transcript)
 	}
 	content, readErr := os.ReadFile(execPath)
 	if readErr != nil {
@@ -347,27 +352,92 @@ func TestUpdaterActiveRunGuardAllowsForce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insert repo: %v", err)
 	}
-	if _, err := database.InsertRun(repo.ID, "feature-a", "aaa111", "000"); err != nil {
+	run, err := database.InsertRun(repo.ID, "feature-a", strings.Repeat("a", 40), strings.Repeat("0", 40))
+	if err != nil {
 		t.Fatalf("insert run: %v", err)
 	}
+	now := time.Unix(1_800_000_000, 0)
+	lease := leaseUpdaterWorker(t, database, run, now)
 	if err := database.Close(); err != nil {
 		t.Fatalf("close db: %v", err)
 	}
 
 	stderr := new(bytes.Buffer)
-	u := &updater{paths: p, stderr: stderr, force: true}
+	u := &updater{paths: p, stderr: stderr, force: true, now: func() time.Time { return now }}
 	if err := u.confirmActiveRunsBeforeUpdate(); err != nil {
 		t.Fatalf("confirmActiveRunsBeforeUpdate with force error = %v", err)
 	}
 	transcript := stderr.String()
 	for _, want := range []string{
 		"FORCE: continuing update",
-		"feature-a",
-		"aaa111",
+		lease.ID,
+		run.ID,
+		"aaaaaaaa",
 	} {
 		if !strings.Contains(transcript, want) {
 			t.Fatalf("stderr should contain %q, got %q", want, transcript)
 		}
+	}
+}
+
+func leaseUpdaterWorker(t *testing.T, database *db.DB, run *db.Run, at time.Time) *db.PipelineJob {
+	t.Helper()
+	step, err := database.InsertStepResult(run.ID, types.StepReview)
+	if err != nil {
+		t.Fatalf("insert worker step: %v", err)
+	}
+	job, replay, err := database.EnqueuePipelineJob(db.PipelineJobSpec{
+		RunID:          run.ID,
+		StepResultID:   step.ID,
+		Kind:           db.PipelineJobReview,
+		Round:          1,
+		DesiredHeadSHA: run.HeadSHA,
+		InputDigest:    strings.Repeat("c", 64),
+		MaxAttempts:    2,
+	})
+	if err != nil || replay {
+		t.Fatalf("enqueue worker job: job=%+v replay=%v err=%v", job, replay, err)
+	}
+	leased, err := database.ClaimPipelineJob(db.PipelineJobReview, "test-worker", at, time.Minute)
+	if err != nil || leased == nil || leased.ID != job.ID {
+		t.Fatalf("claim worker job: job=%+v err=%v", leased, err)
+	}
+	return leased
+}
+
+func TestUpdaterIgnoresLegacyRunningRowsWithoutLiveWorkerLeases(t *testing.T) {
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatalf("ensure paths: %v", err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	repo, err := database.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
+	if err != nil {
+		t.Fatalf("insert repo: %v", err)
+	}
+	for i := 0; i < 56; i++ {
+		run, err := database.InsertRun(repo.ID, fmt.Sprintf("stale-%02d", i), strings.Repeat("a", 40), strings.Repeat("0", 40))
+		if err != nil {
+			t.Fatalf("insert stale run %d: %v", i, err)
+		}
+		if err := database.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
+			t.Fatalf("mark stale run %d running: %v", i, err)
+		}
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	stderr := new(bytes.Buffer)
+	u := &updater{paths: p, stderr: stderr, now: func() time.Time { return time.Unix(1_800_000_000, 0) }}
+	if err := u.confirmActiveRunsBeforeUpdate(); err != nil {
+		t.Fatalf("stale legacy rows blocked update: %v", err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stale legacy rows emitted active-work warning: %q", stderr.String())
 	}
 }
 

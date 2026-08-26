@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/daemon"
 	"github.com/kunchenguid/no-mistakes/internal/gatecontext"
@@ -347,7 +348,7 @@ func newDaemonStopCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "stop the daemon even when pipeline runs are active")
+	cmd.Flags().BoolVar(&force, "force", false, "stop the daemon even when pipeline worker leases are active")
 	return cmd
 }
 
@@ -380,24 +381,24 @@ func newDaemonRestartCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "restart the daemon even when pipeline runs are active")
+	cmd.Flags().BoolVar(&force, "force", false, "restart the daemon even when pipeline worker leases are active")
 	return cmd
 }
 
 func guardDestructiveDaemonLifecycle(p *paths.Paths, stderr io.Writer, action string, force bool) error {
-	runs, err := lifecycle.ActiveRuns(p)
+	leases, err := lifecycle.ActiveWorkerLeases(p, time.Now())
 	if err != nil {
-		return fmt.Errorf("check active pipeline runs: %w", err)
+		return fmt.Errorf("check active pipeline worker leases: %w", err)
 	}
-	if len(runs) == 0 {
+	if len(leases) == 0 {
 		return nil
 	}
 	if force {
-		fmt.Fprintf(stderr, "FORCE: %s will stop/restart the daemon while %d active pipeline runs are in progress\n", action, len(runs))
-		fmt.Fprint(stderr, lifecycle.RunList(runs))
+		fmt.Fprintf(stderr, "FORCE: %s will stop/restart the daemon while %d active pipeline worker leases are in progress\n", action, len(leases))
+		fmt.Fprint(stderr, lifecycle.WorkerLeaseList(leases))
 		return nil
 	}
-	return fmt.Errorf("refusing %s because %d active pipeline runs are in progress; pass --force to stop/restart the daemon anyway\n%s", action, len(runs), lifecycle.RunList(runs))
+	return fmt.Errorf("refusing %s because %d active pipeline worker leases are in progress; pass --force to stop/restart the daemon anyway\n%s", action, len(leases), lifecycle.WorkerLeaseList(leases))
 }
 
 func newDaemonStatusCmd() *cobra.Command {

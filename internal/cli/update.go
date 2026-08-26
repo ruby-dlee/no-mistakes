@@ -22,6 +22,6 @@ func newUpdateCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&beta, "beta", false, "install the latest release including prereleases")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "answer yes to update safety prompts")
-	cmd.Flags().BoolVar(&force, "force", false, "update and restart the daemon even when pipeline runs are active")
+	cmd.Flags().BoolVar(&force, "force", false, "update and restart the daemon even when pipeline worker leases are active")
 	return cmd
 }

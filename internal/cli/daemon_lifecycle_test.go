@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
@@ -33,11 +34,10 @@ func TestDaemonStopRefusesWithActiveRunsAndListsThem(t *testing.T) {
 	}
 	for _, want := range []string{
 		"refusing daemon stop",
-		"2 active pipeline runs",
-		"feature-a",
-		"aaa111",
-		"feature-b",
-		"bbb222",
+		"2 active pipeline worker leases",
+		"head=aaaaaaaa",
+		"head=bbbbbbbb",
+		"owner=test-worker",
 		"--force",
 	} {
 		if !strings.Contains(out+err.Error(), want) {
@@ -100,8 +100,53 @@ func TestDaemonRestartRefusesWithActiveRuns(t *testing.T) {
 	if stopCalled || startCalled {
 		t.Fatalf("daemon restart should not stop/start after refusing; stop=%t start=%t", stopCalled, startCalled)
 	}
-	if !strings.Contains(out+err.Error(), "refusing daemon restart") || !strings.Contains(out+err.Error(), "feature-a") {
-		t.Fatalf("daemon restart refusal should list active runs, got output %q error %v", out, err)
+	if !strings.Contains(out+err.Error(), "refusing daemon restart") || !strings.Contains(out+err.Error(), "owner=test-worker") {
+		t.Fatalf("daemon restart refusal should list active workers, got output %q error %v", out, err)
+	}
+}
+
+func TestDaemonStopIgnoresLegacyRunningRowsWithoutWorkerLeases(t *testing.T) {
+	nmHome := t.TempDir()
+	t.Setenv("NM_HOME", nmHome)
+	p := paths.WithRoot(nmHome)
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := database.InsertRepo("/tmp/stale-project", "git@github.com:user/stale-project.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 56; i++ {
+		run, err := database.InsertRun(repo.ID, "stale-"+string(rune(0x100+i)), strings.Repeat("c", 40), strings.Repeat("0", 40))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := database.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stopCalled := false
+	prevStop := daemonStopFn
+	daemonStopFn = func(*paths.Paths) error {
+		stopCalled = true
+		return nil
+	}
+	t.Cleanup(func() { daemonStopFn = prevStop })
+
+	out, err := executeCmd("daemon", "stop")
+	if err != nil {
+		t.Fatalf("stale rows blocked daemon stop: %v\n%s", err, out)
+	}
+	if !stopCalled {
+		t.Fatal("daemon stop was not called")
 	}
 }
 
@@ -165,14 +210,39 @@ func createLifecycleGuardRuns(t *testing.T, p *paths.Paths) {
 	if err != nil {
 		t.Fatalf("insert repo: %v", err)
 	}
-	if _, err := database.InsertRun(repo.ID, "feature-a", "aaa111", "000"); err != nil {
+	pending, err := database.InsertRun(repo.ID, "feature-a", strings.Repeat("a", 40), strings.Repeat("0", 40))
+	if err != nil {
 		t.Fatalf("insert pending run: %v", err)
 	}
-	running, err := database.InsertRun(repo.ID, "feature-b", "bbb222", "000")
+	running, err := database.InsertRun(repo.ID, "feature-b", strings.Repeat("b", 40), strings.Repeat("0", 40))
 	if err != nil {
 		t.Fatalf("insert running run: %v", err)
 	}
 	if err := database.UpdateRunStatus(running.ID, types.RunRunning); err != nil {
 		t.Fatalf("mark running: %v", err)
+	}
+	for index, run := range []*db.Run{pending, running} {
+		step, err := database.InsertStepResult(run.ID, types.StepReview)
+		if err != nil {
+			t.Fatalf("insert worker step: %v", err)
+		}
+		if _, replay, err := database.EnqueuePipelineJob(db.PipelineJobSpec{
+			RunID:          run.ID,
+			StepResultID:   step.ID,
+			Kind:           db.PipelineJobReview,
+			Round:          1,
+			DesiredHeadSHA: run.HeadSHA,
+			InputDigest:    strings.Repeat(string(rune('c'+index)), 64),
+			MaxAttempts:    2,
+		}); err != nil || replay {
+			t.Fatalf("enqueue worker: replay=%v err=%v", replay, err)
+		}
+	}
+	now := time.Now()
+	for i := 0; i < 2; i++ {
+		lease, err := database.ClaimPipelineJob(db.PipelineJobReview, "test-worker", now, time.Hour)
+		if err != nil || lease == nil {
+			t.Fatalf("claim worker %d: lease=%+v err=%v", i, lease, err)
+		}
 	}
 }

@@ -129,9 +129,9 @@ Safest local verification sequence after non-trivial changes:
 
 **Destructive Daemon Lifecycle Guard (`internal/lifecycle/guard.go`)**
 
-- `daemon stop`, `daemon restart`, and `update` refuse by default while pending/running runs exist (the daemon is machine-wide, so stopping it can fail every active pipeline), list the runs via the shared `lifecycle.ActiveRuns`/`lifecycle.RunList` helpers, and require an explicit `--force`. `update -y` answers only the different-executable prompt and deliberately does not bypass this guard.
+- `daemon stop`, `daemon restart`, and `update` refuse by default only while an exact, unexpired, fenced review/repair/test worker lease exists (the daemon is machine-wide, so stopping it can fail executing work). Historical pending/running rows and durable CI waits are not process liveness and must not block lifecycle operations; the shared owner is `lifecycle.ActiveWorkerLeases`/`lifecycle.WorkerLeaseList`. An explicit `--force` overrides a real lease; `update -y` answers only the different-executable prompt and deliberately does not bypass this guard.
 - Every invocation of the three commands is logged with caller attribution (PID, PPID, parent command line) via `logLifecycleInvocation` to `<NM_HOME>/logs/cli.log`; this is the incident forensic trail, do not remove or weaken it.
-- Regressions: `TestDaemonStopRefusesWithActiveRunsAndListsThem`, `TestDaemonStopForceOverridesActiveRunGuard`, `TestDaemonRestartRefusesWithActiveRuns`, `TestLifecycleCommandsWriteCallerAttributionToCLILog` (`internal/cli/daemon_lifecycle_test.go`), `TestUpdaterRunRefusesWithActiveRunsAndListsThem`, `TestUpdaterActiveRunGuardAllowsForce` (`internal/update`).
+- Regressions: `TestDaemonStopRefusesWithActiveRunsAndListsThem`, `TestDaemonStopForceOverridesActiveRunGuard`, `TestDaemonRestartRefusesWithActiveRuns`, `TestDaemonStopIgnoresLegacyRunningRowsWithoutWorkerLeases`, `TestLifecycleCommandsWriteCallerAttributionToCLILog` (`internal/cli/daemon_lifecycle_test.go`), `TestUpdaterRunRefusesWithActiveRunsAndListsThem`, `TestUpdaterActiveRunGuardAllowsForce`, `TestUpdaterIgnoresLegacyRunningRowsWithoutLiveWorkerLeases` (`internal/update`).
 
 **Testing Conventions**
 
