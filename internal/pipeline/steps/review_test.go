@@ -159,6 +159,12 @@ func TestReviewStep_FixMode(t *testing.T) {
 	if callCount != 2 {
 		t.Errorf("expected 2 agent calls (fix + review), got %d", callCount)
 	}
+	if ag.calls[0].PromptVersion != reviewFixPromptVersion {
+		t.Errorf("fix prompt version = %q, want %q", ag.calls[0].PromptVersion, reviewFixPromptVersion)
+	}
+	if ag.calls[1].PromptVersion != reviewPromptVersion {
+		t.Errorf("review prompt version = %q, want %q", ag.calls[1].PromptVersion, reviewPromptVersion)
+	}
 	if !strings.Contains(ag.calls[0].Prompt, baseSHA) {
 		t.Error("expected fix prompt to contain base SHA")
 	}

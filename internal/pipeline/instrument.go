@@ -81,8 +81,6 @@ func (a *perfRecordingAgent) record(ctx context.Context, opts agent.RunOpts, age
 	sessionKey := invocationSessionKey(opts, result)
 	promptSum := sha256.Sum256([]byte(opts.Prompt))
 	promptDigest := "sha256:" + hex.EncodeToString(promptSum[:])
-	toolVersion := buildinfo.CurrentVersion()
-	toolBuildSHA := buildinfo.Commit
 	harnessName := agentName
 	inv := db.AgentInvocation{
 		RunID:              a.runID,
@@ -92,14 +90,18 @@ func (a *perfRecordingAgent) record(ctx context.Context, opts agent.RunOpts, age
 		Agent:              agentName,
 		HarnessName:        &harnessName,
 		PromptDigest:       &promptDigest,
-		NoMistakesVersion:  &toolVersion,
-		NoMistakesBuildSHA: &toolBuildSHA,
+		NoMistakesVersion:  knownBuildIdentity(buildinfo.CurrentVersion()),
+		NoMistakesBuildSHA: knownBuildIdentity(buildinfo.Commit),
 		SessionMode:        invocationSessionMode(opts, result),
 		SessionKey:         sessionKey,
 		StartedAt:          startedAt.Unix(),
 		CompletedAt:        completedAt.Unix(),
 		DurationMS:         completedAt.Sub(startedAt).Milliseconds(),
 		ExitStatus:         "ok",
+	}
+	if opts.PromptVersion != "" {
+		version := opts.PromptVersion
+		inv.PromptVersion = &version
 	}
 	if a.requestedProfile != nil {
 		profile := a.requestedProfile(agentName)
@@ -135,6 +137,17 @@ func (a *perfRecordingAgent) record(ctx context.Context, opts agent.RunOpts, age
 	if _, dbErr := a.db.InsertAgentInvocation(inv); dbErr != nil {
 		slog.Warn("failed to record agent invocation", "step", a.stepName, "error", dbErr)
 	}
+}
+
+// knownBuildIdentity keeps unavailable build metadata as SQL NULL instead of
+// storing empty strings or linker/debug sentinels as if they were exact
+// identities.
+func knownBuildIdentity(value string) *string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.EqualFold(value, "unknown") || strings.EqualFold(value, "dev") || value == "(devel)" {
+		return nil
+	}
+	return &value
 }
 
 // recordResult folds a successful (or partially successful) result's identity,

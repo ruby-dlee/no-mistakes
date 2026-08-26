@@ -24,6 +24,11 @@ type Agent interface {
 // RunOpts configures a single agent invocation.
 type RunOpts struct {
 	Prompt string
+	// PromptVersion is a stable, content-free template revision (for example
+	// review.v1). Instrumentation stores it separately from the task-specific
+	// prompt digest so quality can be compared across template revisions. Empty
+	// means the caller has not versioned this prompt and remains unknown.
+	PromptVersion string
 	// Env appends invocation-scoped environment entries to the agent process.
 	// Entries later in the slice override inherited values.
 	Env         []string

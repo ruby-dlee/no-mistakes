@@ -13,6 +13,7 @@ func TestAgentInvocations_QualityIdentityRoundTrip(t *testing.T) {
 		RunID: run.ID, StepName: "review", Round: 1, Purpose: "review", Agent: "pi",
 		RequestedModel: strPtr("glm-5.2"), ServedModel: strPtr("glm-5.2-202608"),
 		RequestedReasoning: strPtr("high"), EffectiveReasoning: strPtr("medium"),
+		PromptVersion:     strPtr("review.v1"),
 		PromptDigest:      strPtr("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
 		NoMistakesVersion: strPtr("v1.2.3"), NoMistakesBuildSHA: strPtr("0123456789abcdef"),
 		HarnessName: strPtr("pi"), HarnessVersion: strPtr("0.42.0"),
@@ -30,6 +31,7 @@ func TestAgentInvocations_QualityIdentityRoundTrip(t *testing.T) {
 		got.ServedModel == nil || *got.ServedModel != "glm-5.2-202608" ||
 		got.RequestedReasoning == nil || *got.RequestedReasoning != "high" ||
 		got.EffectiveReasoning == nil || *got.EffectiveReasoning != "medium" ||
+		got.PromptVersion == nil || *got.PromptVersion != "review.v1" ||
 		got.PromptDigest == nil || *got.PromptDigest != *inv.PromptDigest ||
 		got.NoMistakesVersion == nil || *got.NoMistakesVersion != "v1.2.3" ||
 		got.NoMistakesBuildSHA == nil || *got.NoMistakesBuildSHA != "0123456789abcdef" ||
@@ -49,7 +51,7 @@ func TestAgentInvocations_QualityIdentityRoundTrip(t *testing.T) {
 	}
 	unknown := rows[1]
 	if unknown.RequestedModel != nil || unknown.ServedModel != nil || unknown.RequestedReasoning != nil ||
-		unknown.EffectiveReasoning != nil || unknown.PromptDigest != nil || unknown.NoMistakesVersion != nil ||
+		unknown.EffectiveReasoning != nil || unknown.PromptVersion != nil || unknown.PromptDigest != nil || unknown.NoMistakesVersion != nil ||
 		unknown.NoMistakesBuildSHA != nil || unknown.HarnessName != nil || unknown.HarnessVersion != nil {
 		t.Fatalf("unknown quality identity must remain NULL: %+v", unknown)
 	}
@@ -64,6 +66,18 @@ func TestAgentInvocations_RejectsNonDigestPromptData(t *testing.T) {
 		StartedAt: 1, CompletedAt: 2, DurationMS: 1, ExitStatus: "ok",
 	}); err == nil {
 		t.Fatal("non-digest prompt data unexpectedly accepted")
+	}
+}
+
+func TestAgentInvocations_RejectsContentShapedPromptVersion(t *testing.T) {
+	d, _, run := openSessionTestDB(t)
+	bad := "Review this source and return all findings"
+	if _, err := d.InsertAgentInvocation(AgentInvocation{
+		RunID: run.ID, StepName: "review", Round: 1, Purpose: "review", Agent: "pi",
+		PromptVersion: &bad, SessionMode: InvocationModeCold,
+		StartedAt: 1, CompletedAt: 2, DurationMS: 1, ExitStatus: "ok",
+	}); err == nil {
+		t.Fatal("content-shaped prompt version unexpectedly accepted")
 	}
 }
 
@@ -206,8 +220,8 @@ func TestAgentInvocations_PrivacySafeShape(t *testing.T) {
 		if strings.HasSuffix(lower, "_tokens") {
 			continue // token counts are numeric usage data, not content
 		}
-		if lower == "prompt_digest" {
-			continue // one-way content identity, never prompt bytes
+		if lower == "prompt_digest" || lower == "prompt_version" {
+			continue // one-way content identity or bounded template revision, never prompt bytes
 		}
 		for _, forbidden := range []string{"prompt", "output", "diff", "transcript", "secret", "credential", "text", "content"} {
 			if strings.Contains(lower, forbidden) {
@@ -512,7 +526,7 @@ func TestOpenMigratesQualityIdentityColumns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, col := range []string{"requested_model", "served_model", "requested_reasoning", "effective_reasoning", "prompt_digest", "no_mistakes_version", "no_mistakes_build_sha", "harness_name", "harness_version"} {
+	for _, col := range []string{"requested_model", "served_model", "requested_reasoning", "effective_reasoning", "prompt_version", "prompt_digest", "no_mistakes_version", "no_mistakes_build_sha", "harness_name", "harness_version"} {
 		if _, err := d.sql.Exec(`ALTER TABLE agent_invocations DROP COLUMN ` + col); err != nil {
 			t.Fatalf("drop %s: %v", col, err)
 		}
@@ -525,7 +539,7 @@ func TestOpenMigratesQualityIdentityColumns(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer d.Close()
-	for _, col := range []string{"requested_model", "served_model", "requested_reasoning", "effective_reasoning", "prompt_digest", "no_mistakes_version", "no_mistakes_build_sha", "harness_name", "harness_version"} {
+	for _, col := range []string{"requested_model", "served_model", "requested_reasoning", "effective_reasoning", "prompt_version", "prompt_digest", "no_mistakes_version", "no_mistakes_build_sha", "harness_name", "harness_version"} {
 		if !d.hasColumn("agent_invocations", col) {
 			t.Errorf("quality identity column %s missing after migration", col)
 		}

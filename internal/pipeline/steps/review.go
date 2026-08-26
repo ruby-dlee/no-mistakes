@@ -19,6 +19,13 @@ import (
 // ReviewStep reviews the diff for bugs, security issues, and doc gaps.
 type ReviewStep struct{}
 
+// Prompt revisions are bumped whenever the corresponding stable template
+// changes materially. Task-specific context is tracked separately by digest.
+const (
+	reviewPromptVersion    = "review.v1"
+	reviewFixPromptVersion = "review-fix.v1"
+)
+
 func (s *ReviewStep) Name() types.StepName { return types.StepReview }
 
 func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
@@ -128,6 +135,7 @@ Previous review findings to address:
 			MissingFindingsError:    "review fix requires previous review findings",
 			LogMessage:              "asking agent to fix identified issues...",
 			Prompt:                  fixPrompt,
+			PromptVersion:           reviewFixPromptVersion,
 			ErrorPrefix:             "agent fix",
 			FallbackSummary:         "address review findings",
 			SessionRole:             pipeline.SessionRoleFixer,
@@ -276,13 +284,14 @@ Risk assessment (after listing all findings):
 	// explicit sanitized round-history section above; only the fixer keeps a
 	// durable session (executeFixMode), because it certifies nothing.
 	result, err := sctx.RunAgentContext(ctx, agent.RunOpts{
-		Prompt:     prompt,
-		CWD:        sctx.WorkDir,
-		Env:        sctx.Env,
-		JSONSchema: reviewFindingsSchema,
-		OnChunk:    sctx.LogChunk,
-		Purpose:    "review",
-		Workload:   workload,
+		Prompt:        prompt,
+		PromptVersion: reviewPromptVersion,
+		CWD:           sctx.WorkDir,
+		Env:           sctx.Env,
+		JSONSchema:    reviewFindingsSchema,
+		OnChunk:       sctx.LogChunk,
+		Purpose:       "review",
+		Workload:      workload,
 	})
 	if err != nil {
 		return nil, reviewAgentError(ctx, timeout, "agent review", err)

@@ -87,8 +87,9 @@ func TestPerfRecording_ResumedSessionRecordsPerRoundDeltas(t *testing.T) {
 	for r := 1; r <= 2; r++ {
 		roundNum = r
 		opts := agent.RunOpts{
-			Purpose:  "review",
-			Workload: &agent.InvocationWorkload{Files: 4, Lines: 120},
+			Purpose:       "review",
+			PromptVersion: "review.v1",
+			Workload:      &agent.InvocationWorkload{Files: 4, Lines: 120},
 		}
 		if _, err := sessions.Run(context.Background(), wrapped, SessionRoleReviewer, opts, nil); err != nil {
 			t.Fatalf("round %d: %v", r, err)
@@ -142,14 +143,38 @@ func TestPerfRecording_ResumedSessionRecordsPerRoundDeltas(t *testing.T) {
 		t.Fatalf("model/reasoning/provider identity = %+v", r2)
 	}
 	if r2.PromptDigest == nil || !strings.HasPrefix(*r2.PromptDigest, "sha256:") ||
-		r2.NoMistakesVersion == nil || *r2.NoMistakesVersion != buildinfo.CurrentVersion() ||
-		r2.NoMistakesBuildSHA == nil || *r2.NoMistakesBuildSHA != buildinfo.Commit ||
+		r2.PromptVersion == nil || *r2.PromptVersion != "review.v1" ||
 		r2.HarnessName == nil || *r2.HarnessName != "codex" {
 		t.Fatalf("tool/harness/prompt identity = %+v", r2)
+	}
+	if want := knownBuildIdentity(buildinfo.CurrentVersion()); want == nil {
+		if r2.NoMistakesVersion != nil {
+			t.Fatalf("unavailable tool version must stay unknown: %q", *r2.NoMistakesVersion)
+		}
+	} else if r2.NoMistakesVersion == nil || *r2.NoMistakesVersion != *want {
+		t.Fatalf("tool version = %v, want %q", r2.NoMistakesVersion, *want)
+	}
+	if buildinfo.Commit == "" || buildinfo.Commit == "unknown" {
+		if r2.NoMistakesBuildSHA != nil {
+			t.Fatalf("unavailable build SHA must stay unknown: %q", *r2.NoMistakesBuildSHA)
+		}
+	} else if r2.NoMistakesBuildSHA == nil || *r2.NoMistakesBuildSHA != buildinfo.Commit {
+		t.Fatalf("build SHA = %v, want %q", r2.NoMistakesBuildSHA, buildinfo.Commit)
 	}
 	// Cache creation is unknown (codex does not report it), not a fabricated 0.
 	if r2.CacheCreationTokens != nil {
 		t.Fatalf("cache creation must be unknown, got %v", *r2.CacheCreationTokens)
+	}
+}
+
+func TestKnownBuildIdentityLeavesUnavailableValuesUnknown(t *testing.T) {
+	for _, value := range []string{"", " ", "unknown", "(devel)", "dev"} {
+		if got := knownBuildIdentity(value); got != nil {
+			t.Errorf("knownBuildIdentity(%q) = %q, want nil", value, *got)
+		}
+	}
+	if got := knownBuildIdentity("  v1.2.3  "); got == nil || *got != "v1.2.3" {
+		t.Fatalf("known build value = %v, want v1.2.3", got)
 	}
 }
 
