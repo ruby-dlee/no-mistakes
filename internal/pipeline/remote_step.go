@@ -22,6 +22,7 @@ type RemoteStepRequest struct {
 	DesiredHeadSHA   string
 	BaseSHA          string
 	Branch           string
+	DefaultBranch    string
 	Fixing           bool
 	PreviousFindings string
 	UserIntent       string

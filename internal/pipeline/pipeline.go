@@ -95,6 +95,9 @@ type StepContext struct {
 	// OnPRMerged is a best-effort hook after a merged PR state is persisted.
 	// Eval uses it to relabel auto-fix/shipped-unfixed gold; nil is a no-op.
 	OnPRMerged func(ctx context.Context, runID string)
+	// CommitFixes replaces the durable daemon commit bookkeeping for isolated
+	// guest workers. Nil preserves the canonical local DB-backed behavior.
+	CommitFixes func(step types.StepName, summary, fallbackSummary string) error
 }
 
 // SemanticProofRequest binds one semantic repair's checks to the exact

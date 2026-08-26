@@ -180,6 +180,9 @@ func commitPipelineCorrectionWithCleanup(
 }
 
 func commitAgentFixes(sctx *pipeline.StepContext, stepName types.StepName, summary, fallbackSummary string) error {
+	if sctx.CommitFixes != nil {
+		return sctx.CommitFixes(stepName, summary, fallbackSummary)
+	}
 	ctx := sctx.Ctx
 	if err := assertPipelineHeadContinuity(sctx, stepName); err != nil {
 		return err
@@ -228,6 +231,54 @@ func commitAgentFixes(sctx *pipeline.StepContext, stepName types.StepName, summa
 		pipeline.PersistUncertifiedPipelineRange(sctx, startingHead, headSHA)
 	}
 	sctx.Log(fmt.Sprintf("committed agent fixes: %s", commitMessage))
+	return nil
+}
+
+// CommitIsolatedWorkerFixes commits guest-agent changes without touching the
+// daemon database. The caller supplies an exact recorded head in sctx.Run and
+// must validate the final descendant before returning it to the controller.
+func CommitIsolatedWorkerFixes(sctx *pipeline.StepContext, stepName types.StepName, summary, fallbackSummary string) error {
+	ctx := sctx.Ctx
+	if err := assertPipelineHeadContinuity(sctx, stepName); err != nil {
+		return err
+	}
+	status, err := git.Run(ctx, sctx.WorkDir, "status", "--porcelain=v1", "--untracked-files=all")
+	if err != nil {
+		return fmt.Errorf("inspect %s agent changes: %w", stepName, err)
+	}
+	if strings.TrimSpace(status) == "" {
+		return errors.New("isolated repair produced no changes")
+	}
+	if summary == "" {
+		summary = fallbackSummary
+	}
+	if summary == "" {
+		summary = "apply fixes"
+	}
+	message, err := sctx.Config.Commit.RenderFixMessage(stepName, summary)
+	if err != nil {
+		return fmt.Errorf("render %s fix commit message: %w", stepName, err)
+	}
+	if _, err := git.Run(ctx, sctx.WorkDir, "add", "-A"); err != nil {
+		return fmt.Errorf("stage %s changes: %w", stepName, err)
+	}
+	if err := commitPipelineCorrection(ctx, sctx.WorkDir, message, sctx.Log); err != nil {
+		return fmt.Errorf("commit %s changes: %w", stepName, err)
+	}
+	head, err := git.HeadSHA(ctx, sctx.WorkDir)
+	if err != nil {
+		return fmt.Errorf("resolve head after %s commit: %w", stepName, err)
+	}
+	if _, err := git.Run(ctx, sctx.WorkDir, "merge-base", "--is-ancestor", sctx.Run.HeadSHA, head); err != nil {
+		return fmt.Errorf("isolated %s repair is not a descendant of its input head", stepName)
+	}
+	if _, err := git.Run(ctx, sctx.WorkDir, "update-ref", normalizedBranchRef(sctx.Run.Branch), head); err != nil {
+		return fmt.Errorf("update isolated repair branch: %w", err)
+	}
+	sctx.Run.HeadSHA = head
+	if sctx.Log != nil {
+		sctx.Log(fmt.Sprintf("committed agent fixes: %s", message))
+	}
 	return nil
 }
 

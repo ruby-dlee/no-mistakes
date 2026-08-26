@@ -82,3 +82,14 @@ func decodeStepOutcome(data []byte, wantStep StepOutcomeStep, outputHead string)
 	}
 	return outcome, nil
 }
+
+// ValidateStepOutcome applies the same closed result contract used by the
+// controller to an in-memory guest outcome before it is materialized.
+func ValidateStepOutcome(outcome StepOutcomeEnvelope, wantStep StepOutcomeStep, outputHead string) error {
+	data, err := json.Marshal(outcome)
+	if err != nil {
+		return err
+	}
+	_, err = decodeStepOutcome(data, wantStep, outputHead)
+	return err
+}

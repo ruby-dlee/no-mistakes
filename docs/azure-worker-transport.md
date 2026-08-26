@@ -26,7 +26,22 @@ private payload directory contains exactly:
 - `brief.md`: one `no-mistakes.azure-worker-step-input/v1` JSON object whose
   SHA-256 is in the request envelope. It binds `run_id`, `repo_id`,
   `step_result_id`, `step`, `round`, `desired_head_sha`, `base_sha`, `branch`,
-  `fixing`, `previous_findings_json`, `user_intent`, and `user_intent_source`.
+  `default_branch`, `fixing`, `previous_findings_json`, `user_intent`, and
+  `user_intent_source`.
+
+The staged runtime executes exactly:
+
+```text
+no-mistakes worker run --role review|repair|test \
+  --brief <path-to-brief.md> --result <path-to-step-outcome.json>
+```
+
+This standalone path never opens the daemon database or recursively invokes
+the coordinator. It admits only an exact clean checkout at the bound head and
+base, uses the configured Pi harness and the existing Review/Test step
+contracts, and writes the semantic outcome atomically only after the worktree
+and returned head pass their final checks. Agent, tool, parse, or timeout
+failures write no outcome.
 
 `request.json` uses `no-mistakes.firstmate-worker-request/v1`. It binds the job,
 run, canonical step name, step-result ID, kind, round, desired head, input digest, owner-decision head, desired
@@ -45,10 +60,11 @@ The wrapper writes one closed `no-mistakes.worker-step-outcome/v1` object to
 `no-mistakes.firstmate-worker-result/v1` object at `result.json`, then exits
 zero. The semantic object contains only `step`, `needs_approval`,
 `auto_fixable`, `findings_json`, `exit_code`, `fix_summary`,
-`review_approved_head_sha`, `skipped`, and `skip_remaining`. Review and repair
-outcomes bind review approval to the exact output head; test outcomes cannot
-assert review authority. This separate digest-bound object prevents a remote
-finding from being collapsed into a clear/pass transport result.
+`review_approved_head_sha`, `skipped`, and `skip_remaining`. Review outcomes,
+including review repair, bind review approval to the exact output head; test
+outcomes, including test repair, cannot assert review authority. This separate
+digest-bound object prevents a remote finding from being collapsed into a
+clear/pass transport result.
 
 Every request binding must be echoed exactly. Unknown fields, trailing data,
 missing files, wrong identities, wrong heads, and stale fences fail closed.

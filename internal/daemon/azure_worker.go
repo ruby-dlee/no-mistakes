@@ -19,24 +19,6 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/workertransport"
 )
 
-const azureWorkerStepInputSchema = "no-mistakes.azure-worker-step-input/v1"
-
-type azureWorkerStepInput struct {
-	Schema           string         `json:"schema"`
-	RunID            string         `json:"run_id"`
-	RepoID           string         `json:"repo_id"`
-	StepResultID     string         `json:"step_result_id"`
-	Step             types.StepName `json:"step"`
-	Round            int            `json:"round"`
-	DesiredHeadSHA   string         `json:"desired_head_sha"`
-	BaseSHA          string         `json:"base_sha"`
-	Branch           string         `json:"branch"`
-	Fixing           bool           `json:"fixing"`
-	PreviousFindings string         `json:"previous_findings_json,omitempty"`
-	UserIntent       string         `json:"user_intent,omitempty"`
-	UserIntentSource string         `json:"user_intent_source,omitempty"`
-}
-
 type azureWorkerRuntime struct {
 	database *db.DB
 	store    *workertransport.DurableStore
@@ -144,11 +126,12 @@ func (r *azureWorkerRuntime) ExecuteRemoteStep(ctx context.Context, request pipe
 	if request.Fixing {
 		kind = db.PipelineJobRepair
 	}
-	inputBytes, err := json.Marshal(azureWorkerStepInput{
-		Schema: azureWorkerStepInputSchema, RunID: request.RunID, RepoID: request.RepoID,
+	inputBytes, err := json.Marshal(workertransport.StepInputEnvelope{
+		Schema: workertransport.StepInputSchema, RunID: request.RunID, RepoID: request.RepoID,
 		StepResultID: request.StepResultID, Step: request.Step, Round: request.Round,
 		DesiredHeadSHA: request.DesiredHeadSHA, BaseSHA: request.BaseSHA, Branch: request.Branch,
-		Fixing: request.Fixing, PreviousFindings: request.PreviousFindings,
+		DefaultBranch: request.DefaultBranch,
+		Fixing:        request.Fixing, PreviousFindings: request.PreviousFindings,
 		UserIntent: request.UserIntent, UserIntentSource: request.UserIntentSource,
 	})
 	if err != nil {
