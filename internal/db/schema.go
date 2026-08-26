@@ -322,6 +322,19 @@ CREATE TABLE IF NOT EXISTS branch_desired_state (
     PRIMARY KEY (repo_id, branch)
 );
 
+-- Worker execution and CI custody advance independently. Keeping their
+-- generations in separate tables prevents a CI wait from invalidating an
+-- exact review/test lease (and vice versa) on the same branch.
+CREATE TABLE IF NOT EXISTS worker_desired_state (
+    repo_id         TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    branch          TEXT NOT NULL,
+    revision        INTEGER NOT NULL CHECK (revision > 0),
+    head_sha        TEXT NOT NULL,
+    input_digest    TEXT NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, branch)
+);
+
 CREATE TABLE IF NOT EXISTS github_deliveries (
     delivery_id     TEXT PRIMARY KEY,
     payload_digest  TEXT NOT NULL,
@@ -342,6 +355,9 @@ CREATE TABLE IF NOT EXISTS ci_waits (
     head_sha            TEXT NOT NULL,
     input_digest        TEXT NOT NULL,
     desired_generation  INTEGER NOT NULL CHECK (desired_generation > 0),
+    declared_no_ci      INTEGER NOT NULL DEFAULT 0 CHECK (declared_no_ci IN (0, 1)),
+    evidence_local_root TEXT NOT NULL DEFAULT '',
+    trusted_config_bound INTEGER NOT NULL DEFAULT 0 CHECK (trusted_config_bound IN (0, 1)),
     status              TEXT NOT NULL CHECK (status IN ('waiting', 'ready', 'failed', 'closed')),
     check_state         TEXT NOT NULL,
     next_reconcile_at   INTEGER NOT NULL,
@@ -367,6 +383,9 @@ CREATE TABLE IF NOT EXISTS ci_reconciliations (
 // idempotent via its error being tolerated when the column already exists.
 var migrationStatements = []string{
 	`ALTER TABLE pipeline_jobs ADD COLUMN desired_generation INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE ci_waits ADD COLUMN declared_no_ci INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE ci_waits ADD COLUMN evidence_local_root TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE ci_waits ADD COLUMN trusted_config_bound INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE repos ADD COLUMN fork_url TEXT`,
 	`ALTER TABLE owner_decision_authorities ADD COLUMN repo_id TEXT`,
 	`ALTER TABLE owner_decision_authorities ADD COLUMN branch TEXT`,

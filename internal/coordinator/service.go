@@ -29,6 +29,7 @@ type ServiceOptions struct {
 	Interval       time.Duration
 	Now            func() time.Time
 	OnError        func(error)
+	OnApplied      func(db.CIReconciliationWork, db.CIReconciliationResult)
 }
 
 type Service struct {
@@ -40,6 +41,7 @@ type Service struct {
 	interval       time.Duration
 	now            func() time.Time
 	onError        func(error)
+	onApplied      func(db.CIReconciliationWork, db.CIReconciliationResult)
 }
 
 func NewService(options ServiceOptions) (*Service, error) {
@@ -61,7 +63,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 	return &Service{
 		store: options.Store, github: options.GitHub, reducer: options.Reducer,
 		batchSize: options.BatchSize, maxConcurrency: options.MaxConcurrency,
-		interval: options.Interval, now: options.Now, onError: options.OnError,
+		interval: options.Interval, now: options.Now, onError: options.OnError, onApplied: options.OnApplied,
 	}, nil
 }
 
@@ -139,24 +141,42 @@ func (s *Service) processOne(ctx context.Context, work db.CIReconciliationWork, 
 	if err != nil {
 		return fmt.Errorf("refetch CI state for wait %s failed", work.Wait.ID)
 	}
-	if state.RepoID != work.Wait.RepoID || state.PRNumber != work.Wait.PRNumber || state.HeadSHA != work.Wait.HeadSHA {
-		return fmt.Errorf("refetch CI state for wait %s: exact binding changed", work.Wait.ID)
+	if state.RepoID != work.Wait.RepoID || state.PRNumber != work.Wait.PRNumber {
+		return fmt.Errorf("refetch CI state for wait %s: repository or PR binding changed", work.Wait.ID)
 	}
-	status, err := s.reducer.ReduceCI(ctx, work, state)
-	if err != nil {
-		return fmt.Errorf("reduce CI state for wait %s failed", work.Wait.ID)
+	status := db.CIWaitFailed
+	failureReason := db.CIFailureHeadMoved
+	checkState := "failed"
+	if state.HeadSHA == work.Wait.HeadSHA {
+		status, err = s.reducer.ReduceCI(ctx, work, state)
+		if err != nil {
+			return fmt.Errorf("reduce CI state for wait %s failed", work.Wait.ID)
+		}
+		checkState = state.CheckState
+		failureReason = ""
+		if status == db.CIWaitFailed {
+			failureReason = db.CIFailureChecks
+			if state.Mergeability == db.MergeabilityConflict {
+				failureReason = db.CIFailureMergeConflict
+			}
+		}
 	}
-	applied, err := s.store.ApplyCIReconciliation(db.CIReconciliationResult{
+	result := db.CIReconciliationResult{
 		WaitID: work.Wait.ID, RepoID: work.Wait.RepoID, Branch: work.Wait.Branch,
 		PRNumber: work.Wait.PRNumber, HeadSHA: work.Wait.HeadSHA,
 		InputDigest: work.Wait.InputDigest, DesiredGeneration: work.Wait.DesiredGeneration,
-		Status: status, CheckState: state.CheckState, AppliedAt: at,
-	})
+		Status: status, CheckState: checkState, DeclaredNoCI: work.Wait.DeclaredNoCI,
+		FailureReason: failureReason, AppliedAt: at,
+	}
+	applied, err := s.store.ApplyCIReconciliation(result)
 	if err != nil {
 		return fmt.Errorf("apply CI state for wait %s: %w", work.Wait.ID, err)
 	}
 	if !applied {
 		return fmt.Errorf("apply CI state for wait %s: result not admitted", work.Wait.ID)
+	}
+	if s.onApplied != nil {
+		s.onApplied(work, result)
 	}
 	return nil
 }

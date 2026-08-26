@@ -154,19 +154,17 @@ func (r *azureWorkerRuntime) ExecuteRemoteStep(ctx context.Context, request pipe
 	if err != nil {
 		return nil, err
 	}
-	desiredGeneration := int64(0)
-	if desired, err := r.database.GetBranchDesiredState(request.RepoID, request.Branch); err != nil {
+	desired, _, _, err := r.database.AdvanceWorkerDesiredState(db.BranchDesiredUpdate{
+		RepoID: request.RepoID, Branch: request.Branch, HeadSHA: request.DesiredHeadSHA,
+		InputDigest: inputDigest, UpdatedAt: time.Now(),
+	})
+	if err != nil {
 		return nil, err
-	} else if desired != nil {
-		if desired.HeadSHA != request.DesiredHeadSHA || desired.InputDigest != inputDigest {
-			return nil, errors.New("Azure worker branch desired-state binding does not match this exact step input")
-		}
-		desiredGeneration = desired.Revision
 	}
 	job, _, err := r.database.EnqueuePipelineJob(db.PipelineJobSpec{
 		RunID: request.RunID, StepResultID: request.StepResultID, Kind: kind, Round: request.Round,
 		DesiredHeadSHA: request.DesiredHeadSHA, InputDigest: inputDigest,
-		OwnerDecisionHead: ownerHead, DesiredGeneration: desiredGeneration, MaxAttempts: 3,
+		OwnerDecisionHead: ownerHead, DesiredGeneration: desired.Revision, MaxAttempts: 3,
 	})
 	if err != nil {
 		return nil, err

@@ -23,7 +23,12 @@ import (
 
 const coordinatorShutdownTimeout = 2 * time.Second
 
-func adoptExistingCoordinatorCIWaits(database *db.DB, cfg config.Coordinator, at time.Time) (int, error) {
+type coordinatorAdoptionConfigResolver func(*db.Run, *db.Repo) (*config.Config, error)
+
+func adoptExistingCoordinatorCIWaits(database *db.DB, cfg config.Coordinator, at time.Time, resolveConfig coordinatorAdoptionConfigResolver) (int, error) {
+	if resolveConfig == nil {
+		return 0, errors.New("adopt coordinator CI waits: trusted config resolver is required")
+	}
 	runs, err := database.GetActiveRuns()
 	if err != nil {
 		return 0, err
@@ -46,9 +51,11 @@ func adoptExistingCoordinatorCIWaits(database *db.DB, cfg config.Coordinator, at
 		if activeCI != 1 {
 			return adopted, fmt.Errorf("adopt coordinator CI run %s: active CI step is ambiguous", run.ID)
 		}
-		if existing, err := database.GetCIWaitForRun(run.ID); err != nil {
+		existing, err := database.GetCIWaitForRun(run.ID)
+		if err != nil {
 			return adopted, err
-		} else if existing != nil {
+		}
+		if existing != nil && existing.TrustedConfigBound {
 			continue
 		}
 		repo, err := database.GetRepo(run.RepoID)
@@ -57,6 +64,17 @@ func adoptExistingCoordinatorCIWaits(database *db.DB, cfg config.Coordinator, at
 		}
 		if scm.DetectProviderContext(context.Background(), repo.UpstreamURL) != scm.ProviderGitHub || run.PRURL == nil {
 			return adopted, fmt.Errorf("adopt coordinator CI run %s: exact GitHub PR binding is unavailable", run.ID)
+		}
+		resolved, err := resolveConfig(run, repo)
+		if err != nil || resolved == nil {
+			return adopted, fmt.Errorf("adopt coordinator CI run %s: trusted config is unavailable", run.ID)
+		}
+		if existing != nil {
+			bound, bindErr := database.BindCIWaitTrustedConfig(run.ID, resolved.NoCI, resolved.Test.Evidence.LocalRoot, at)
+			if bindErr != nil || !bound {
+				return adopted, fmt.Errorf("adopt coordinator CI run %s: trusted config binding changed", run.ID)
+			}
+			continue
 		}
 		prText, err := scm.ExtractPRNumber(strings.TrimSpace(*run.PRURL))
 		if err != nil {
@@ -82,6 +100,8 @@ func adoptExistingCoordinatorCIWaits(database *db.DB, cfg config.Coordinator, at
 			RunID: run.ID, RepoID: repo.ID, Branch: run.Branch, PRNumber: prNumber,
 			HeadSHA: head, InputDigest: input, DesiredGeneration: desired.Revision,
 			RegisteredAt: at, ReconcileInterval: interval,
+			DeclaredNoCI: resolved.NoCI, EvidenceLocalRoot: resolved.Test.Evidence.LocalRoot,
+			TrustedConfigBound: true,
 		}); err != nil {
 			return adopted, fmt.Errorf("adopt coordinator CI run %s wait: %w", run.ID, err)
 		}
@@ -99,6 +119,7 @@ type coordinatorRuntimeOptions struct {
 	Repositories coordinator.RepositoryMapper
 	GitHub       coordinator.GitHubStateClient
 	Reducer      coordinator.CIStateReducer
+	Manager      *RunManager
 }
 
 type coordinatorRuntime struct {
@@ -150,6 +171,11 @@ func startCoordinatorRuntime(parent context.Context, options coordinatorRuntimeO
 		Interval: options.Config.ReconcileInterval,
 		OnError: func(err error) {
 			slog.Warn("coordinator reconciliation deferred", "error", err)
+		},
+		OnApplied: func(work db.CIReconciliationWork, result db.CIReconciliationResult) {
+			if options.Manager != nil {
+				options.Manager.handleCoordinatorResult(work, result)
+			}
 		},
 	})
 	if err != nil {

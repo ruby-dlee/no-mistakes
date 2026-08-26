@@ -630,6 +630,8 @@ func registerCoordinatorCIWait(sctx *pipeline.StepContext, prNumber string) (boo
 	} else if existing != nil {
 		if existing.RepoID == sctx.Repo.ID && existing.Branch == sctx.Run.Branch &&
 			existing.PRNumber == parsedPR && existing.HeadSHA == head && existing.InputDigest == input &&
+			existing.DeclaredNoCI == sctx.Config.NoCI && existing.TrustedConfigBound &&
+			existing.EvidenceLocalRoot == sctx.Config.Test.Evidence.LocalRoot &&
 			(existing.Status == db.CIWaitWaiting || existing.Status == db.CIWaitReady) {
 			return true, nil
 		}
@@ -647,7 +649,10 @@ func registerCoordinatorCIWait(sctx *pipeline.StepContext, prNumber string) (boo
 		RunID: sctx.Run.ID, RepoID: sctx.Repo.ID, Branch: sctx.Run.Branch,
 		PRNumber: parsedPR, HeadSHA: head, InputDigest: input,
 		DesiredGeneration: desired.Revision, RegisteredAt: now,
-		ReconcileInterval: coordinatorCIWaitInterval(sctx.Config.Coordinator.ReconcileInterval),
+		ReconcileInterval:  coordinatorCIWaitInterval(sctx.Config.Coordinator.ReconcileInterval),
+		DeclaredNoCI:       sctx.Config.NoCI,
+		EvidenceLocalRoot:  sctx.Config.Test.Evidence.LocalRoot,
+		TrustedConfigBound: true,
 	}); err != nil {
 		return false, fmt.Errorf("register coordinator CI wait: %w", err)
 	}

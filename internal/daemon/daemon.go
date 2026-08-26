@@ -259,7 +259,23 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, globalCfg *config.GlobalConf
 	// its restart reconciler instead of the generic stale-run terminalizer.
 	var coordinatorCIWaitRuns []string
 	if globalCfg.Coordinator.Enabled {
-		adopted, adoptErr := adoptExistingCoordinatorCIWaits(d, globalCfg.Coordinator, time.Now())
+		terminalized, terminalizeErr := d.TerminalizeLegacyFailedCIWaitRuns(time.Now())
+		if terminalizeErr != nil {
+			return fmt.Errorf("restore failed coordinator rerun custody: %w", terminalizeErr)
+		}
+		if terminalized > 0 {
+			slog.Info("terminalized legacy failed coordinator waits for clean rerun", "count", terminalized)
+		}
+		adopted, adoptErr := adoptExistingCoordinatorCIWaits(d, globalCfg.Coordinator, time.Now(),
+			func(run *db.Run, repo *db.Repo) (*config.Config, error) {
+				workDir := worktrees.RecordedDir(p, run.WorktreePath(), repo.ID, run.ID)
+				resolved, resolveErr := mgr.loadRecoveredConfig(context.Background(), run, repo, workDir)
+				if resolveErr != nil {
+					return nil, resolveErr
+				}
+				mgr.trackCoordinatorCustody(run.ID, repo.ID, p.RepoDir(repo.ID), workDir, resolved)
+				return resolved, nil
+			})
 		if adoptErr != nil {
 			return fmt.Errorf("adopt coordinator CI restart custody: %w", adoptErr)
 		}
@@ -271,7 +287,18 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, globalCfg *config.GlobalConf
 			return fmt.Errorf("load coordinator CI restart custody: %w", err)
 		}
 	}
-	recoverOnStartup(d, p, mgr, layout, coordinatorCIWaitRuns)
+	preservedExternalRuns := append([]string(nil), coordinatorCIWaitRuns...)
+	if azureWorkers != nil {
+		workerRuns, workerErr := d.RecoverablePipelineJobRunIDs()
+		if workerErr != nil {
+			return fmt.Errorf("load Azure worker restart custody: %w", workerErr)
+		}
+		preservedExternalRuns = append(preservedExternalRuns, workerRuns...)
+		if len(workerRuns) > 0 {
+			slog.Info("preserving active Azure worker jobs across startup", "count", len(workerRuns))
+		}
+	}
+	recoverOnStartup(d, p, mgr, layout, preservedExternalRuns)
 
 	srv := ipc.NewServer()
 
@@ -282,7 +309,7 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, globalCfg *config.GlobalConf
 	}
 
 	coordinatorRuntime, err := startCoordinatorRuntime(ctx, coordinatorRuntimeOptions{
-		Config: globalCfg.Coordinator, DB: d, Paths: p,
+		Config: globalCfg.Coordinator, DB: d, Paths: p, Manager: mgr,
 	})
 	if err != nil {
 		return fmt.Errorf("start coordinator: %w", err)
@@ -437,7 +464,7 @@ func writeDaemonPIDFile(path string, record daemonPIDFile) error {
 // best-effort migrates gate bare repos in place so older installs pick up
 // the per-worktree hookspath isolation introduced for issue #122 when Git
 // supports config --worktree.
-func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktrees.Layout, coordinatorCIWaitRuns []string) {
+func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktrees.Layout, externalCustodyRuns []string) {
 	orphanStarted := time.Now()
 	reapOrphanedServers(p)
 	logStartupPhase("orphan_servers", orphanStarted)
@@ -483,15 +510,15 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 	for _, plan := range plans {
 		preserved[plan.run.ID] = struct{}{}
 	}
-	coordinatorPreserved := 0
-	for _, id := range coordinatorCIWaitRuns {
+	externalPreserved := 0
+	for _, id := range externalCustodyRuns {
 		if _, exists := preserved[id]; !exists {
-			coordinatorPreserved++
+			externalPreserved++
 		}
 		preserved[id] = struct{}{}
 	}
 	logStartupPhase("parked_runs", parkedStarted,
-		"preserved", len(plans), "coordinator_preserved", coordinatorPreserved)
+		"preserved", len(plans), "external_custody_preserved", externalPreserved)
 
 	// Read while the runs that were executing when this daemon started still say
 	// so: recovery below turns them terminal, and they are the ones whose

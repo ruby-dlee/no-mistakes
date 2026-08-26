@@ -43,6 +43,7 @@ func (c *daemonGitHubClient) RefetchCIState(context.Context, string, int64) (db.
 	}
 	return db.AuthoritativeGitHubState{
 		RepoID: c.repoID, PRNumber: c.pr, HeadSHA: c.head, CheckState: state,
+		Mergeability: db.MergeabilityMergeable,
 	}, nil
 }
 
@@ -271,6 +272,59 @@ func TestCoordinatorRestartCustodySurvivesGenericDaemonRecovery(t *testing.T) {
 	}
 }
 
+func TestAzureWorkerRestartCustodySurvivesGenericDaemonRecovery(t *testing.T) {
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	repo, err := database.InsertRepo(t.TempDir(), "https://github.com/Ruby-Labs/Relvino.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := strings.Repeat("a", 40)
+	run, err := database.InsertRun(repo.ID, "review/worker-restart", head, strings.Repeat("0", 40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	step, err := database.InsertStepResult(run.ID, types.StepReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateStepStatus(step.ID, types.StepStatusRunning); err != nil {
+		t.Fatal(err)
+	}
+	input := strings.Repeat("b", 64)
+	desired, _, _, err := database.AdvanceWorkerDesiredState(db.BranchDesiredUpdate{
+		RepoID: repo.ID, Branch: run.Branch, HeadSHA: head, InputDigest: input, UpdatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := database.EnqueuePipelineJob(db.PipelineJobSpec{
+		RunID: run.ID, StepResultID: step.ID, Kind: db.PipelineJobReview, Round: 1,
+		DesiredHeadSHA: head, InputDigest: input, DesiredGeneration: desired.Revision, MaxAttempts: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recoverable, err := database.RecoverablePipelineJobRunIDs()
+	if err != nil || len(recoverable) != 1 || recoverable[0] != run.ID {
+		t.Fatalf("recoverable worker runs=%v err=%v", recoverable, err)
+	}
+	recoverOnStartup(database, p, NewRunManager(database, p, nil), worktrees.New(p, nil), recoverable)
+	preserved, err := database.GetRun(run.ID)
+	if err != nil || preserved.Status != types.RunRunning {
+		t.Fatalf("worker run=%+v err=%v", preserved, err)
+	}
+}
+
 func TestCoordinatorRestartAdoptsExistingRunningCIWithoutExecutionGoroutine(t *testing.T) {
 	p := paths.WithRoot(t.TempDir())
 	if err := p.EnsureDirs(); err != nil {
@@ -304,12 +358,20 @@ func TestCoordinatorRestartAdoptsExistingRunningCIWithoutExecutionGoroutine(t *t
 		t.Fatal(err)
 	}
 
-	adopted, err := adoptExistingCoordinatorCIWaits(database, config.Coordinator{ReconcileInterval: 15 * time.Second}, time.Now())
+	resolvedTrustedConfig := false
+	adopted, err := adoptExistingCoordinatorCIWaits(database, config.Coordinator{ReconcileInterval: 15 * time.Second}, time.Now(),
+		func(gotRun *db.Run, gotRepo *db.Repo) (*config.Config, error) {
+			if gotRun.ID != run.ID || gotRepo.ID != repo.ID {
+				t.Fatalf("resolver binding run=%s repo=%s", gotRun.ID, gotRepo.ID)
+			}
+			resolvedTrustedConfig = true
+			return &config.Config{NoCI: true}, nil
+		})
 	if err != nil || adopted != 1 {
 		t.Fatalf("adopted=%d err=%v", adopted, err)
 	}
 	wait, err := database.GetCIWaitForRun(run.ID)
-	if err != nil || wait == nil || wait.HeadSHA != head || wait.PRNumber != 327 || wait.IntervalSeconds != 60 {
+	if err != nil || wait == nil || wait.HeadSHA != head || wait.PRNumber != 327 || wait.IntervalSeconds != 60 || !wait.DeclaredNoCI || !resolvedTrustedConfig {
 		t.Fatalf("adopted wait=%+v err=%v", wait, err)
 	}
 	recoverable, err := database.RecoverableCIWaitRunIDs()
@@ -318,5 +380,56 @@ func TestCoordinatorRestartAdoptsExistingRunningCIWithoutExecutionGoroutine(t *t
 	}
 	if active := NewRunManager(database, p, nil).ActiveExecutionRunIDs(); len(active) != 0 {
 		t.Fatalf("durable wait spawned execution goroutine: %v", active)
+	}
+
+	// Existing waits from the pre-binding schema migrate with an explicit
+	// unbound marker. Startup must resolve their trusted no_ci/evidence config
+	// once, rather than preserving the migration defaults forever.
+	legacyRun, err := database.InsertRun(repo.ID, "review/legacy", strings.Repeat("c", 40), strings.Repeat("0", 40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunPRURL(legacyRun.ID, "https://github.com/Ruby-Labs/relvino/pull/328"); err != nil {
+		t.Fatal(err)
+	}
+	legacyStep, err := database.InsertStepResult(legacyRun.ID, types.StepCI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatus(legacyRun.ID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateStepStatus(legacyStep.ID, types.StepStatusRunning); err != nil {
+		t.Fatal(err)
+	}
+	legacyInput := db.CIWaitInputDigest(repo.ID, legacyRun.Branch, 328, legacyRun.HeadSHA)
+	legacyDesired, _, _, err := database.AdvanceBranchDesiredState(db.BranchDesiredUpdate{
+		RepoID: repo.ID, Branch: legacyRun.Branch, HeadSHA: legacyRun.HeadSHA,
+		InputDigest: legacyInput, UpdatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyWaitID, err := database.RegisterCIWait(db.CIWaitSpec{
+		RunID: legacyRun.ID, RepoID: repo.ID, Branch: legacyRun.Branch, PRNumber: 328,
+		HeadSHA: legacyRun.HeadSHA, InputDigest: legacyInput, DesiredGeneration: legacyDesired.Revision,
+		RegisteredAt: time.Now(), ReconcileInterval: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	customEvidence := filepath.Join(t.TempDir(), "coordinator-evidence")
+	resolvedTrustedConfig = false
+	adopted, err = adoptExistingCoordinatorCIWaits(database, config.Coordinator{ReconcileInterval: time.Minute}, time.Now(),
+		func(*db.Run, *db.Repo) (*config.Config, error) {
+			resolvedTrustedConfig = true
+			return &config.Config{NoCI: true, Test: config.Test{Evidence: config.Evidence{LocalRoot: customEvidence}}}, nil
+		})
+	if err != nil || adopted != 0 || !resolvedTrustedConfig {
+		t.Fatalf("legacy binding adopted=%d resolved=%v err=%v", adopted, resolvedTrustedConfig, err)
+	}
+	wait, err = database.GetCIWait(legacyWaitID)
+	if err != nil || !wait.TrustedConfigBound || !wait.DeclaredNoCI || wait.EvidenceLocalRoot != customEvidence {
+		t.Fatalf("bound legacy wait=%+v err=%v", wait, err)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -784,14 +785,32 @@ func (d *DB) verifyPipelineJobCanonicalBindingsTx(tx *sql.Tx, job *PipelineJob) 
 	}
 	var revision int64
 	var desiredHead, inputDigest string
-	err := tx.QueryRow(`SELECT revision, head_sha, input_digest FROM branch_desired_state WHERE repo_id = ? AND branch = ?`, repoID, branch).
+	err := tx.QueryRow(`SELECT revision, head_sha, input_digest FROM worker_desired_state WHERE repo_id = ? AND branch = ?`, repoID, branch).
 		Scan(&revision, &desiredHead, &inputDigest)
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("verify desired generation: %w", err)
 	}
 	if err == sql.ErrNoRows {
-		if job.DesiredGeneration != 0 {
-			return errors.New("job names a desired generation without branch state")
+		if job.DesiredGeneration == 0 {
+			// Jobs created before desired generations existed remain exact through
+			// their run, step, and head bindings above.
+		} else {
+			// One release used branch_desired_state for both CI custody and worker
+			// execution. Accept that table only while the new worker namespace is
+			// absent and its complete binding still matches, so an in-flight job
+			// survives the first upgraded daemon restart without weakening later
+			// worker generations.
+			err = tx.QueryRow(`SELECT revision, head_sha, input_digest FROM branch_desired_state WHERE repo_id = ? AND branch = ?`, repoID, branch).
+				Scan(&revision, &desiredHead, &inputDigest)
+			if err != nil {
+				if err == sql.ErrNoRows {
+					return errors.New("job names a desired generation without worker or migration state")
+				}
+				return fmt.Errorf("verify migrated desired generation: %w", err)
+			}
+			if revision != job.DesiredGeneration || desiredHead != job.DesiredHeadSHA || inputDigest != job.InputDigest {
+				return errors.New("migrated desired generation, head, or input binding changed")
+			}
 		}
 	} else if revision != job.DesiredGeneration || desiredHead != job.DesiredHeadSHA || inputDigest != job.InputDigest {
 		return errors.New("desired generation, head, or input binding changed")
@@ -813,6 +832,48 @@ func (d *DB) verifyPipelineJobCanonicalBindingsTx(tx *sql.Tx, job *PipelineJob) 
 		return fmt.Errorf("owner-decision head binding changed: %w", err)
 	}
 	return nil
+}
+
+// RecoverablePipelineJobRunIDs returns active runs with at least one queued or
+// leased worker job whose run, step, head, worker generation, and owner history
+// are still exact. Startup uses this set before generic stale-run recovery.
+func (d *DB) RecoverablePipelineJobRunIDs() ([]string, error) {
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT `+pipelineJobColumns+` FROM pipeline_jobs WHERE status IN (?, ?) ORDER BY run_id, id`, PipelineJobQueued, PipelineJobLeased)
+	if err != nil {
+		return nil, err
+	}
+	var jobs []*PipelineJob
+	for rows.Next() {
+		job, scanErr := scanPipelineJob(rows)
+		if scanErr != nil {
+			rows.Close()
+			return nil, scanErr
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{})
+	for _, job := range jobs {
+		if err := d.verifyPipelineJobCanonicalBindingsTx(tx, job); err == nil {
+			seen[job.RunID] = struct{}{}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids, nil
 }
 
 func (d *DB) pipelineJobOwnerHeadCurrentTx(tx *sql.Tx, job *PipelineJob) (bool, error) {

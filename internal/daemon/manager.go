@@ -56,6 +56,7 @@ type RunManager struct {
 	paths            *paths.Paths
 	steps            StepFactory
 	remoteSteps      pipeline.RemoteStepRunner
+	coordinatorRuns  map[string]coordinatorCleanupPlan
 
 	branchLocks sync.Map // repoID+"/"+branch → *sync.Mutex
 
@@ -76,6 +77,11 @@ type RunManager struct {
 	stateRevs      map[string]int64           // runID → monotonic state revision
 	completedRuns  map[string]bool            // runIDs whose goroutines have finished
 	completedOrder []string                   // insertion order for FIFO eviction
+}
+
+type coordinatorCleanupPlan struct {
+	repoID, gateDir, workDir string
+	cfg                      *config.Config
 }
 
 func (m *RunManager) SetRemoteStepRunner(runner pipeline.RemoteStepRunner) {
@@ -108,6 +114,7 @@ func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *Ru
 		cancels:          make(map[string]context.CancelCauseFunc),
 		dones:            make(map[string]chan struct{}),
 		pendingProtected: make(map[string]recoveredRunPlan),
+		coordinatorRuns:  make(map[string]coordinatorCleanupPlan),
 		db:               database,
 		paths:            p,
 		steps:            stepFactory,
@@ -415,6 +422,7 @@ func (m *RunManager) resumeRecoveredRunArmed(plan recoveredRunPlan, expectedOwne
 	m.cancels[plan.run.ID] = cancel
 	m.dones[plan.run.ID] = done
 	m.mu.Unlock()
+	m.trackCoordinatorCustody(plan.run.ID, plan.repo.ID, plan.gateDir, plan.workDir, plan.cfg)
 
 	m.wg.Add(1)
 	go func() {
@@ -433,15 +441,14 @@ func (m *RunManager) resumeRecoveredRunArmed(plan recoveredRunPlan, expectedOwne
 			}
 			cancel(nil)
 			_ = plan.agent.Close()
-			m.closeSubscribers(plan.run.ID)
 			if !coordinatorDeferred {
+				m.clearCoordinatorCustody(plan.run.ID)
+				m.closeSubscribers(plan.run.ID)
 				m.removeRunWorktree(plan.repo.ID, plan.run.ID, plan.gateDir, plan.workDir, "resumed_run_finished")
-			}
-			// A recovered run is a finished run too. This is the second of the
-			// two completion boundaries, and leaving it out is what let a run
-			// resumed after a daemon restart keep its empty evidence directory
-			// until some later run or restart happened to sweep it.
-			if !coordinatorDeferred {
+				// A recovered run is a finished run too. This is the second of the
+				// two completion boundaries, and leaving it out is what let a run
+				// resumed after a daemon restart keep its empty evidence directory
+				// until some later run or restart happened to sweep it.
 				m.cleanupRunEvidence(plan.cfg, plan.run.ID)
 			}
 			m.mu.Lock()
@@ -628,6 +635,78 @@ func (m *RunManager) cleanupRunEvidence(cfg *config.Config, runID string) {
 		slog.Debug("run evidence kept", "run_id", runID, "reason", err)
 	}
 	reapEvidence(m.db, root, policy, time.Now())
+}
+
+func (m *RunManager) cleanupCoordinatorEvidenceAfterRestart(configuredRoot, runID string) {
+	if err := m.paths.ValidateEvidenceRoot(configuredRoot); err != nil {
+		slog.Warn("coordinator evidence cleanup refused", "run_id", runID, "error", err)
+		return
+	}
+	path := m.paths.RunEvidenceDir(configuredRoot, runID)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		slog.Debug("coordinator evidence kept", "run_id", runID, "reason", err)
+	}
+}
+
+func (m *RunManager) trackCoordinatorCustody(runID, repoID, gateDir, workDir string, cfg *config.Config) {
+	m.mu.Lock()
+	m.coordinatorRuns[runID] = coordinatorCleanupPlan{
+		repoID: repoID, gateDir: gateDir, workDir: workDir, cfg: cfg,
+	}
+	m.mu.Unlock()
+}
+
+func (m *RunManager) clearCoordinatorCustody(runID string) {
+	m.mu.Lock()
+	delete(m.coordinatorRuns, runID)
+	m.mu.Unlock()
+}
+
+// handleCoordinatorResult wakes attached clients on every durable projection.
+// A terminal coordinator result owns the cleanup that the execution goroutine
+// deliberately skipped when it transferred custody.
+func (m *RunManager) handleCoordinatorResult(work db.CIReconciliationWork, result db.CIReconciliationResult) {
+	runID := work.Wait.RunID
+	if runID == "" {
+		return
+	}
+	status := types.RunRunning
+	eventType := ipc.EventRunUpdated
+	terminal := result.Status == db.CIWaitFailed || result.Status == db.CIWaitClosed
+	if result.Status == db.CIWaitFailed {
+		status = types.RunFailed
+		eventType = ipc.EventRunCompleted
+	} else if result.Status == db.CIWaitClosed {
+		status = types.RunCompleted
+		eventType = ipc.EventRunCompleted
+	}
+	statusText := string(status)
+	m.broadcast(ipc.Event{Type: eventType, RunID: runID, Status: &statusText})
+	if !terminal {
+		return
+	}
+
+	m.mu.Lock()
+	cleanup, tracked := m.coordinatorRuns[runID]
+	delete(m.coordinatorRuns, runID)
+	m.mu.Unlock()
+	if !tracked {
+		run, err := m.db.GetRun(runID)
+		if err == nil && run != nil {
+			cleanup.repoID = run.RepoID
+			cleanup.gateDir = m.paths.RepoDir(run.RepoID)
+			cleanup.workDir = worktrees.RecordedDir(m.paths, run.WorktreePath(), run.RepoID, run.ID)
+		}
+	}
+	if cleanup.repoID != "" && cleanup.workDir != "" {
+		m.removeRunWorktree(cleanup.repoID, runID, cleanup.gateDir, cleanup.workDir, "coordinator_terminal")
+	}
+	if cleanup.cfg != nil {
+		m.cleanupRunEvidence(cleanup.cfg, runID)
+	} else {
+		m.cleanupCoordinatorEvidenceAfterRestart(work.Wait.EvidenceLocalRoot, runID)
+	}
+	m.closeSubscribers(runID)
 }
 
 // removeRunWorktree tears one run's worktree down: it sweeps whatever is still
@@ -1240,6 +1319,7 @@ func (m *RunManager) startRunWithIntentSourceAndOwnerDecision(ctx context.Contex
 	m.cancels[run.ID] = cancel
 	m.dones[run.ID] = done
 	m.mu.Unlock()
+	m.trackCoordinatorCustody(run.ID, repo.ID, gateDir, wtDir, cfg)
 
 	// Background goroutine now owns worktree cleanup.
 	bgOwnsWorktree = true
@@ -1285,9 +1365,11 @@ func (m *RunManager) startRunWithIntentSourceAndOwnerDecision(ctx context.Contex
 			}
 			cancel(nil)
 			ag.Close()
-			// Close subscriber channels for this run.
-			m.closeSubscribers(run.ID)
 			if !coordinatorDeferred {
+				m.clearCoordinatorCustody(run.ID)
+				// Close subscriber channels only when execution or coordinator
+				// custody is terminal. A deferred wait must remain attachable.
+				m.closeSubscribers(run.ID)
 				m.removeRunWorktree(repo.ID, run.ID, gateDir, wtDir, "run_finished")
 				m.cleanupRunEvidence(cfg, run.ID)
 			}
@@ -1750,6 +1832,11 @@ func (m *RunManager) cancelActiveRuns(repoID, branch string) error {
 			}
 			wtDir := worktrees.RecordedDir(m.paths, candidate.run.WorktreePath(), repoID, candidate.run.ID)
 			m.removeRunWorktree(repoID, candidate.run.ID, m.paths.RepoDir(repoID), wtDir, "coordinator_run_superseded")
+			m.clearCoordinatorCustody(candidate.run.ID)
+			m.cleanupRunEvidence(nil, candidate.run.ID)
+			status := string(types.RunCancelled)
+			m.broadcast(ipc.Event{Type: ipc.EventRunCompleted, RunID: candidate.run.ID, Status: &status})
+			m.closeSubscribers(candidate.run.ID)
 			slog.Info("cancelled coordinator-owned run", "run_id", candidate.run.ID, "repo_id", repoID, "branch", branch)
 			continue
 		}

@@ -335,7 +335,7 @@ func TestServiceRecoversLostWebhooksAfterRestartWithBoundedConcurrencyAndNoLease
 		t.Fatalf("completed waits left pending work=%d err=%v", len(pending), err)
 	}
 	liveness, err := database.UpdaterPipelineLiveness(start)
-	if err != nil || len(liveness.ActiveWorkerLeases) != 0 || liveness.LegacyActiveRowsIgnored != 43 {
+	if err != nil || len(liveness.ActiveWorkerLeases) != 0 || liveness.LegacyActiveRowsIgnored != 30 {
 		t.Fatalf("liveness=%+v err=%v", liveness, err)
 	}
 
@@ -379,5 +379,41 @@ func TestServiceRetainsFailedRefetchWithoutLeakingClientError(t *testing.T) {
 	pending, pendingErr := database.PendingCIReconciliationWork(10)
 	if pendingErr != nil || len(pending) != 1 {
 		t.Fatalf("failed refetch consumed durable work=%d err=%v", len(pending), pendingErr)
+	}
+}
+
+func TestServiceHeadMoveFailsOldExactRunAndNotifiesTerminalObserver(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	start := time.Unix(1_800_000_000, 0)
+	fixture := addWait(t, database, 120, start)
+	moved := strings.Repeat("f", 40)
+	client := &staticGitHubClient{states: map[stateKey]db.AuthoritativeGitHubState{
+		{repoID: fixture.repoID, pr: fixture.pr}: {
+			RepoID: fixture.repoID, PRNumber: fixture.pr, HeadSHA: moved,
+			CheckState: "passed", Mergeability: db.MergeabilityMergeable,
+		},
+	}}
+	var observed db.CIReconciliationResult
+	service, err := NewService(ServiceOptions{
+		Store: database, GitHub: client, Reducer: ExactCIStateReducer{}, BatchSize: 10,
+		MaxConcurrency: 2, Interval: time.Minute,
+		OnApplied: func(_ db.CIReconciliationWork, result db.CIReconciliationResult) { observed = result },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ProcessOnce(context.Background(), start); err != nil {
+		t.Fatal(err)
+	}
+	wait, err := database.GetCIWait(fixture.waitID)
+	if err != nil || wait.Status != db.CIWaitFailed {
+		t.Fatalf("head-moved wait=%+v err=%v", wait, err)
+	}
+	if observed.Status != db.CIWaitFailed || observed.FailureReason != db.CIFailureHeadMoved || observed.HeadSHA != fixture.head {
+		t.Fatalf("terminal observation=%+v", observed)
 	}
 }

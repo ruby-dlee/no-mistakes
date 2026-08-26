@@ -49,10 +49,24 @@ func (d *DB) GetBranchDesiredState(repoID, branch string) (*BranchDesiredState, 
 	return &state, nil
 }
 
-// AdvanceBranchDesiredState coalesces an exact replay and advances every new
-// semantic push by one revision. The same transaction supersedes obsolete
-// queued/leased worker jobs, which invalidates their fences before any stale
-// completion can commit.
+func (d *DB) GetWorkerDesiredState(repoID, branch string) (*BranchDesiredState, error) {
+	var state BranchDesiredState
+	err := d.sql.QueryRow(
+		`SELECT repo_id, branch, revision, head_sha, input_digest, updated_at
+		   FROM worker_desired_state WHERE repo_id = ? AND branch = ?`, repoID, branch,
+	).Scan(&state.RepoID, &state.Branch, &state.Revision, &state.HeadSHA, &state.InputDigest, &state.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get worker desired state: %w", err)
+	}
+	return &state, nil
+}
+
+// AdvanceBranchDesiredState coalesces an exact CI replay and advances every new
+// CI custody binding by one revision. Worker execution has an independent
+// generation namespace in AdvanceWorkerDesiredState.
 func (d *DB) AdvanceBranchDesiredState(update BranchDesiredUpdate) (BranchDesiredState, bool, int, error) {
 	if strings.TrimSpace(update.RepoID) == "" || strings.TrimSpace(update.Branch) == "" ||
 		!validGitHead(update.HeadSHA) || !validDigest(update.InputDigest) {
@@ -90,6 +104,62 @@ func (d *DB) AdvanceBranchDesiredState(update BranchDesiredUpdate) (BranchDesire
 		}
 		return state, true, 0, nil
 	}
+	if _, err := tx.Exec(`UPDATE ci_waits SET status = 'closed', updated_at = ?
+	 WHERE repo_id = ? AND branch = ? AND status IN ('waiting', 'ready', 'failed')
+	 AND (desired_generation < ? OR head_sha <> ? OR input_digest <> ?)`,
+		ts, update.RepoID, update.Branch, state.Revision, state.HeadSHA, state.InputDigest); err != nil {
+		return BranchDesiredState{}, false, 0, err
+	}
+	if _, err := tx.Exec(`DELETE FROM ci_reconciliations WHERE wait_id IN
+	 (SELECT id FROM ci_waits WHERE repo_id = ? AND branch = ? AND status = 'closed')`, update.RepoID, update.Branch); err != nil {
+		return BranchDesiredState{}, false, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return BranchDesiredState{}, false, 0, err
+	}
+	return state, false, 0, nil
+}
+
+// AdvanceWorkerDesiredState advances only the exact review/repair/test
+// execution generation. It supersedes obsolete worker leases without touching
+// coordinator CI waits on the same branch.
+func (d *DB) AdvanceWorkerDesiredState(update BranchDesiredUpdate) (BranchDesiredState, bool, int, error) {
+	if strings.TrimSpace(update.RepoID) == "" || strings.TrimSpace(update.Branch) == "" ||
+		!validGitHead(update.HeadSHA) || !validDigest(update.InputDigest) {
+		return BranchDesiredState{}, false, 0, errors.New("advance worker desired state: invalid exact binding")
+	}
+	ts := update.UpdatedAt.Unix()
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return BranchDesiredState{}, false, 0, err
+	}
+	defer tx.Rollback()
+	state := BranchDesiredState{}
+	err = tx.QueryRow(
+		`INSERT INTO worker_desired_state (repo_id, branch, revision, head_sha, input_digest, updated_at)
+		 VALUES (?, ?, 1, ?, ?, ?)
+		 ON CONFLICT(repo_id, branch) DO UPDATE SET
+		   revision = worker_desired_state.revision + 1,
+		   head_sha = excluded.head_sha, input_digest = excluded.input_digest, updated_at = excluded.updated_at
+		 WHERE worker_desired_state.head_sha <> excluded.head_sha OR worker_desired_state.input_digest <> excluded.input_digest
+		 RETURNING repo_id, branch, revision, head_sha, input_digest, updated_at`,
+		update.RepoID, update.Branch, update.HeadSHA, update.InputDigest, ts,
+	).Scan(&state.RepoID, &state.Branch, &state.Revision, &state.HeadSHA, &state.InputDigest, &state.UpdatedAt)
+	replay := false
+	if err == sql.ErrNoRows {
+		replay = true
+		err = tx.QueryRow(`SELECT repo_id, branch, revision, head_sha, input_digest, updated_at FROM worker_desired_state WHERE repo_id = ? AND branch = ?`, update.RepoID, update.Branch).
+			Scan(&state.RepoID, &state.Branch, &state.Revision, &state.HeadSHA, &state.InputDigest, &state.UpdatedAt)
+	}
+	if err != nil {
+		return BranchDesiredState{}, false, 0, fmt.Errorf("advance worker desired state: %w", err)
+	}
+	if replay {
+		if err := tx.Commit(); err != nil {
+			return BranchDesiredState{}, false, 0, err
+		}
+		return state, true, 0, nil
+	}
 	rows, err := tx.Query(
 		`UPDATE pipeline_jobs SET status = ?, superseded_at = ?, lease_expires_at = NULL,
 		 heartbeat_at = NULL, updated_at = ?
@@ -120,16 +190,6 @@ func (d *DB) AdvanceBranchDesiredState(update BranchDesiredUpdate) (BranchDesire
 		if err := insertPipelineJobEventTx(tx, job, "superseded", ts); err != nil {
 			return BranchDesiredState{}, false, 0, err
 		}
-	}
-	if _, err := tx.Exec(`UPDATE ci_waits SET status = 'closed', updated_at = ?
-	 WHERE repo_id = ? AND branch = ? AND status IN ('waiting', 'ready', 'failed')
-	 AND (desired_generation < ? OR head_sha <> ? OR input_digest <> ?)`,
-		ts, update.RepoID, update.Branch, state.Revision, state.HeadSHA, state.InputDigest); err != nil {
-		return BranchDesiredState{}, false, 0, err
-	}
-	if _, err := tx.Exec(`DELETE FROM ci_reconciliations WHERE wait_id IN
-	 (SELECT id FROM ci_waits WHERE repo_id = ? AND branch = ? AND status = 'closed')`, update.RepoID, update.Branch); err != nil {
-		return BranchDesiredState{}, false, 0, err
 	}
 	if err := tx.Commit(); err != nil {
 		return BranchDesiredState{}, false, 0, err
@@ -181,9 +241,12 @@ func (d *DB) AdmitGitHubDelivery(delivery GitHubDelivery) (bool, error) {
 
 type CIWaitSpec struct {
 	RunID, RepoID, Branch, HeadSHA, InputDigest string
+	EvidenceLocalRoot                           string
 	PRNumber, DesiredGeneration                 int64
 	RegisteredAt                                time.Time
 	ReconcileInterval                           time.Duration
+	DeclaredNoCI                                bool
+	TrustedConfigBound                          bool
 }
 
 // CIWaitInputDigest is the content-free semantic identity shared by new CI
@@ -208,10 +271,11 @@ func (d *DB) RegisterCIWait(spec CIWaitSpec) (string, error) {
 	defer tx.Rollback()
 	if _, err := tx.Exec(`INSERT INTO ci_waits
 	 (id, run_id, repo_id, branch, pr_number, head_sha, input_digest, desired_generation,
-	  status, check_state, next_reconcile_at, interval_seconds, created_at, updated_at)
-	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'waiting', 'unknown', ?, ?, ?, ?)`,
+	  declared_no_ci, evidence_local_root, trusted_config_bound, status, check_state, next_reconcile_at, interval_seconds, created_at, updated_at)
+	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', 'unknown', ?, ?, ?, ?)`,
 		id, spec.RunID, spec.RepoID, spec.Branch, spec.PRNumber, spec.HeadSHA,
-		spec.InputDigest, spec.DesiredGeneration, ts, int64(spec.ReconcileInterval/time.Second), ts, ts); err != nil {
+		spec.InputDigest, spec.DesiredGeneration, spec.DeclaredNoCI, spec.EvidenceLocalRoot, spec.TrustedConfigBound,
+		ts, int64(spec.ReconcileInterval/time.Second), ts, ts); err != nil {
 		return "", err
 	}
 	var bound int
@@ -232,9 +296,15 @@ func (d *DB) RegisterCIWait(spec CIWaitSpec) (string, error) {
 }
 
 type AuthoritativeGitHubState struct {
-	RepoID, HeadSHA, CheckState string
-	PRNumber                    int64
+	RepoID, HeadSHA, CheckState, Mergeability string
+	PRNumber                                  int64
 }
+
+const (
+	MergeabilityUnknown   = "unknown"
+	MergeabilityMergeable = "mergeable"
+	MergeabilityConflict  = "conflict"
+)
 
 // ConfirmGitHubDelivery accepts only an injected authoritative refetch bound
 // to the delivery's repository/PR/head. It coalesces one durable reconciliation
@@ -303,8 +373,11 @@ const (
 
 type CIWait struct {
 	ID, RunID, RepoID, Branch, HeadSHA, InputDigest string
+	EvidenceLocalRoot                               string
 	PRNumber, DesiredGeneration                     int64
 	Status                                          CIWaitStatus
+	DeclaredNoCI                                    bool
+	TrustedConfigBound                              bool
 	CheckState                                      string
 	NextReconcileAt, IntervalSeconds                int64
 	LastDeliveryID                                  *string
@@ -321,8 +394,16 @@ type CIReconciliationResult struct {
 	PRNumber, DesiredGeneration                  int64
 	Status                                       CIWaitStatus
 	CheckState                                   string
+	DeclaredNoCI                                 bool
+	FailureReason                                string
 	AppliedAt                                    time.Time
 }
+
+const (
+	CIFailureChecks        = "checks_failed"
+	CIFailureHeadMoved     = "head_moved"
+	CIFailureMergeConflict = "merge_conflict"
+)
 
 func (d *DB) ScheduleDueCIReconciliations(at time.Time, limit int) (int, error) {
 	if limit < 1 || limit > 100 {
@@ -391,7 +472,8 @@ func (d *DB) PendingCIReconciliationWork(limit int) ([]CIReconciliationWork, err
 	}
 	rows, err := d.sql.Query(`SELECT r.wait_id, r.reason, r.delivery_id, r.requested_at,
 	 w.id, w.run_id, w.repo_id, w.branch, w.pr_number, w.head_sha, w.input_digest,
-	 w.desired_generation, w.status, w.check_state, w.next_reconcile_at,
+	 w.desired_generation, w.declared_no_ci, w.evidence_local_root, w.trusted_config_bound,
+	 w.status, w.check_state, w.next_reconcile_at,
 	 w.interval_seconds, w.last_delivery_id, w.created_at, w.updated_at
 	 FROM ci_reconciliations r JOIN ci_waits w ON w.id = r.wait_id
 	 WHERE w.status IN ('waiting', 'ready') ORDER BY r.requested_at, r.wait_id LIMIT ?`, limit)
@@ -407,7 +489,8 @@ func (d *DB) PendingCIReconciliationWork(limit int) ([]CIReconciliationWork, err
 			&item.Reconciliation.DeliveryID, &item.Reconciliation.RequestedAt,
 			&item.Wait.ID, &item.Wait.RunID, &item.Wait.RepoID, &item.Wait.Branch,
 			&item.Wait.PRNumber, &item.Wait.HeadSHA, &item.Wait.InputDigest,
-			&item.Wait.DesiredGeneration, &item.Wait.Status, &item.Wait.CheckState,
+			&item.Wait.DesiredGeneration, &item.Wait.DeclaredNoCI, &item.Wait.EvidenceLocalRoot, &item.Wait.TrustedConfigBound,
+			&item.Wait.Status, &item.Wait.CheckState,
 			&item.Wait.NextReconcileAt, &item.Wait.IntervalSeconds,
 			&item.Wait.LastDeliveryID, &item.Wait.CreatedAt, &item.Wait.UpdatedAt,
 		); err != nil {
@@ -421,10 +504,11 @@ func (d *DB) PendingCIReconciliationWork(limit int) ([]CIReconciliationWork, err
 func (d *DB) GetCIWait(id string) (*CIWait, error) {
 	item := &CIWait{}
 	err := d.sql.QueryRow(`SELECT id, run_id, repo_id, branch, pr_number, head_sha,
-	 input_digest, desired_generation, status, check_state, next_reconcile_at,
+		 input_digest, desired_generation, declared_no_ci, evidence_local_root, trusted_config_bound, status, check_state, next_reconcile_at,
 	 interval_seconds, last_delivery_id, created_at, updated_at FROM ci_waits WHERE id = ?`, id).
 		Scan(&item.ID, &item.RunID, &item.RepoID, &item.Branch, &item.PRNumber,
-			&item.HeadSHA, &item.InputDigest, &item.DesiredGeneration, &item.Status,
+			&item.HeadSHA, &item.InputDigest, &item.DesiredGeneration, &item.DeclaredNoCI,
+			&item.EvidenceLocalRoot, &item.TrustedConfigBound, &item.Status,
 			&item.CheckState, &item.NextReconcileAt, &item.IntervalSeconds,
 			&item.LastDeliveryID, &item.CreatedAt, &item.UpdatedAt)
 	if err == sql.ErrNoRows {
@@ -440,10 +524,11 @@ func (d *DB) GetCIWait(id string) (*CIWait, error) {
 func (d *DB) GetCIWaitForRun(runID string) (*CIWait, error) {
 	item := &CIWait{}
 	err := d.sql.QueryRow(`SELECT id, run_id, repo_id, branch, pr_number, head_sha,
-	 input_digest, desired_generation, status, check_state, next_reconcile_at,
+	 input_digest, desired_generation, declared_no_ci, evidence_local_root, trusted_config_bound, status, check_state, next_reconcile_at,
 	 interval_seconds, last_delivery_id, created_at, updated_at FROM ci_waits WHERE run_id = ?`, runID).
 		Scan(&item.ID, &item.RunID, &item.RepoID, &item.Branch, &item.PRNumber,
-			&item.HeadSHA, &item.InputDigest, &item.DesiredGeneration, &item.Status,
+			&item.HeadSHA, &item.InputDigest, &item.DesiredGeneration, &item.DeclaredNoCI,
+			&item.EvidenceLocalRoot, &item.TrustedConfigBound, &item.Status,
 			&item.CheckState, &item.NextReconcileAt, &item.IntervalSeconds,
 			&item.LastDeliveryID, &item.CreatedAt, &item.UpdatedAt)
 	if err == sql.ErrNoRows {
@@ -453,6 +538,20 @@ func (d *DB) GetCIWaitForRun(runID string) (*CIWait, error) {
 		return nil, err
 	}
 	return item, nil
+}
+
+// BindCIWaitTrustedConfig upgrades a wait created before trusted no_ci and
+// evidence cleanup settings were persisted. The marker makes this a one-time
+// startup migration instead of a config refetch on every daemon restart.
+func (d *DB) BindCIWaitTrustedConfig(runID string, declaredNoCI bool, evidenceLocalRoot string, at time.Time) (bool, error) {
+	result, err := d.sql.Exec(`UPDATE ci_waits SET declared_no_ci = ?, evidence_local_root = ?,
+		trusted_config_bound = 1, updated_at = ? WHERE run_id = ? AND trusted_config_bound = 0
+		AND status IN ('waiting', 'ready')`, declaredNoCI, evidenceLocalRoot, at.Unix(), runID)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	return count == 1, err
 }
 
 // CancelCoordinatorCIWaitRun transfers custody from an obsolete durable CI
@@ -549,6 +648,65 @@ func (d *DB) RecoverableCIWaitRunIDs() ([]string, error) {
 	return ids, rows.Err()
 }
 
+// TerminalizeLegacyFailedCIWaitRuns upgrades failed waits produced by the
+// earlier coordinator projection, which parked a fake approval gate after the
+// execution goroutine had already transferred custody. Terminal failure makes
+// the existing rerun action authoritative and lets startup clean its resources.
+func (d *DB) TerminalizeLegacyFailedCIWaitRuns(at time.Time) (int, error) {
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT w.run_id FROM ci_waits w
+		JOIN runs r ON r.id = w.run_id
+		WHERE w.status = ? AND r.status IN (?, ?)
+		AND 1 = (SELECT COUNT(*) FROM step_results s WHERE s.run_id = w.run_id
+			AND s.step_name = ? AND s.status IN (?, ?))
+		ORDER BY w.run_id`, CIWaitFailed, types.RunPending, types.RunRunning,
+		types.StepCI, types.StepStatusAwaitingApproval, types.StepStatusFixReview)
+	if err != nil {
+		return 0, err
+	}
+	var runIDs []string
+	for rows.Next() {
+		var runID string
+		if err := rows.Scan(&runID); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		runIDs = append(runIDs, runID)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	ts := at.Unix()
+	reason := coordinatorFailureMessage(CIFailureChecks)
+	for _, runID := range runIDs {
+		if _, err := tx.Exec(`UPDATE step_results SET status = ?, completed_at = ?, error = ?,
+			last_activity_at = ?, last_activity = ?, agent_pid = NULL
+			WHERE run_id = ? AND step_name = ? AND status IN (?, ?)`,
+			types.StepStatusFailed, ts, reason, ts, "status: failed", runID, types.StepCI,
+			types.StepStatusAwaitingApproval, types.StepStatusFixReview); err != nil {
+			return 0, err
+		}
+		if _, err := tx.Exec(`UPDATE runs SET status = ?, error = ?, ci_ready_at = NULL,
+			ci_ready_no_ci = 0, awaiting_agent_since = NULL, updated_at = ?
+			WHERE id = ? AND status IN (?, ?)`, types.RunFailed, reason, ts, runID,
+			types.RunPending, types.RunRunning); err != nil {
+			return 0, err
+		}
+		if _, err := tx.Exec(`DELETE FROM ci_reconciliations WHERE wait_id IN
+			(SELECT id FROM ci_waits WHERE run_id = ?)`, runID); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(runIDs), nil
+}
+
 // ApplyCIReconciliation commits a terminal reducer result only while every
 // exact wait and desired-generation binding is still current. The durable
 // reconciliation record is deleted in the same transaction and only after
@@ -561,6 +719,15 @@ func (d *DB) ApplyCIReconciliation(result CIReconciliationResult) (bool, error) 
 		(result.Status != CIWaitWaiting && result.Status != CIWaitReady &&
 			result.Status != CIWaitFailed && result.Status != CIWaitClosed) {
 		return false, errors.New("apply CI reconciliation: invalid exact result")
+	}
+	if result.Status == CIWaitFailed {
+		switch result.FailureReason {
+		case CIFailureChecks, CIFailureHeadMoved, CIFailureMergeConflict:
+		default:
+			return false, errors.New("apply CI reconciliation: failed result has no bounded recovery reason")
+		}
+	} else if result.FailureReason != "" {
+		return false, errors.New("apply CI reconciliation: non-failed result has failure reason")
 	}
 	tx, err := d.sql.Begin()
 	if err != nil {
@@ -637,9 +804,10 @@ func projectCIReconciliationTx(tx *sql.Tx, result CIReconciliationResult) error 
 	case CIWaitReady:
 		return updateExactRunCIState(tx, runID, result, ts, false)
 	case CIWaitFailed:
-		updated, err := tx.Exec(`UPDATE step_results SET status = ?, last_activity_at = ?,
+		reason := coordinatorFailureMessage(result.FailureReason)
+		updated, err := tx.Exec(`UPDATE step_results SET status = ?, completed_at = ?, error = ?, last_activity_at = ?,
 			last_activity = ?, agent_pid = NULL WHERE run_id = ? AND step_name = ? AND status IN (?, ?, ?)`,
-			types.StepStatusAwaitingApproval, ts, "status: awaiting_approval", runID, types.StepCI,
+			types.StepStatusFailed, ts, reason, ts, "status: failed", runID, types.StepCI,
 			types.StepStatusRunning, types.StepStatusFixing, types.StepStatusFixReview)
 		if err != nil {
 			return err
@@ -647,7 +815,18 @@ func projectCIReconciliationTx(tx *sql.Tx, result CIReconciliationResult) error 
 		if count, err := updated.RowsAffected(); err != nil || count != 1 {
 			return errors.New("failed CI step projection lost custody")
 		}
-		return updateExactRunCIState(tx, runID, result, nil, true)
+		updated, err = tx.Exec(`UPDATE runs SET status = ?, error = ?, ci_ready_at = NULL,
+			ci_ready_no_ci = 0, awaiting_agent_since = NULL, updated_at = ?
+			WHERE id = ? AND repo_id = ? AND branch = ? AND head_sha = ? AND status IN (?, ?)`,
+			types.RunFailed, reason, ts, runID, result.RepoID, result.Branch, result.HeadSHA,
+			types.RunPending, types.RunRunning)
+		if err != nil {
+			return err
+		}
+		if count, err := updated.RowsAffected(); err != nil || count != 1 {
+			return errors.New("failed CI run projection lost custody")
+		}
+		return nil
 	case CIWaitClosed:
 		if err := finalizeTerminalPRRun(tx, runID, ts); err != nil {
 			return err
@@ -669,15 +848,27 @@ func projectCIReconciliationTx(tx *sql.Tx, result CIReconciliationResult) error 
 	}
 }
 
+func coordinatorFailureMessage(reason string) string {
+	switch reason {
+	case CIFailureHeadMoved:
+		return "coordinator stopped: the PR head moved; rerun no-mistakes against the new exact head"
+	case CIFailureMergeConflict:
+		return "coordinator stopped: the PR has merge conflicts; resolve them and rerun no-mistakes"
+	default:
+		return "coordinator stopped: CI checks failed; fix or rerun the checks, then rerun no-mistakes"
+	}
+}
+
 func updateExactRunCIState(tx *sql.Tx, runID string, result CIReconciliationResult, readyAt any, awaiting bool) error {
 	awaitingAt := any(nil)
 	if awaiting {
 		awaitingAt = result.AppliedAt.Unix()
 	}
-	updated, err := tx.Exec(`UPDATE runs SET ci_ready_at = ?, ci_ready_no_ci = 0,
+	declaredNoCI := result.Status == CIWaitReady && result.DeclaredNoCI
+	updated, err := tx.Exec(`UPDATE runs SET ci_ready_at = ?, ci_ready_no_ci = ?,
 		awaiting_agent_since = ?, updated_at = ? WHERE id = ? AND repo_id = ?
 		AND branch = ? AND head_sha = ? AND status IN (?, ?)`,
-		readyAt, awaitingAt, result.AppliedAt.Unix(), runID, result.RepoID,
+		readyAt, declaredNoCI, awaitingAt, result.AppliedAt.Unix(), runID, result.RepoID,
 		result.Branch, result.HeadSHA, types.RunPending, types.RunRunning)
 	if err != nil {
 		return err

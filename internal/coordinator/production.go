@@ -119,6 +119,29 @@ func (a *GitHubAuthority) RefetchCIState(ctx context.Context, repoID string, prN
 	if err != nil {
 		return db.AuthoritativeGitHubState{}, errors.New("GitHub lifecycle refetch failed")
 	}
+	mergeability := db.MergeabilityUnknown
+	if prState == scm.PRStateOpen {
+		if !host.Capabilities().MergeableState {
+			return db.AuthoritativeGitHubState{}, errors.New("GitHub authority cannot establish mergeability")
+		}
+		mergeState, mergeErr := host.GetMergeableState(refetchCtx, pr)
+		if mergeErr != nil {
+			return db.AuthoritativeGitHubState{}, errors.New("GitHub mergeability refetch failed")
+		}
+		switch {
+		case mergeState.Conflict():
+			mergeability = db.MergeabilityConflict
+		case mergeState.Resolved():
+			mergeability = db.MergeabilityMergeable
+		default:
+			mergeability = db.MergeabilityUnknown
+		}
+	}
+	// Discover checks last: GitHub's implementation binds them to the current PR
+	// head and verifies that head again after discovery. A head move between the
+	// mergeability read and this call therefore returns the new exact head to the
+	// service, which fails the old wait closed instead of mixing new mergeability
+	// with old-head checks.
 	checks, err := host.GetChecks(refetchCtx, pr)
 	if err != nil {
 		return db.AuthoritativeGitHubState{}, errors.New("GitHub check refetch failed")
@@ -131,7 +154,8 @@ func (a *GitHubAuthority) RefetchCIState(ctx context.Context, repoID string, prN
 		return db.AuthoritativeGitHubState{}, err
 	}
 	return db.AuthoritativeGitHubState{
-		RepoID: repoID, PRNumber: prNumber, HeadSHA: pr.HeadSHA, CheckState: checkState,
+		RepoID: repoID, PRNumber: prNumber, HeadSHA: pr.HeadSHA,
+		CheckState: checkState, Mergeability: mergeability,
 	}, nil
 }
 
@@ -198,14 +222,30 @@ func (ExactCIStateReducer) ReduceCI(_ context.Context, work db.CIReconciliationW
 		return "", errors.New("authoritative state exact binding changed")
 	}
 	switch state.CheckState {
-	case "unknown", "pending":
+	case "closed":
+		return db.CIWaitClosed, nil
+	}
+	switch state.Mergeability {
+	case db.MergeabilityConflict:
+		return db.CIWaitFailed, nil
+	case db.MergeabilityUnknown, "":
+		return db.CIWaitWaiting, nil
+	case db.MergeabilityMergeable:
+	default:
+		return "", errors.New("authoritative mergeability is invalid")
+	}
+	switch state.CheckState {
+	case "unknown":
+		if work.Wait.DeclaredNoCI {
+			return db.CIWaitReady, nil
+		}
+		return db.CIWaitWaiting, nil
+	case "pending":
 		return db.CIWaitWaiting, nil
 	case "passed":
 		return db.CIWaitReady, nil
 	case "failed":
 		return db.CIWaitFailed, nil
-	case "closed":
-		return db.CIWaitClosed, nil
 	default:
 		return "", errors.New("authoritative state is invalid")
 	}

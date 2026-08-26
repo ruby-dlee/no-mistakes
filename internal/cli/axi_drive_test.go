@@ -570,6 +570,26 @@ func TestRenderDriveResult_DeclaredNoCIChecksPassed(t *testing.T) {
 	}
 }
 
+func TestRenderDriveResult_CoordinatorFailureOffersRerunPrimaryAction(t *testing.T) {
+	reason := "coordinator stopped: the PR head moved; rerun no-mistakes against the new exact head"
+	run := &ipc.RunInfo{
+		ID: "run-1", Branch: "feature/x", Status: types.RunFailed, HeadSHA: "abcdef1234567890",
+		Error: &reason,
+		Steps: []ipc.StepResultInfo{{StepName: types.StepCI, Status: types.StepStatusFailed}},
+	}
+	var out bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&out)
+	err := renderDriveResult(cmd, run, false)
+	if err == nil {
+		t.Fatal("failed coordinator result must remain blocked")
+	}
+	got := out.String()
+	if !strings.Contains(got, "no-mistakes axi rerun") || !strings.Contains(got, "exact-head custody") {
+		t.Fatalf("coordinator rerun guidance missing:\n%s", got)
+	}
+}
+
 func TestRenderDriveResult_ChecksPassedWithFixes(t *testing.T) {
 	run := &ipc.RunInfo{
 		ID:      "run-1",

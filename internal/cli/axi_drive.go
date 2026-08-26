@@ -691,6 +691,9 @@ func renderDriveResult(cmd *cobra.Command, run *ipc.RunInfo, ciReady bool) error
 	}
 
 	help := []string{preserveGateFixCommitsGuidance}
+	if run.Error != nil && strings.HasPrefix(*run.Error, "coordinator stopped:") {
+		help = append([]string{"After resolving the reported CI condition, run `no-mistakes axi rerun` from this branch to start fresh exact-head custody."}, help...)
+	}
 	if hasBranchSync {
 		help = append(help, branchSyncAgentGuidance)
 	}

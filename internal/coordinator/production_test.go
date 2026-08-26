@@ -32,12 +32,13 @@ type authoritativeHostStub struct {
 	head   string
 	state  scm.PRState
 	checks []scm.Check
+	merge  scm.MergeableState
 	calls  []string
 }
 
 func (h *authoritativeHostStub) Provider() scm.Provider { return scm.ProviderGitHub }
 func (h *authoritativeHostStub) Capabilities() scm.Capabilities {
-	return scm.Capabilities{}
+	return scm.Capabilities{MergeableState: true}
 }
 func (h *authoritativeHostStub) Available(context.Context) error { return nil }
 func (h *authoritativeHostStub) FindPR(context.Context, string, string) (*scm.PR, error) {
@@ -59,7 +60,8 @@ func (h *authoritativeHostStub) GetChecks(_ context.Context, pr *scm.PR) ([]scm.
 	return h.checks, nil
 }
 func (h *authoritativeHostStub) GetMergeableState(context.Context, *scm.PR) (scm.MergeableState, error) {
-	return scm.MergeableUnknown, scm.ErrUnsupported
+	h.calls = append(h.calls, "mergeability")
+	return h.merge, nil
 }
 func (h *authoritativeHostStub) FetchFailedCheckLogs(context.Context, *scm.PR, string, string, []string) (string, error) {
 	return "", scm.ErrUnsupported
@@ -91,6 +93,7 @@ func TestGitHubAuthorityRefetchesThroughSCMHostAndClassifiesExactHead(t *testing
 	host := &authoritativeHostStub{
 		head: head, state: scm.PRStateOpen,
 		checks: []scm.Check{{Name: "unit", Bucket: scm.CheckBucketPass}, {Name: "lint", Bucket: scm.CheckBucketSkip}},
+		merge:  scm.MergeableOK,
 	}
 	authority, err := NewGitHubAuthority(GitHubAuthorityOptions{
 		Store: repositoryStoreStub{repos: []*db.Repo{{ID: "repo", UpstreamURL: "https://github.com/Ruby-Labs/Relvino.git"}}},
@@ -103,10 +106,10 @@ func TestGitHubAuthorityRefetchesThroughSCMHostAndClassifiesExactHead(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.RepoID != "repo" || state.PRNumber != 327 || state.HeadSHA != head || state.CheckState != "passed" {
+	if state.RepoID != "repo" || state.PRNumber != 327 || state.HeadSHA != head || state.CheckState != "passed" || state.Mergeability != db.MergeabilityMergeable {
 		t.Fatalf("state=%+v", state)
 	}
-	if strings.Join(host.calls, ",") != "state,checks" {
+	if strings.Join(host.calls, ",") != "state,mergeability,checks" {
 		t.Fatalf("SCM calls=%v", host.calls)
 	}
 
@@ -149,7 +152,7 @@ func TestGitHubAuthorityFailsClosedOutsideGitHubOrWithoutExactHead(t *testing.T)
 		})
 	}
 
-	host := &authoritativeHostStub{head: "not-a-sha", state: scm.PRStateOpen}
+	host := &authoritativeHostStub{head: "not-a-sha", state: scm.PRStateOpen, merge: scm.MergeableOK}
 	authority, err := NewGitHubAuthority(GitHubAuthorityOptions{
 		Store: repositoryStoreStub{repos: []*db.Repo{{ID: "repo", UpstreamURL: "https://github.com/Ruby-Labs/Relvino.git"}}},
 		Host:  func(context.Context, *db.Repo) (scm.Host, error) { return host, nil },
@@ -164,7 +167,7 @@ func TestGitHubAuthorityFailsClosedOutsideGitHubOrWithoutExactHead(t *testing.T)
 
 func TestExactCIStateReducerRejectsChangedBindingsAndMapsState(t *testing.T) {
 	work := db.CIReconciliationWork{Wait: db.CIWait{
-		RepoID: "repo", PRNumber: 7, HeadSHA: strings.Repeat("a", 40),
+		RepoID: "repo", PRNumber: 7, HeadSHA: strings.Repeat("a", 40), DeclaredNoCI: false,
 	}}
 	for state, want := range map[string]db.CIWaitStatus{
 		"unknown": db.CIWaitWaiting,
@@ -174,15 +177,37 @@ func TestExactCIStateReducerRejectsChangedBindingsAndMapsState(t *testing.T) {
 		"closed":  db.CIWaitClosed,
 	} {
 		got, err := (ExactCIStateReducer{}).ReduceCI(context.Background(), work, db.AuthoritativeGitHubState{
-			RepoID: "repo", PRNumber: 7, HeadSHA: work.Wait.HeadSHA, CheckState: state,
+			RepoID: "repo", PRNumber: 7, HeadSHA: work.Wait.HeadSHA, CheckState: state, Mergeability: db.MergeabilityMergeable,
 		})
 		if err != nil || got != want {
 			t.Errorf("state %q: got=%q err=%v want=%q", state, got, err, want)
 		}
 	}
 	if _, err := (ExactCIStateReducer{}).ReduceCI(context.Background(), work, db.AuthoritativeGitHubState{
-		RepoID: "repo", PRNumber: 7, HeadSHA: strings.Repeat("b", 40), CheckState: "passed",
+		RepoID: "repo", PRNumber: 7, HeadSHA: strings.Repeat("b", 40), CheckState: "passed", Mergeability: db.MergeabilityMergeable,
 	}); err == nil {
 		t.Fatal("changed head was admitted")
+	}
+}
+
+func TestExactCIStateReducerRequiresMergeabilityAndTrustedNoCI(t *testing.T) {
+	head := strings.Repeat("a", 40)
+	work := db.CIReconciliationWork{Wait: db.CIWait{RepoID: "repo", PRNumber: 7, HeadSHA: head}}
+	state := db.AuthoritativeGitHubState{RepoID: "repo", PRNumber: 7, HeadSHA: head, CheckState: "passed", Mergeability: db.MergeabilityUnknown}
+	if got, err := (ExactCIStateReducer{}).ReduceCI(context.Background(), work, state); err != nil || got != db.CIWaitWaiting {
+		t.Fatalf("unresolved mergeability got=%q err=%v", got, err)
+	}
+	state.Mergeability = db.MergeabilityConflict
+	if got, err := (ExactCIStateReducer{}).ReduceCI(context.Background(), work, state); err != nil || got != db.CIWaitFailed {
+		t.Fatalf("conflict got=%q err=%v", got, err)
+	}
+	state.Mergeability = db.MergeabilityMergeable
+	state.CheckState = "unknown"
+	if got, err := (ExactCIStateReducer{}).ReduceCI(context.Background(), work, state); err != nil || got != db.CIWaitWaiting {
+		t.Fatalf("empty checks without no_ci got=%q err=%v", got, err)
+	}
+	work.Wait.DeclaredNoCI = true
+	if got, err := (ExactCIStateReducer{}).ReduceCI(context.Background(), work, state); err != nil || got != db.CIWaitReady {
+		t.Fatalf("trusted no_ci got=%q err=%v", got, err)
 	}
 }
