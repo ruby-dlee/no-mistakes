@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+var (
+	ErrGitHubDeliveryConflict = errors.New("GitHub delivery conflicts with prior binding")
+	ErrGitHubStateMismatch    = errors.New("authoritative GitHub state does not match delivery")
+)
+
 type BranchDesiredState struct {
 	RepoID      string
 	Branch      string
@@ -150,7 +155,7 @@ func (d *DB) AdmitGitHubDelivery(delivery GitHubDelivery) (bool, error) {
 		return false, err
 	}
 	if digest != delivery.PayloadDigest || repo != delivery.RepoID || pr != delivery.PRNumber || head != delivery.HeadSHA || event != delivery.EventType {
-		return false, errors.New("admit GitHub delivery: delivery ID conflicts with prior digest or binding")
+		return false, fmt.Errorf("admit GitHub delivery: %w", ErrGitHubDeliveryConflict)
 	}
 	return true, nil
 }
@@ -219,7 +224,7 @@ func (d *DB) ConfirmGitHubDelivery(deliveryID string, state AuthoritativeGitHubS
 		return 0, err
 	}
 	if state.RepoID != repo || state.PRNumber != pr || state.HeadSHA != deliveryHead || !validGitHead(state.HeadSHA) || !validGitHubCheckState(state.CheckState) {
-		return 0, errors.New("confirm GitHub delivery: authoritative refetch does not match delivery")
+		return 0, fmt.Errorf("confirm GitHub delivery: %w", ErrGitHubStateMismatch)
 	}
 	ts := at.Unix()
 	rows, err := tx.Query(`SELECT id FROM ci_waits WHERE repo_id = ? AND pr_number = ? AND head_sha = ? AND status = 'waiting'`, repo, pr, state.HeadSHA)
@@ -258,6 +263,38 @@ type CIReconciliation struct {
 	WaitID, Reason string
 	DeliveryID     *string
 	RequestedAt    int64
+}
+
+type CIWaitStatus string
+
+const (
+	CIWaitWaiting CIWaitStatus = "waiting"
+	CIWaitReady   CIWaitStatus = "ready"
+	CIWaitFailed  CIWaitStatus = "failed"
+	CIWaitClosed  CIWaitStatus = "closed"
+)
+
+type CIWait struct {
+	ID, RunID, RepoID, Branch, HeadSHA, InputDigest string
+	PRNumber, DesiredGeneration                     int64
+	Status                                          CIWaitStatus
+	CheckState                                      string
+	NextReconcileAt, IntervalSeconds                int64
+	LastDeliveryID                                  *string
+	CreatedAt, UpdatedAt                            int64
+}
+
+type CIReconciliationWork struct {
+	Reconciliation CIReconciliation
+	Wait           CIWait
+}
+
+type CIReconciliationResult struct {
+	WaitID, RepoID, Branch, HeadSHA, InputDigest string
+	PRNumber, DesiredGeneration                  int64
+	Status                                       CIWaitStatus
+	CheckState                                   string
+	AppliedAt                                    time.Time
 }
 
 func (d *DB) ScheduleDueCIReconciliations(at time.Time, limit int) (int, error) {
@@ -319,6 +356,116 @@ func (d *DB) PendingCIReconciliations(limit int) ([]CIReconciliation, error) {
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+func (d *DB) PendingCIReconciliationWork(limit int) ([]CIReconciliationWork, error) {
+	if limit < 1 || limit > 100 {
+		return nil, errors.New("pending CI reconciliation work: limit must be 1..100")
+	}
+	rows, err := d.sql.Query(`SELECT r.wait_id, r.reason, r.delivery_id, r.requested_at,
+	 w.id, w.run_id, w.repo_id, w.branch, w.pr_number, w.head_sha, w.input_digest,
+	 w.desired_generation, w.status, w.check_state, w.next_reconcile_at,
+	 w.interval_seconds, w.last_delivery_id, w.created_at, w.updated_at
+	 FROM ci_reconciliations r JOIN ci_waits w ON w.id = r.wait_id
+	 WHERE w.status = 'waiting' ORDER BY r.requested_at, r.wait_id LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CIReconciliationWork
+	for rows.Next() {
+		var item CIReconciliationWork
+		if err := rows.Scan(
+			&item.Reconciliation.WaitID, &item.Reconciliation.Reason,
+			&item.Reconciliation.DeliveryID, &item.Reconciliation.RequestedAt,
+			&item.Wait.ID, &item.Wait.RunID, &item.Wait.RepoID, &item.Wait.Branch,
+			&item.Wait.PRNumber, &item.Wait.HeadSHA, &item.Wait.InputDigest,
+			&item.Wait.DesiredGeneration, &item.Wait.Status, &item.Wait.CheckState,
+			&item.Wait.NextReconcileAt, &item.Wait.IntervalSeconds,
+			&item.Wait.LastDeliveryID, &item.Wait.CreatedAt, &item.Wait.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (d *DB) GetCIWait(id string) (*CIWait, error) {
+	item := &CIWait{}
+	err := d.sql.QueryRow(`SELECT id, run_id, repo_id, branch, pr_number, head_sha,
+	 input_digest, desired_generation, status, check_state, next_reconcile_at,
+	 interval_seconds, last_delivery_id, created_at, updated_at FROM ci_waits WHERE id = ?`, id).
+		Scan(&item.ID, &item.RunID, &item.RepoID, &item.Branch, &item.PRNumber,
+			&item.HeadSHA, &item.InputDigest, &item.DesiredGeneration, &item.Status,
+			&item.CheckState, &item.NextReconcileAt, &item.IntervalSeconds,
+			&item.LastDeliveryID, &item.CreatedAt, &item.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return item, nil
+}
+
+// ApplyCIReconciliation commits a terminal reducer result only while every
+// exact wait and desired-generation binding is still current. The durable
+// reconciliation record is deleted in the same transaction and only after
+// the compare-and-swap succeeds.
+func (d *DB) ApplyCIReconciliation(result CIReconciliationResult) (bool, error) {
+	if strings.TrimSpace(result.WaitID) == "" || strings.TrimSpace(result.RepoID) == "" ||
+		strings.TrimSpace(result.Branch) == "" || result.PRNumber <= 0 ||
+		!validGitHead(result.HeadSHA) || !validDigest(result.InputDigest) ||
+		result.DesiredGeneration <= 0 || !validGitHubCheckState(result.CheckState) ||
+		(result.Status != CIWaitWaiting && result.Status != CIWaitReady &&
+			result.Status != CIWaitFailed && result.Status != CIWaitClosed) {
+		return false, errors.New("apply CI reconciliation: invalid exact result")
+	}
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	updated, err := tx.Exec(`UPDATE ci_waits SET status = ?, check_state = ?, updated_at = ?
+	 WHERE id = ? AND repo_id = ? AND branch = ? AND pr_number = ? AND head_sha = ?
+	 AND input_digest = ? AND desired_generation = ? AND status = 'waiting'
+	 AND EXISTS (SELECT 1 FROM ci_reconciliations c WHERE c.wait_id = ci_waits.id)
+	 AND EXISTS (SELECT 1 FROM branch_desired_state d
+	   WHERE d.repo_id = ci_waits.repo_id AND d.branch = ci_waits.branch
+	   AND d.revision = ci_waits.desired_generation AND d.head_sha = ci_waits.head_sha
+	   AND d.input_digest = ci_waits.input_digest)
+	 AND EXISTS (SELECT 1 FROM runs r WHERE r.id = ci_waits.run_id
+	   AND r.repo_id = ci_waits.repo_id AND r.branch = ci_waits.branch
+	   AND r.head_sha = ci_waits.head_sha)`,
+		result.Status, result.CheckState, result.AppliedAt.Unix(), result.WaitID,
+		result.RepoID, result.Branch, result.PRNumber, result.HeadSHA,
+		result.InputDigest, result.DesiredGeneration)
+	if err != nil {
+		return false, err
+	}
+	count, err := updated.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if count != 1 {
+		return false, errors.New("apply CI reconciliation: stale or missing exact binding")
+	}
+	deleted, err := tx.Exec(`DELETE FROM ci_reconciliations WHERE wait_id = ?`, result.WaitID)
+	if err != nil {
+		return false, err
+	}
+	count, err = deleted.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if count != 1 {
+		return false, errors.New("apply CI reconciliation: reconciliation custody changed")
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 type UpdaterPipelineLiveness struct {
