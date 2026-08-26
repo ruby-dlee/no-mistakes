@@ -10,7 +10,13 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
-var ErrFatalGateReconciliation = errors.New("fatal gate reconciliation")
+var (
+	ErrFatalGateReconciliation = errors.New("fatal gate reconciliation")
+	// ErrPipelineDeferred is the non-terminal result of a durable external
+	// coordinator handoff. Callers must release local execution capacity while
+	// leaving the run and current step active.
+	ErrPipelineDeferred = errors.New("pipeline custody deferred to coordinator")
+)
 
 // StepContext provides shared resources to pipeline steps during execution.
 type StepContext struct {
@@ -144,6 +150,10 @@ type StepOutcome struct {
 	PRURL         string // PR/MR URL if this step created or found one
 	Skipped       bool   // mark the step as skipped without failing the run
 	SkipRemaining bool   // skip all subsequent steps (e.g. empty diff after rebase)
+	// Deferred means this step durably transferred custody to an external
+	// coordinator. The executor leaves the run and step active while releasing
+	// its local goroutine and agent.
+	Deferred bool
 	// FixSummary, when non-empty, is the agent's one-line commit summary for
 	// the fix attempt performed during this round. Steps populate it in fix
 	// mode so the executor can persist it on the round record and later

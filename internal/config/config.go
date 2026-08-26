@@ -540,6 +540,7 @@ type Config struct {
 	LogLevel              string
 	SessionReuse          bool
 	Eval                  Eval
+	Coordinator           Coordinator
 	AzureWorker           AzureWorkerConfig
 	Commands              Commands
 	IgnorePatterns        []string
@@ -2636,6 +2637,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		// Eval is global-only by design (see GlobalConfig.Eval), so it is
 		// copied straight through with no repository override step.
 		Eval:           global.Eval,
+		Coordinator:    global.Coordinator,
 		AzureWorker:    global.AzureWorker,
 		Commands:       repo.Commands,
 		IgnorePatterns: repo.IgnorePatterns,

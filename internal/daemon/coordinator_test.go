@@ -270,3 +270,53 @@ func TestCoordinatorRestartCustodySurvivesGenericDaemonRecovery(t *testing.T) {
 		t.Fatalf("liveness=%+v err=%v", liveness, err)
 	}
 }
+
+func TestCoordinatorRestartAdoptsExistingRunningCIWithoutExecutionGoroutine(t *testing.T) {
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	repo, err := database.InsertRepo(t.TempDir(), "https://github.com/Ruby-Labs/relvino.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := strings.Repeat("a", 40)
+	run, err := database.InsertRun(repo.ID, "review/adopt", head, strings.Repeat("0", 40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunPRURL(run.ID, "https://github.com/Ruby-Labs/relvino/pull/327"); err != nil {
+		t.Fatal(err)
+	}
+	step, err := database.InsertStepResult(run.ID, types.StepCI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateStepStatus(step.ID, types.StepStatusRunning); err != nil {
+		t.Fatal(err)
+	}
+
+	adopted, err := adoptExistingCoordinatorCIWaits(database, config.Coordinator{ReconcileInterval: 15 * time.Second}, time.Now())
+	if err != nil || adopted != 1 {
+		t.Fatalf("adopted=%d err=%v", adopted, err)
+	}
+	wait, err := database.GetCIWaitForRun(run.ID)
+	if err != nil || wait == nil || wait.HeadSHA != head || wait.PRNumber != 327 || wait.IntervalSeconds != 60 {
+		t.Fatalf("adopted wait=%+v err=%v", wait, err)
+	}
+	recoverable, err := database.RecoverableCIWaitRunIDs()
+	if err != nil || len(recoverable) != 1 || recoverable[0] != run.ID {
+		t.Fatalf("recoverable=%v err=%v", recoverable, err)
+	}
+	if active := NewRunManager(database, p, nil).ActiveExecutionRunIDs(); len(active) != 0 {
+		t.Fatalf("durable wait spawned execution goroutine: %v", active)
+	}
+}

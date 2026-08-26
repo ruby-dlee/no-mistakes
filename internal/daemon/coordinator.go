@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,9 +17,78 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/coordinator"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/kunchenguid/no-mistakes/internal/scm"
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 const coordinatorShutdownTimeout = 2 * time.Second
+
+func adoptExistingCoordinatorCIWaits(database *db.DB, cfg config.Coordinator, at time.Time) (int, error) {
+	runs, err := database.GetActiveRuns()
+	if err != nil {
+		return 0, err
+	}
+	adopted := 0
+	for _, run := range runs {
+		steps, err := database.GetStepsByRun(run.ID)
+		if err != nil {
+			return adopted, err
+		}
+		activeCI := 0
+		for _, step := range steps {
+			if step.StepName == types.StepCI && step.Status == types.StepStatusRunning {
+				activeCI++
+			}
+		}
+		if activeCI == 0 {
+			continue
+		}
+		if activeCI != 1 {
+			return adopted, fmt.Errorf("adopt coordinator CI run %s: active CI step is ambiguous", run.ID)
+		}
+		if existing, err := database.GetCIWaitForRun(run.ID); err != nil {
+			return adopted, err
+		} else if existing != nil {
+			continue
+		}
+		repo, err := database.GetRepo(run.RepoID)
+		if err != nil || repo == nil {
+			return adopted, fmt.Errorf("adopt coordinator CI run %s: repository is unavailable", run.ID)
+		}
+		if scm.DetectProviderContext(context.Background(), repo.UpstreamURL) != scm.ProviderGitHub || run.PRURL == nil {
+			return adopted, fmt.Errorf("adopt coordinator CI run %s: exact GitHub PR binding is unavailable", run.ID)
+		}
+		prText, err := scm.ExtractPRNumber(strings.TrimSpace(*run.PRURL))
+		if err != nil {
+			return adopted, fmt.Errorf("adopt coordinator CI run %s: %w", run.ID, err)
+		}
+		prNumber, err := strconv.ParseInt(prText, 10, 64)
+		if err != nil || prNumber <= 0 {
+			return adopted, fmt.Errorf("adopt coordinator CI run %s: invalid PR number", run.ID)
+		}
+		head := strings.ToLower(strings.TrimSpace(run.HeadSHA))
+		input := db.CIWaitInputDigest(repo.ID, run.Branch, prNumber, head)
+		desired, _, _, err := database.AdvanceBranchDesiredState(db.BranchDesiredUpdate{
+			RepoID: repo.ID, Branch: run.Branch, HeadSHA: head, InputDigest: input, UpdatedAt: at,
+		})
+		if err != nil {
+			return adopted, fmt.Errorf("adopt coordinator CI run %s desired state: %w", run.ID, err)
+		}
+		interval := cfg.ReconcileInterval
+		if interval < time.Minute {
+			interval = time.Minute
+		}
+		if _, err := database.RegisterCIWait(db.CIWaitSpec{
+			RunID: run.ID, RepoID: repo.ID, Branch: run.Branch, PRNumber: prNumber,
+			HeadSHA: head, InputDigest: input, DesiredGeneration: desired.Revision,
+			RegisteredAt: at, ReconcileInterval: interval,
+		}); err != nil {
+			return adopted, fmt.Errorf("adopt coordinator CI run %s wait: %w", run.ID, err)
+		}
+		adopted++
+	}
+	return adopted, nil
+}
 
 type coordinatorRuntimeOptions struct {
 	Config       config.Coordinator

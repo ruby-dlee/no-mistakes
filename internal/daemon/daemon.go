@@ -251,6 +251,13 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, globalCfg *config.GlobalConf
 	// its restart reconciler instead of the generic stale-run terminalizer.
 	var coordinatorCIWaitRuns []string
 	if globalCfg.Coordinator.Enabled {
+		adopted, adoptErr := adoptExistingCoordinatorCIWaits(d, globalCfg.Coordinator, time.Now())
+		if adoptErr != nil {
+			return fmt.Errorf("adopt coordinator CI restart custody: %w", adoptErr)
+		}
+		if adopted > 0 {
+			slog.Info("adopted existing CI waits into coordinator custody", "count", adopted)
+		}
 		coordinatorCIWaitRuns, err = d.RecoverableCIWaitRunIDs()
 		if err != nil {
 			return fmt.Errorf("load coordinator CI restart custody: %w", err)

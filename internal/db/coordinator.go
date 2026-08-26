@@ -1,7 +1,9 @@
 package db
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -105,7 +107,7 @@ func (d *DB) AdvanceBranchDesiredState(update BranchDesiredUpdate) (BranchDesire
 		}
 	}
 	if _, err := tx.Exec(`UPDATE ci_waits SET status = 'closed', updated_at = ?
-	 WHERE repo_id = ? AND branch = ? AND status = 'waiting'
+	 WHERE repo_id = ? AND branch = ? AND status IN ('waiting', 'ready', 'failed')
 	 AND (desired_generation < ? OR head_sha <> ? OR input_digest <> ?)`,
 		ts, update.RepoID, update.Branch, state.Revision, state.HeadSHA, state.InputDigest); err != nil {
 		return BranchDesiredState{}, false, 0, err
@@ -169,6 +171,14 @@ type CIWaitSpec struct {
 	ReconcileInterval                           time.Duration
 }
 
+// CIWaitInputDigest is the content-free semantic identity shared by new CI
+// handoffs and restart adoption of an already-running CI step.
+func CIWaitInputDigest(repoID, branch string, prNumber int64, head string) string {
+	payload := fmt.Sprintf("no-mistakes.ci-wait/v1\x00%s\x00%s\x00%d\x00%s", repoID, branch, prNumber, head)
+	sum := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(sum[:])
+}
+
 func (d *DB) RegisterCIWait(spec CIWaitSpec) (string, error) {
 	if spec.RunID == "" || spec.RepoID == "" || spec.Branch == "" || spec.PRNumber <= 0 ||
 		!validGitHead(spec.HeadSHA) || !validDigest(spec.InputDigest) || spec.DesiredGeneration <= 0 ||
@@ -229,7 +239,7 @@ func (d *DB) ConfirmGitHubDelivery(deliveryID string, state AuthoritativeGitHubS
 		return 0, fmt.Errorf("confirm GitHub delivery: %w", ErrGitHubStateMismatch)
 	}
 	ts := at.Unix()
-	rows, err := tx.Query(`SELECT id FROM ci_waits WHERE repo_id = ? AND pr_number = ? AND head_sha = ? AND status = 'waiting'`, repo, pr, state.HeadSHA)
+	rows, err := tx.Query(`SELECT id FROM ci_waits WHERE repo_id = ? AND pr_number = ? AND head_sha = ? AND status IN ('waiting', 'ready')`, repo, pr, state.HeadSHA)
 	if err != nil {
 		return 0, err
 	}
@@ -308,7 +318,7 @@ func (d *DB) ScheduleDueCIReconciliations(at time.Time, limit int) (int, error) 
 		return 0, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.Query(`SELECT id, interval_seconds FROM ci_waits WHERE status = 'waiting' AND next_reconcile_at <= ? ORDER BY next_reconcile_at, id LIMIT ?`, at.Unix(), limit)
+	rows, err := tx.Query(`SELECT id, interval_seconds FROM ci_waits WHERE status IN ('waiting', 'ready') AND next_reconcile_at <= ? ORDER BY next_reconcile_at, id LIMIT ?`, at.Unix(), limit)
 	if err != nil {
 		return 0, err
 	}
@@ -369,7 +379,7 @@ func (d *DB) PendingCIReconciliationWork(limit int) ([]CIReconciliationWork, err
 	 w.desired_generation, w.status, w.check_state, w.next_reconcile_at,
 	 w.interval_seconds, w.last_delivery_id, w.created_at, w.updated_at
 	 FROM ci_reconciliations r JOIN ci_waits w ON w.id = r.wait_id
-	 WHERE w.status = 'waiting' ORDER BY r.requested_at, r.wait_id LIMIT ?`, limit)
+	 WHERE w.status IN ('waiting', 'ready') ORDER BY r.requested_at, r.wait_id LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -411,6 +421,86 @@ func (d *DB) GetCIWait(id string) (*CIWait, error) {
 	return item, nil
 }
 
+// GetCIWaitForRun returns the run's single durable CI wait, if registered.
+func (d *DB) GetCIWaitForRun(runID string) (*CIWait, error) {
+	item := &CIWait{}
+	err := d.sql.QueryRow(`SELECT id, run_id, repo_id, branch, pr_number, head_sha,
+	 input_digest, desired_generation, status, check_state, next_reconcile_at,
+	 interval_seconds, last_delivery_id, created_at, updated_at FROM ci_waits WHERE run_id = ?`, runID).
+		Scan(&item.ID, &item.RunID, &item.RepoID, &item.Branch, &item.PRNumber,
+			&item.HeadSHA, &item.InputDigest, &item.DesiredGeneration, &item.Status,
+			&item.CheckState, &item.NextReconcileAt, &item.IntervalSeconds,
+			&item.LastDeliveryID, &item.CreatedAt, &item.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return item, nil
+}
+
+// CancelCoordinatorCIWaitRun transfers custody from an obsolete durable CI
+// wait to its superseding push. It succeeds only for the exact current desired
+// generation and terminalizes both the CI step and run in one transaction.
+func (d *DB) CancelCoordinatorCIWaitRun(runID string, at time.Time) (bool, error) {
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var waitID string
+	err = tx.QueryRow(`SELECT w.id FROM ci_waits w
+	 JOIN runs r ON r.id = w.run_id
+	 JOIN branch_desired_state desired ON desired.repo_id = w.repo_id AND desired.branch = w.branch
+	 WHERE w.run_id = ? AND w.status IN ('waiting', 'ready', 'failed')
+	 AND r.status IN (?, ?) AND r.repo_id = w.repo_id AND r.branch = w.branch AND r.head_sha = w.head_sha
+	 AND desired.revision = w.desired_generation AND desired.head_sha = w.head_sha
+	 AND desired.input_digest = w.input_digest`, runID, types.RunPending, types.RunRunning).Scan(&waitID)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	ts := at.Unix()
+	result, err := tx.Exec(`UPDATE ci_waits SET status = 'closed', updated_at = ?
+	 WHERE id = ? AND status IN ('waiting', 'ready', 'failed')`, ts, waitID)
+	if err != nil {
+		return false, err
+	}
+	if count, err := result.RowsAffected(); err != nil || count != 1 {
+		return false, errors.New("cancel coordinator CI wait: custody changed")
+	}
+	if _, err := tx.Exec(`DELETE FROM ci_reconciliations WHERE wait_id = ?`, waitID); err != nil {
+		return false, err
+	}
+	result, err = tx.Exec(`UPDATE step_results SET status = ?, completed_at = ?, last_activity_at = ?,
+	 last_activity = ?, agent_pid = NULL WHERE run_id = ? AND step_name = ?
+	 AND status IN (?, ?, ?, ?)`, types.StepStatusSkipped, ts, ts, "status: skipped (superseded)",
+		runID, types.StepCI, types.StepStatusRunning, types.StepStatusAwaitingApproval,
+		types.StepStatusFixing, types.StepStatusFixReview)
+	if err != nil {
+		return false, err
+	}
+	if count, err := result.RowsAffected(); err != nil || count != 1 {
+		return false, errors.New("cancel coordinator CI wait: exact active CI step changed")
+	}
+	result, err = tx.Exec(`UPDATE runs SET status = ?, error = ?, awaiting_agent_since = NULL,
+	 updated_at = ? WHERE id = ? AND status IN (?, ?)`, types.RunCancelled,
+		types.RunCancelReasonSuperseded, ts, runID, types.RunPending, types.RunRunning)
+	if err != nil {
+		return false, err
+	}
+	if count, err := result.RowsAffected(); err != nil || count != 1 {
+		return false, errors.New("cancel coordinator CI wait: exact active run changed")
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // RecoverableCIWaitRunIDs returns only active runs whose waiting coordinator
 // record still matches the current desired generation and one active CI step.
 // The daemon uses this exact set to keep coordinator-owned waits alive across
@@ -419,14 +509,14 @@ func (d *DB) RecoverableCIWaitRunIDs() ([]string, error) {
 	rows, err := d.sql.Query(`SELECT DISTINCT w.run_id FROM ci_waits w
 		JOIN runs r ON r.id = w.run_id
 		JOIN branch_desired_state desired ON desired.repo_id = w.repo_id AND desired.branch = w.branch
-		WHERE w.status = ? AND r.status IN (?, ?)
+		WHERE w.status IN (?, ?) AND r.status IN (?, ?)
 		AND r.repo_id = w.repo_id AND r.branch = w.branch AND r.head_sha = w.head_sha
 		AND desired.revision = w.desired_generation AND desired.head_sha = w.head_sha
 		AND desired.input_digest = w.input_digest
 		AND 1 = (SELECT COUNT(*) FROM step_results ci WHERE ci.run_id = w.run_id
 			AND ci.step_name = ? AND ci.status IN (?, ?, ?, ?))
 		ORDER BY w.run_id`,
-		CIWaitWaiting, types.RunPending, types.RunRunning, types.StepCI,
+		CIWaitWaiting, CIWaitReady, types.RunPending, types.RunRunning, types.StepCI,
 		types.StepStatusRunning, types.StepStatusAwaitingApproval,
 		types.StepStatusFixing, types.StepStatusFixReview)
 	if err != nil {
@@ -464,7 +554,7 @@ func (d *DB) ApplyCIReconciliation(result CIReconciliationResult) (bool, error) 
 	defer tx.Rollback()
 	updated, err := tx.Exec(`UPDATE ci_waits SET status = ?, check_state = ?, updated_at = ?
 	 WHERE id = ? AND repo_id = ? AND branch = ? AND pr_number = ? AND head_sha = ?
-	 AND input_digest = ? AND desired_generation = ? AND status = 'waiting'
+	 AND input_digest = ? AND desired_generation = ? AND status IN ('waiting', 'ready')
 	 AND EXISTS (SELECT 1 FROM ci_reconciliations c WHERE c.wait_id = ci_waits.id)
 	 AND EXISTS (SELECT 1 FROM branch_desired_state d
 	   WHERE d.repo_id = ci_waits.repo_id AND d.branch = ci_waits.branch

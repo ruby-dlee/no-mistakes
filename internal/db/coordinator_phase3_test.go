@@ -125,3 +125,54 @@ func TestApplyPendingCIReconciliationConsumesOnlyCurrentPoll(t *testing.T) {
 		t.Fatalf("due reschedule=%d err=%v", count, err)
 	}
 }
+
+func TestReadyCIWaitKeepsReconcilingUntilPRCloses(t *testing.T) {
+	database := openTestDB(t)
+	fixture := newPipelineJobFixture(t, database, false)
+	activateCoordinatorCI(t, database, fixture.run.ID)
+	start := time.Unix(1_800_000_000, 0)
+	desired, _, _, err := database.AdvanceBranchDesiredState(BranchDesiredUpdate{
+		RepoID: fixture.run.RepoID, Branch: fixture.run.Branch, HeadSHA: fixture.run.HeadSHA,
+		InputDigest: fixture.spec.InputDigest, UpdatedAt: start,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitID, err := database.RegisterCIWait(CIWaitSpec{
+		RunID: fixture.run.ID, RepoID: fixture.run.RepoID, Branch: fixture.run.Branch,
+		PRNumber: 23, HeadSHA: fixture.run.HeadSHA, InputDigest: fixture.spec.InputDigest,
+		DesiredGeneration: desired.Revision, RegisteredAt: start, ReconcileInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ScheduleDueCIReconciliations(start, 10); err != nil {
+		t.Fatal(err)
+	}
+	ready := CIReconciliationResult{
+		WaitID: waitID, RepoID: fixture.run.RepoID, Branch: fixture.run.Branch,
+		PRNumber: 23, HeadSHA: fixture.run.HeadSHA, InputDigest: fixture.spec.InputDigest,
+		DesiredGeneration: desired.Revision, Status: CIWaitReady, CheckState: "passed", AppliedAt: start,
+	}
+	if applied, err := database.ApplyCIReconciliation(ready); err != nil || !applied {
+		t.Fatalf("apply ready=%v err=%v", applied, err)
+	}
+	if count, err := database.ScheduleDueCIReconciliations(start.Add(time.Hour), 10); err != nil || count != 1 {
+		t.Fatalf("ready reschedule=%d err=%v", count, err)
+	}
+	work, err := database.PendingCIReconciliationWork(10)
+	if err != nil || len(work) != 1 || work[0].Wait.Status != CIWaitReady {
+		t.Fatalf("ready work=%+v err=%v", work, err)
+	}
+	closed := ready
+	closed.Status = CIWaitClosed
+	closed.CheckState = "closed"
+	closed.AppliedAt = start.Add(time.Hour)
+	if applied, err := database.ApplyCIReconciliation(closed); err != nil || !applied {
+		t.Fatalf("apply closed=%v err=%v", applied, err)
+	}
+	run, err := database.GetRun(fixture.run.ID)
+	if err != nil || run.Status != types.RunCompleted {
+		t.Fatalf("closed run=%+v err=%v", run, err)
+	}
+}

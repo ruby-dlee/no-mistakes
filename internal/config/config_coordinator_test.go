@@ -44,6 +44,10 @@ func TestCoordinatorLoadsOnlyFromTrustedGlobalConfig(t *testing.T) {
 	if _, exists := reflect.TypeOf(RepoConfig{}).FieldByName("Coordinator"); exists {
 		t.Fatal("repository configuration exposes the global-only coordinator")
 	}
+	merged := Merge(cfg, &RepoConfig{})
+	if merged.Coordinator != cfg.Coordinator {
+		t.Fatalf("merged coordinator = %+v, want %+v", merged.Coordinator, cfg.Coordinator)
+	}
 }
 
 func TestCoordinatorRejectsUnsafeOrUnboundedConfiguration(t *testing.T) {

@@ -552,6 +552,9 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 		}
 		skipRemaining, err := e.executeStep(ctx, step, sr, run, repo, workDir, logDir, stepExecutionState{})
 		if err != nil {
+			if errors.Is(err, ErrPipelineDeferred) {
+				return err
+			}
 			return e.failRun(run, repo, err, ctx)
 		}
 		if skipRemaining {
@@ -1187,6 +1190,9 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			}
 			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(types.StepStatusFailed), "", redactedErr, &durationMS)
 			return false, fmt.Errorf("step %s failed: %s", stepName, redactedErr)
+		}
+		if outcome.Deferred {
+			return false, ErrPipelineDeferred
 		}
 
 		if stepName == types.StepReview {

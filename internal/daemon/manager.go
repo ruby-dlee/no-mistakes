@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -401,6 +402,7 @@ func (m *RunManager) resumeRecoveredRunArmed(plan recoveredRunPlan, expectedOwne
 	m.wg.Add(1)
 	go func() {
 		startedAt := time.Now()
+		coordinatorDeferred := false
 		defer m.wg.Done()
 		defer close(done)
 		defer func() {
@@ -415,12 +417,16 @@ func (m *RunManager) resumeRecoveredRunArmed(plan recoveredRunPlan, expectedOwne
 			cancel(nil)
 			_ = plan.agent.Close()
 			m.closeSubscribers(plan.run.ID)
-			m.removeRunWorktree(plan.repo.ID, plan.run.ID, plan.gateDir, plan.workDir, "resumed_run_finished")
+			if !coordinatorDeferred {
+				m.removeRunWorktree(plan.repo.ID, plan.run.ID, plan.gateDir, plan.workDir, "resumed_run_finished")
+			}
 			// A recovered run is a finished run too. This is the second of the
 			// two completion boundaries, and leaving it out is what let a run
 			// resumed after a daemon restart keep its empty evidence directory
 			// until some later run or restart happened to sweep it.
-			m.cleanupRunEvidence(plan.cfg, plan.run.ID)
+			if !coordinatorDeferred {
+				m.cleanupRunEvidence(plan.cfg, plan.run.ID)
+			}
 			m.mu.Lock()
 			delete(m.executors, plan.run.ID)
 			delete(m.cancels, plan.run.ID)
@@ -428,7 +434,11 @@ func (m *RunManager) resumeRecoveredRunArmed(plan recoveredRunPlan, expectedOwne
 			m.mu.Unlock()
 		}()
 
-		if err := executor.Resume(runCtx, plan.run, plan.repo, plan.workDir); err != nil {
+		if err := executor.Resume(runCtx, plan.run, plan.repo, plan.workDir); errors.Is(err, pipeline.ErrPipelineDeferred) {
+			coordinatorDeferred = true
+			slog.Info("recovered pipeline CI custody transferred to coordinator", "run_id", plan.run.ID)
+			return
+		} else if err != nil {
 			if plan.run.Status == types.RunRunning {
 				errMsg := err.Error()
 				plan.run.Status = types.RunFailed
@@ -1220,6 +1230,7 @@ func (m *RunManager) startRunWithIntentSourceAndOwnerDecision(ctx context.Contex
 	m.wg.Add(1)
 	go func() {
 		startedAt := time.Now()
+		coordinatorDeferred := false
 		defer m.wg.Done()
 		defer close(done)
 		defer func() {
@@ -1258,8 +1269,10 @@ func (m *RunManager) startRunWithIntentSourceAndOwnerDecision(ctx context.Contex
 			ag.Close()
 			// Close subscriber channels for this run.
 			m.closeSubscribers(run.ID)
-			m.removeRunWorktree(repo.ID, run.ID, gateDir, wtDir, "run_finished")
-			m.cleanupRunEvidence(cfg, run.ID)
+			if !coordinatorDeferred {
+				m.removeRunWorktree(repo.ID, run.ID, gateDir, wtDir, "run_finished")
+				m.cleanupRunEvidence(cfg, run.ID)
+			}
 			// Remove tracking.
 			m.mu.Lock()
 			delete(m.executors, run.ID)
@@ -1268,7 +1281,11 @@ func (m *RunManager) startRunWithIntentSourceAndOwnerDecision(ctx context.Contex
 			m.mu.Unlock()
 		}()
 
-		if err := executor.Execute(runCtx, run, repo, wtDir); err != nil {
+		if err := executor.Execute(runCtx, run, repo, wtDir); errors.Is(err, pipeline.ErrPipelineDeferred) {
+			coordinatorDeferred = true
+			slog.Info("pipeline CI custody transferred to coordinator", "run_id", run.ID)
+			return
+		} else if err != nil {
 			fields := telemetry.Fields{
 				"action":      "finished",
 				"trigger":     trigger,
@@ -1659,9 +1676,10 @@ func (m *RunManager) cancelActiveRuns(repoID, branch string) error {
 	}
 
 	type activeRun struct {
-		run    *db.Run
-		cancel context.CancelCauseFunc
-		done   chan struct{}
+		run         *db.Run
+		cancel      context.CancelCauseFunc
+		done        chan struct{}
+		coordinator bool
 	}
 	var active []activeRun
 	// First classify every candidate. Cancelling a legacy run before later
@@ -1691,11 +1709,32 @@ func (m *RunManager) cancelActiveRuns(repoID, branch string) error {
 		}
 		if cancel != nil {
 			active = append(active, activeRun{run: run, cancel: cancel, done: done})
+		} else {
+			wait, waitErr := m.db.GetCIWaitForRun(run.ID)
+			if waitErr != nil {
+				return fmt.Errorf("classify active run %s coordinator wait: %w", run.ID, waitErr)
+			}
+			if wait != nil && (wait.Status == db.CIWaitWaiting || wait.Status == db.CIWaitReady || wait.Status == db.CIWaitFailed) {
+				active = append(active, activeRun{run: run, coordinator: true})
+			}
 		}
 	}
 
 	var toWait []chan struct{}
 	for _, candidate := range active {
+		if candidate.coordinator {
+			cancelled, cancelErr := m.db.CancelCoordinatorCIWaitRun(candidate.run.ID, time.Now())
+			if cancelErr != nil {
+				return fmt.Errorf("cancel coordinator run %s: %w", candidate.run.ID, cancelErr)
+			}
+			if !cancelled {
+				return fmt.Errorf("cancel coordinator run %s: exact custody changed", candidate.run.ID)
+			}
+			wtDir := worktrees.RecordedDir(m.paths, candidate.run.WorktreePath(), repoID, candidate.run.ID)
+			m.removeRunWorktree(repoID, candidate.run.ID, m.paths.RepoDir(repoID), wtDir, "coordinator_run_superseded")
+			slog.Info("cancelled coordinator-owned run", "run_id", candidate.run.ID, "repo_id", repoID, "branch", branch)
+			continue
+		}
 		candidate.cancel(fmt.Errorf(types.RunCancelReasonSuperseded))
 		slog.Info("cancelled active run", "run_id", candidate.run.ID, "repo_id", repoID, "branch", branch)
 		if candidate.done != nil {

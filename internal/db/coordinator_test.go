@@ -205,6 +205,41 @@ func TestPeriodicCIReconciliationSurvivesRestartAndLegacyRowsUseZeroCapacity(t *
 	}
 }
 
+func TestNewDesiredHeadSupersedesReadyWait(t *testing.T) {
+	database := openTestDB(t)
+	fixture := newPipelineJobFixture(t, database, false)
+	start := time.Now().Truncate(time.Second)
+	first, _, _, err := database.AdvanceBranchDesiredState(BranchDesiredUpdate{
+		RepoID: fixture.run.RepoID, Branch: fixture.run.Branch, HeadSHA: fixture.run.HeadSHA,
+		InputDigest: fixture.spec.InputDigest, UpdatedAt: start,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitID, err := database.RegisterCIWait(CIWaitSpec{
+		RunID: fixture.run.ID, RepoID: fixture.run.RepoID, Branch: fixture.run.Branch,
+		PRNumber: 55, HeadSHA: fixture.run.HeadSHA, InputDigest: fixture.spec.InputDigest,
+		DesiredGeneration: first.Revision, RegisteredAt: start, ReconcileInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.sql.Exec(`UPDATE ci_waits SET status = ? WHERE id = ?`, CIWaitReady, waitID); err != nil {
+		t.Fatal(err)
+	}
+	if _, replay, _, err := database.AdvanceBranchDesiredState(BranchDesiredUpdate{
+		RepoID: fixture.run.RepoID, Branch: fixture.run.Branch,
+		HeadSHA: strings.Repeat("e", 40), InputDigest: strings.Repeat("f", 64),
+		UpdatedAt: start.Add(time.Second),
+	}); err != nil || replay {
+		t.Fatalf("advance new head replay=%v err=%v", replay, err)
+	}
+	wait, err := database.GetCIWait(waitID)
+	if err != nil || wait.Status != CIWaitClosed {
+		t.Fatalf("superseded wait=%+v err=%v", wait, err)
+	}
+}
+
 func TestCoordinatorSchemaStoresNoWebhookPayload(t *testing.T) {
 	database := openTestDB(t)
 	allowed := map[string]map[string]bool{
