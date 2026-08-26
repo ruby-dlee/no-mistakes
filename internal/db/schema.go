@@ -294,6 +294,24 @@ CREATE TABLE IF NOT EXISTS pipeline_job_events (
 CREATE INDEX IF NOT EXISTS idx_pipeline_job_events_job_created
     ON pipeline_job_events (job_id, created_at, id);
 
+-- Explicit worker failures are a separate append-only attempt stream so an
+-- immediate bounded retry is distinguishable from lease expiry. Categories
+-- are bounded machine labels only; raw process output never enters SQLite.
+CREATE TABLE IF NOT EXISTS pipeline_job_attempt_failures (
+    id                TEXT PRIMARY KEY,
+    job_id            TEXT NOT NULL REFERENCES pipeline_jobs(id) ON DELETE CASCADE,
+    attempt           INTEGER NOT NULL CHECK (attempt > 0),
+    lease_fence       INTEGER NOT NULL CHECK (lease_fence > 0),
+    lease_owner       TEXT NOT NULL,
+    error_category    TEXT NOT NULL,
+    retryable         INTEGER NOT NULL CHECK (retryable IN (0, 1)),
+    created_at        INTEGER NOT NULL,
+    UNIQUE (job_id, lease_fence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_job_attempt_failures_job
+    ON pipeline_job_attempt_failures (job_id, attempt);
+
 CREATE TABLE IF NOT EXISTS branch_desired_state (
     repo_id         TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
     branch          TEXT NOT NULL,

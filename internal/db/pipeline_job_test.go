@@ -183,6 +183,74 @@ func TestPipelineJobClaimHasOneWinnerAcrossSQLiteConnections(t *testing.T) {
 	}
 }
 
+func TestPipelineJobFailureCASRequeuesThenFailsWithinBudget(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	fixture := newPipelineJobFixture(t, database, false)
+	job, _, err := database.EnqueuePipelineJob(fixture.spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Unix(1_800_000_000, 0)
+
+	lease, err := database.ClaimPipelineJob(PipelineJobReview, "worker-a", at, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := PipelineJobFailure{
+		JobID: job.ID, LeaseOwner: "worker-a", LeaseFence: lease.LeaseFence,
+		DesiredHeadSHA: fixture.spec.DesiredHeadSHA, InputDigest: fixture.spec.InputDigest,
+		OwnerDecisionHead: fixture.spec.OwnerDecisionHead, DesiredGeneration: fixture.spec.DesiredGeneration,
+		ErrorCategory: "wrapper_failure", Retryable: true, FailedAt: at.Add(time.Second),
+	}
+	replay, err := database.FailPipelineJob(failure)
+	if err != nil || replay {
+		t.Fatalf("first failure = replay %v, err %v", replay, err)
+	}
+	replay, err = database.FailPipelineJob(failure)
+	if err != nil || !replay {
+		t.Fatalf("failure replay = replay %v, err %v", replay, err)
+	}
+	wrongBinding := failure
+	wrongBinding.InputDigest = strings.Repeat("c", 64)
+	if _, err := database.FailPipelineJob(wrongBinding); err == nil {
+		t.Fatal("failure replay with a changed input digest was accepted")
+	}
+	requeued, err := database.GetPipelineJob(job.ID)
+	if err != nil || requeued.Status != PipelineJobQueued {
+		t.Fatalf("requeued job = %+v, err %v", requeued, err)
+	}
+
+	lease, err = database.ClaimPipelineJob(PipelineJobReview, "worker-b", at.Add(2*time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure.LeaseOwner = "worker-b"
+	failure.LeaseFence = lease.LeaseFence
+	failure.FailedAt = at.Add(3 * time.Second)
+	replay, err = database.FailPipelineJob(failure)
+	if err != nil || replay {
+		t.Fatalf("terminal failure = replay %v, err %v", replay, err)
+	}
+	failed, err := database.GetPipelineJob(job.ID)
+	if err != nil || failed.Status != PipelineJobFailed || failed.ErrorCategory == nil || *failed.ErrorCategory != "wrapper_failure" {
+		t.Fatalf("failed job = %+v, err %v", failed, err)
+	}
+	var attempts int
+	if err := database.sql.QueryRow(`SELECT COUNT(*) FROM pipeline_job_attempt_failures WHERE job_id = ?`, job.ID).Scan(&attempts); err != nil || attempts != 2 {
+		t.Fatalf("failure attempts = %d, %v", attempts, err)
+	}
+
+	stale := failure
+	stale.LeaseFence--
+	if _, err := database.FailPipelineJob(stale); err == nil {
+		t.Fatal("stale failure fence was accepted")
+	}
+}
+
 func TestPipelineJobExpiredLeaseRetriesAndRejectsStaleFence(t *testing.T) {
 	database := openTestDB(t)
 	fixture := newPipelineJobFixture(t, database, false)
@@ -564,6 +632,11 @@ func TestPipelineJobSchemaStoresOnlyBoundedMetadata(t *testing.T) {
 			"id": true, "job_id": true, "event_type": true, "status": true,
 			"attempt": true, "lease_fence": true, "lease_owner": true,
 			"result_digest": true, "output_head_sha": true, "created_at": true,
+		},
+		"pipeline_job_attempt_failures": {
+			"id": true, "job_id": true, "attempt": true, "lease_fence": true,
+			"lease_owner": true, "error_category": true, "retryable": true,
+			"created_at": true,
 		},
 	}
 	for table, columns := range allowed {

@@ -164,6 +164,10 @@ type GlobalConfig struct {
 	// neither expose its listener nor select the environment variable carrying
 	// its webhook secret.
 	Coordinator Coordinator
+	// AzureWorker is a global-only opt-in transport to a trusted Firstmate
+	// wrapper. Repository config can never select executable or fleet config
+	// paths. Disabled is the default, preserving the local pipeline.
+	AzureWorker AzureWorkerConfig
 }
 
 // Coordinator configures the optional process-local webhook and CI reconciler.
@@ -184,6 +188,26 @@ type coordinatorRaw struct {
 	ReconcileInterval      string `yaml:"reconcile_interval"`
 	BatchSize              *int   `yaml:"batch_size"`
 	MaxConcurrency         *int   `yaml:"max_concurrency"`
+}
+
+// AzureWorkerConfig contains only controller-side transport policy. The
+// wrapper's own config owns Firstmate account, assignment, and Azure details.
+type AzureWorkerConfig struct {
+	Enabled           bool
+	RunnerPath        string
+	ConfigPath        string
+	LeaseDuration     time.Duration
+	HeartbeatInterval time.Duration
+	Timeout           time.Duration
+}
+
+type azureWorkerRaw struct {
+	Enabled           bool   `yaml:"enabled"`
+	RunnerPath        string `yaml:"runner_path"`
+	ConfigPath        string `yaml:"config_path"`
+	LeaseDuration     string `yaml:"lease_duration"`
+	HeartbeatInterval string `yaml:"heartbeat_interval"`
+	Timeout           string `yaml:"timeout"`
 }
 
 // globalConfigRaw is the on-disk YAML representation with duration as string.
@@ -213,6 +237,7 @@ type globalConfigRaw struct {
 	Test                    TestRaw                    `yaml:"test"`
 	Eval                    EvalRaw                    `yaml:"eval"`
 	Coordinator             coordinatorRaw             `yaml:"coordinator"`
+	AzureWorker             azureWorkerRaw             `yaml:"azure_worker"`
 }
 
 // RepoConfig represents .no-mistakes.yaml in a repo root.
@@ -515,6 +540,7 @@ type Config struct {
 	LogLevel              string
 	SessionReuse          bool
 	Eval                  Eval
+	AzureWorker           AzureWorkerConfig
 	Commands              Commands
 	IgnorePatterns        []string
 	AutoFix               AutoFix
@@ -804,6 +830,17 @@ coordinator:
   reconcile_interval: "60s"
   batch_size: 100
   max_concurrency: 4
+
+# Optional Firstmate-owned Azure worker transport. Disabled by default, so the
+# existing local review/repair/test path is unchanged. Both paths are trusted,
+# absolute machine configuration and cannot be supplied by a repository.
+# azure_worker:
+#   enabled: true
+#   runner_path: /opt/firstmate/bin/fm-no-mistakes-worker
+#   config_path: /etc/firstmate/no-mistakes-worker.yaml
+#   lease_duration: 2m
+#   heartbeat_interval: 30s
+#   timeout: 30m
 
 # Reuse a fixer session for the first semantic repair; a second repair resets the
 # persisted identity and starts fresh. Review turns always run session-free so a
@@ -1597,6 +1634,11 @@ func DefaultGlobalConfig() *GlobalConfig {
 		SessionReuse:            true,
 		Eval:                    evalDefaults(),
 		Coordinator:             coordinatorDefaults(),
+		AzureWorker: AzureWorkerConfig{
+			LeaseDuration:     2 * time.Minute,
+			HeartbeatInterval: 30 * time.Second,
+			Timeout:           30 * time.Minute,
+		},
 	}
 }
 
@@ -1885,6 +1927,11 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	cfg.Test = raw.Test
 	applyEvalOverrides(&cfg.Eval, &raw.Eval)
 	applyCoordinatorOverrides(&cfg.Coordinator, raw.Coordinator)
+	azureWorker, err := parseAzureWorker(raw.AzureWorker, cfg.AzureWorker)
+	if err != nil {
+		return nil, err
+	}
+	cfg.AzureWorker = azureWorker
 
 	return cfg, nil
 }
@@ -1953,6 +2000,49 @@ func validEnvironmentKey(value string) bool {
 		}
 	}
 	return true
+}
+
+func parseAzureWorker(raw azureWorkerRaw, defaults AzureWorkerConfig) (AzureWorkerConfig, error) {
+	cfg := defaults
+	cfg.Enabled = raw.Enabled
+	cfg.RunnerPath = strings.TrimSpace(raw.RunnerPath)
+	cfg.ConfigPath = strings.TrimSpace(raw.ConfigPath)
+	parse := func(name, value string, current *time.Duration) error {
+		if value == "" {
+			return nil
+		}
+		d, err := parsePositiveDuration("azure_worker."+name, value)
+		if err != nil {
+			return err
+		}
+		*current = d
+		return nil
+	}
+	if err := parse("lease_duration", raw.LeaseDuration, &cfg.LeaseDuration); err != nil {
+		return AzureWorkerConfig{}, err
+	}
+	if err := parse("heartbeat_interval", raw.HeartbeatInterval, &cfg.HeartbeatInterval); err != nil {
+		return AzureWorkerConfig{}, err
+	}
+	if err := parse("timeout", raw.Timeout, &cfg.Timeout); err != nil {
+		return AzureWorkerConfig{}, err
+	}
+	if !cfg.Enabled {
+		return cfg, nil
+	}
+	if !filepath.IsAbs(cfg.RunnerPath) || !filepath.IsAbs(cfg.ConfigPath) {
+		return AzureWorkerConfig{}, errors.New("parse azure_worker: enabled runner_path and config_path must be absolute")
+	}
+	if cfg.LeaseDuration < time.Minute || cfg.LeaseDuration > 24*time.Hour || cfg.LeaseDuration%time.Second != 0 {
+		return AzureWorkerConfig{}, errors.New("parse azure_worker.lease_duration: must be whole seconds between one minute and 24 hours")
+	}
+	if cfg.HeartbeatInterval < time.Second || cfg.HeartbeatInterval >= cfg.LeaseDuration/2 {
+		return AzureWorkerConfig{}, errors.New("parse azure_worker.heartbeat_interval: must be at least one second and less than half the lease duration")
+	}
+	if cfg.Timeout < time.Minute || cfg.Timeout > 24*time.Hour {
+		return AzureWorkerConfig{}, errors.New("parse azure_worker.timeout: must be between one minute and 24 hours")
+	}
+	return cfg, nil
 }
 
 // parseCITimeout interprets the ci_timeout config value. The keyword
@@ -2546,6 +2636,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		// Eval is global-only by design (see GlobalConfig.Eval), so it is
 		// copied straight through with no repository override step.
 		Eval:           global.Eval,
+		AzureWorker:    global.AzureWorker,
 		Commands:       repo.Commands,
 		IgnorePatterns: repo.IgnorePatterns,
 		AutoFix:        af,
