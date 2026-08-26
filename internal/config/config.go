@@ -135,9 +135,10 @@ type GlobalConfig struct {
 	BranchSyncRemoteTimeout time.Duration     `yaml:"-"`
 	LogLevel                string            `yaml:"log_level"`
 	// SessionReuse controls per-run agent session reuse in the review loop:
-	// one durable fixer session across review-fix turns. Review turns always
-	// run session-free so the rereview never resumes the session whose
-	// findings prescribed the fixes it certifies. Default true; set
+	// the first semantic repair may keep its fixer context, but a second repair
+	// resets that identity and starts fresh. Review turns always run session-free
+	// so the rereview never resumes the session whose findings prescribed the
+	// fixes it certifies. Default true; set
 	// session_reuse: false to force every invocation cold.
 	SessionReuse bool `yaml:"-"`
 	AutoFix      AutoFixRaw
@@ -763,9 +764,10 @@ daemon_connect_timeout: "3s"
 # (ls-remote or fetch) before treating the target as offline. Global-only.
 branch_sync_remote_timeout: "60s"
 
-# Reuse one durable fixer session per run across review-fix turns. Review turns
-# always run session-free so a rereview never resumes the session that prescribed
-# its fixes. Supported for claude, codex, grok, and pi; other agents run cold.
+# Reuse a fixer session for the first semantic repair; a second repair resets the
+# persisted identity and starts fresh. Review turns always run session-free so a
+# rereview never resumes the session that prescribed its fixes. Supported for
+# claude, codex, grok, and pi; other agents run cold.
 # Set false to force every agent invocation cold.
 session_reuse: true
 
