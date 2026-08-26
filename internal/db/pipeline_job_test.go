@@ -434,8 +434,13 @@ func TestPipelineJobOwnerDecisionHeadInvalidatesLeasedWork(t *testing.T) {
 		SelectedFindingIDs: DeclinedSelectionJSON,
 		SelectionSource:    RoundSelectionSourceUserDeclined,
 	}
-	if _, err := database.AppendOwnerDecision(run.ID, "respond:"+round.ID, envelope, challenge, projection, start); err != nil {
+	decision, err := database.AppendOwnerDecision(run.ID, "respond:"+round.ID, envelope, challenge, projection, start)
+	if err != nil {
 		t.Fatal(err)
+	}
+	stored, err := database.GetPipelineJob(job.ID)
+	if err != nil || stored == nil || stored.Status != PipelineJobSuperseded {
+		t.Fatalf("old owner-decision job was not superseded: job=%+v err=%v", stored, err)
 	}
 	active, err := database.ActivePipelineWorkerLeases(start.Add(10 * time.Second))
 	if err != nil || len(active) != 0 {
@@ -453,6 +458,24 @@ func TestPipelineJobOwnerDecisionHeadInvalidatesLeasedWork(t *testing.T) {
 		CompletedAt:       start.Add(20 * time.Second),
 	}); err == nil {
 		t.Fatal("lease under an old owner-decision head completed")
+	}
+	replacementSpec := PipelineJobSpec{
+		RunID:             run.ID,
+		StepResultID:      round.StepResultID,
+		Kind:              PipelineJobReview,
+		Round:             1,
+		DesiredHeadSHA:    run.HeadSHA,
+		InputDigest:       pipelineJobInput,
+		OwnerDecisionHead: decision.Head,
+		MaxAttempts:       2,
+	}
+	replacement, replay, err := database.EnqueuePipelineJob(replacementSpec)
+	if err != nil || replay {
+		t.Fatalf("enqueue replacement = job=%+v replay=%v err=%v", replacement, replay, err)
+	}
+	claimed, err := database.ClaimPipelineJob(PipelineJobReview, "worker-b", start.Add(10*time.Second), time.Minute)
+	if err != nil || claimed == nil || claimed.ID != replacement.ID {
+		t.Fatalf("replacement was starved by stale owner job: claimed=%+v err=%v", claimed, err)
 	}
 }
 

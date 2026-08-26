@@ -268,6 +268,9 @@ func (d *DB) AppendOwnerDecision(runID, gateID string, envelope ownerdecision.En
 	); err != nil {
 		return OwnerDecisionAppendResult{}, fmt.Errorf("insert owner decision event: %w", err)
 	}
+	if _, err := supersedePipelineJobsForOwnerDecisionTx(tx, runID, historyHead, createdAt); err != nil {
+		return OwnerDecisionAppendResult{}, fmt.Errorf("append owner decision: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return OwnerDecisionAppendResult{}, fmt.Errorf("commit owner decision append: %w", err)
 	}

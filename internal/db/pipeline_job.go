@@ -505,6 +505,45 @@ func (d *DB) SupersedePipelineJob(supersession PipelineJobSupersession) (bool, e
 	return false, errors.New("supersede pipeline job: job is terminal or exact binding changed")
 }
 
+// supersedePipelineJobsForOwnerDecisionTx invalidates every queued or leased
+// job authorized by an older owner-decision history head. It runs in the same
+// transaction that appends the new signed decision, so an advanced authority
+// can never leave an older job at the front of the worker queue.
+func supersedePipelineJobsForOwnerDecisionTx(tx *sql.Tx, runID, currentHead string, at int64) (int, error) {
+	rows, err := tx.Query(
+		`UPDATE pipeline_jobs
+		    SET status = ?, superseded_at = ?, lease_expires_at = NULL,
+		        heartbeat_at = NULL, updated_at = ?
+		  WHERE run_id = ? AND status IN (?, ?) AND owner_decision_head <> ?
+		  RETURNING `+pipelineJobColumns,
+		PipelineJobSuperseded, at, at, runID, PipelineJobQueued, PipelineJobLeased, currentHead,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("supersede stale owner-decision jobs: %w", err)
+	}
+	defer rows.Close()
+	var jobs []*PipelineJob
+	for rows.Next() {
+		job, err := scanPipelineJob(rows)
+		if err != nil {
+			return 0, fmt.Errorf("scan stale owner-decision job: %w", err)
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("scan stale owner-decision jobs: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("close stale owner-decision jobs: %w", err)
+	}
+	for _, job := range jobs {
+		if err := insertPipelineJobEventTx(tx, job, "superseded", at); err != nil {
+			return 0, err
+		}
+	}
+	return len(jobs), nil
+}
+
 func (d *DB) GetPipelineJobEvents(jobID string) ([]PipelineJobEvent, error) {
 	rows, err := d.sql.Query(
 		`SELECT id, job_id, event_type, status, attempt, lease_fence, lease_owner,
