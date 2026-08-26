@@ -35,7 +35,9 @@ const (
 
 const PipelineJobErrorLeaseExpired = "lease_expired"
 
-const maxPipelineJobAttempts = 100
+// Infrastructure delivery retries are separate from semantic repair policy.
+// Keep the hard safety ceiling small; ordinary callers should use two or three.
+const maxPipelineJobAttempts = 10
 
 // PipelineJob is bounded execution metadata. Runs and step_results remain the
 // semantic source of truth; a job records only how one exact unit was executed.
@@ -48,6 +50,7 @@ type PipelineJob struct {
 	DesiredHeadSHA    string
 	InputDigest       string
 	OwnerDecisionHead string
+	DesiredGeneration int64
 	IdempotencyKey    string
 	Status            PipelineJobStatus
 	MaxAttempts       int
@@ -73,6 +76,7 @@ type PipelineJobSpec struct {
 	DesiredHeadSHA    string
 	InputDigest       string
 	OwnerDecisionHead string
+	DesiredGeneration int64
 	MaxAttempts       int
 }
 
@@ -83,6 +87,7 @@ type PipelineJobHeartbeat struct {
 	DesiredHeadSHA    string
 	InputDigest       string
 	OwnerDecisionHead string
+	DesiredGeneration int64
 	HeartbeatAt       time.Time
 	LeaseDuration     time.Duration
 }
@@ -94,6 +99,7 @@ type PipelineJobCompletion struct {
 	DesiredHeadSHA    string
 	InputDigest       string
 	OwnerDecisionHead string
+	DesiredGeneration int64
 	ResultDigest      string
 	OutputHeadSHA     string
 	CompletedAt       time.Time
@@ -104,6 +110,7 @@ type PipelineJobSupersession struct {
 	DesiredHeadSHA    string
 	InputDigest       string
 	OwnerDecisionHead string
+	DesiredGeneration int64
 	SupersededAt      time.Time
 }
 
@@ -120,13 +127,14 @@ type PipelineJobEvent struct {
 	CreatedAt     int64
 }
 
-const pipelineJobColumns = `id, run_id, step_result_id, kind, round, desired_head_sha, input_digest, owner_decision_head, idempotency_key, status, max_attempts, attempts_started, lease_fence, lease_owner, lease_expires_at, heartbeat_at, result_digest, output_head_sha, error_category, superseded_at, completed_at, created_at, updated_at`
+const pipelineJobColumns = `id, run_id, step_result_id, kind, round, desired_head_sha, input_digest, owner_decision_head, desired_generation, idempotency_key, status, max_attempts, attempts_started, lease_fence, lease_owner, lease_expires_at, heartbeat_at, result_digest, output_head_sha, error_category, superseded_at, completed_at, created_at, updated_at`
 
 func scanPipelineJob(scanner interface{ Scan(...any) error }) (*PipelineJob, error) {
 	job := &PipelineJob{}
 	if err := scanner.Scan(
 		&job.ID, &job.RunID, &job.StepResultID, &job.Kind, &job.Round,
 		&job.DesiredHeadSHA, &job.InputDigest, &job.OwnerDecisionHead,
+		&job.DesiredGeneration,
 		&job.IdempotencyKey, &job.Status, &job.MaxAttempts,
 		&job.AttemptsStarted, &job.LeaseFence, &job.LeaseOwner,
 		&job.LeaseExpiresAt, &job.HeartbeatAt, &job.ResultDigest,
@@ -180,10 +188,10 @@ func (d *DB) EnqueuePipelineJob(spec PipelineJobSpec) (*PipelineJob, bool, error
 	result, err := tx.Exec(
 		`INSERT OR IGNORE INTO pipeline_jobs
 		 (id, run_id, step_result_id, kind, round, desired_head_sha, input_digest,
-		  owner_decision_head, idempotency_key, status, max_attempts, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		  owner_decision_head, desired_generation, idempotency_key, status, max_attempts, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		jobID, spec.RunID, spec.StepResultID, spec.Kind, spec.Round,
-		spec.DesiredHeadSHA, spec.InputDigest, spec.OwnerDecisionHead, key,
+		spec.DesiredHeadSHA, spec.InputDigest, spec.OwnerDecisionHead, spec.DesiredGeneration, key,
 		PipelineJobQueued, spec.MaxAttempts, ts, ts,
 	)
 	if err != nil {
@@ -301,14 +309,14 @@ func (d *DB) HeartbeatPipelineJob(heartbeat PipelineJobHeartbeat) (*PipelineJob,
 		`UPDATE pipeline_jobs
 		    SET lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
 		  WHERE id = ? AND status = ? AND lease_owner = ? AND lease_fence = ?
-		    AND desired_head_sha = ? AND input_digest = ? AND owner_decision_head = ?
+		    AND desired_head_sha = ? AND input_digest = ? AND owner_decision_head = ? AND desired_generation = ?
 		    AND lease_expires_at > ?
 		    AND EXISTS (SELECT 1 FROM runs r WHERE r.id = pipeline_jobs.run_id AND r.head_sha = pipeline_jobs.desired_head_sha)
 		    AND EXISTS (SELECT 1 FROM step_results s WHERE s.id = pipeline_jobs.step_result_id AND s.run_id = pipeline_jobs.run_id)
 		  RETURNING `+pipelineJobColumns,
 		ts+leaseSeconds, ts, ts, heartbeat.JobID, PipelineJobLeased,
 		heartbeat.LeaseOwner, heartbeat.LeaseFence, heartbeat.DesiredHeadSHA,
-		heartbeat.InputDigest, heartbeat.OwnerDecisionHead, ts,
+		heartbeat.InputDigest, heartbeat.OwnerDecisionHead, heartbeat.DesiredGeneration, ts,
 	))
 	if err == sql.ErrNoRows {
 		return nil, errors.New("heartbeat pipeline job: lease or exact binding is stale")
@@ -406,14 +414,14 @@ func (d *DB) CompletePipelineJob(completion PipelineJobCompletion) (bool, error)
 		    SET status = ?, result_digest = ?, output_head_sha = ?, completed_at = ?,
 		        lease_expires_at = NULL, heartbeat_at = NULL, updated_at = ?
 		  WHERE id = ? AND status = ? AND lease_owner = ? AND lease_fence = ?
-		    AND desired_head_sha = ? AND input_digest = ? AND owner_decision_head = ?
+		    AND desired_head_sha = ? AND input_digest = ? AND owner_decision_head = ? AND desired_generation = ?
 		    AND lease_expires_at > ?
 		    AND EXISTS (SELECT 1 FROM runs r WHERE r.id = pipeline_jobs.run_id AND r.head_sha = pipeline_jobs.desired_head_sha)
 		    AND EXISTS (SELECT 1 FROM step_results s WHERE s.id = pipeline_jobs.step_result_id AND s.run_id = pipeline_jobs.run_id)
 		  RETURNING `+pipelineJobColumns,
 		PipelineJobCompleted, completion.ResultDigest, completion.OutputHeadSHA, ts, ts,
 		completion.JobID, PipelineJobLeased, completion.LeaseOwner, completion.LeaseFence,
-		completion.DesiredHeadSHA, completion.InputDigest, completion.OwnerDecisionHead, ts,
+		completion.DesiredHeadSHA, completion.InputDigest, completion.OwnerDecisionHead, completion.DesiredGeneration, ts,
 	))
 	if err == nil {
 		if err := d.verifyPipelineJobCanonicalBindingsTx(tx, job); err != nil {
@@ -462,11 +470,11 @@ func (d *DB) SupersedePipelineJob(supersession PipelineJobSupersession) (bool, e
 		    SET status = ?, superseded_at = ?, lease_expires_at = NULL,
 		        heartbeat_at = NULL, updated_at = ?
 		  WHERE id = ? AND status IN (?, ?)
-		    AND desired_head_sha = ? AND input_digest = ? AND owner_decision_head = ?
+		    AND desired_head_sha = ? AND input_digest = ? AND owner_decision_head = ? AND desired_generation = ?
 		  RETURNING `+pipelineJobColumns,
 		PipelineJobSuperseded, ts, ts, supersession.JobID,
 		PipelineJobQueued, PipelineJobLeased, supersession.DesiredHeadSHA,
-		supersession.InputDigest, supersession.OwnerDecisionHead,
+		supersession.InputDigest, supersession.OwnerDecisionHead, supersession.DesiredGeneration,
 	))
 	if err == nil {
 		if err := insertPipelineJobEventTx(tx, job, "superseded", ts); err != nil {
@@ -487,7 +495,8 @@ func (d *DB) SupersedePipelineJob(supersession PipelineJobSupersession) (bool, e
 	if existing != nil && existing.Status == PipelineJobSuperseded &&
 		existing.DesiredHeadSHA == supersession.DesiredHeadSHA &&
 		existing.InputDigest == supersession.InputDigest &&
-		existing.OwnerDecisionHead == supersession.OwnerDecisionHead {
+		existing.OwnerDecisionHead == supersession.OwnerDecisionHead &&
+		existing.DesiredGeneration == supersession.DesiredGeneration {
 		if err := tx.Commit(); err != nil {
 			return false, fmt.Errorf("commit pipeline job supersession replay: %w", err)
 		}
@@ -594,12 +603,12 @@ func insertPipelineJobEventTx(tx *sql.Tx, job *PipelineJob, eventType string, at
 }
 
 func (d *DB) verifyPipelineJobCanonicalBindingsTx(tx *sql.Tx, job *PipelineJob) error {
-	var runHead, stepRunID string
+	var runHead, stepRunID, repoID, branch string
 	if err := tx.QueryRow(
-		`SELECT r.head_sha, s.run_id
+		`SELECT r.head_sha, s.run_id, r.repo_id, r.branch
 		   FROM runs r JOIN step_results s ON s.id = ?
 		  WHERE r.id = ?`, job.StepResultID, job.RunID,
-	).Scan(&runHead, &stepRunID); err != nil {
+	).Scan(&runHead, &stepRunID, &repoID, &branch); err != nil {
 		if err == sql.ErrNoRows {
 			return errors.New("run or step binding is absent")
 		}
@@ -607,6 +616,20 @@ func (d *DB) verifyPipelineJobCanonicalBindingsTx(tx *sql.Tx, job *PipelineJob) 
 	}
 	if stepRunID != job.RunID || runHead != job.DesiredHeadSHA {
 		return errors.New("run, step, or desired head binding changed")
+	}
+	var revision int64
+	var desiredHead, inputDigest string
+	err := tx.QueryRow(`SELECT revision, head_sha, input_digest FROM branch_desired_state WHERE repo_id = ? AND branch = ?`, repoID, branch).
+		Scan(&revision, &desiredHead, &inputDigest)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("verify desired generation: %w", err)
+	}
+	if err == sql.ErrNoRows {
+		if job.DesiredGeneration != 0 {
+			return errors.New("job names a desired generation without branch state")
+		}
+	} else if revision != job.DesiredGeneration || desiredHead != job.DesiredHeadSHA || inputDigest != job.InputDigest {
+		return errors.New("desired generation, head, or input binding changed")
 	}
 	authority, err := getOwnerDecisionAuthorityTx(tx, job.RunID)
 	if err != nil {
@@ -649,7 +672,8 @@ func pipelineJobMatchesSpec(job *PipelineJob, spec PipelineJobSpec) bool {
 	return job != nil && job.RunID == spec.RunID && job.StepResultID == spec.StepResultID &&
 		job.Kind == spec.Kind && job.Round == spec.Round &&
 		job.DesiredHeadSHA == spec.DesiredHeadSHA && job.InputDigest == spec.InputDigest &&
-		job.OwnerDecisionHead == spec.OwnerDecisionHead && job.MaxAttempts == spec.MaxAttempts
+		job.OwnerDecisionHead == spec.OwnerDecisionHead && job.DesiredGeneration == spec.DesiredGeneration &&
+		job.MaxAttempts == spec.MaxAttempts
 }
 
 func pipelineJobMatchesCompletion(job *PipelineJob, completion PipelineJobCompletion) bool {
@@ -659,6 +683,7 @@ func pipelineJobMatchesCompletion(job *PipelineJob, completion PipelineJobComple
 		job.DesiredHeadSHA == completion.DesiredHeadSHA &&
 		job.InputDigest == completion.InputDigest &&
 		job.OwnerDecisionHead == completion.OwnerDecisionHead &&
+		job.DesiredGeneration == completion.DesiredGeneration &&
 		job.ResultDigest != nil && *job.ResultDigest == completion.ResultDigest &&
 		job.OutputHeadSHA != nil && *job.OutputHeadSHA == completion.OutputHeadSHA
 }
@@ -672,6 +697,9 @@ func validatePipelineJobSpec(spec PipelineJobSpec) error {
 	}
 	if spec.Round < 0 {
 		return errors.New("enqueue pipeline job: round must be non-negative")
+	}
+	if spec.DesiredGeneration < 0 {
+		return errors.New("enqueue pipeline job: desired generation must be non-negative")
 	}
 	if !validGitHead(spec.DesiredHeadSHA) {
 		return errors.New("enqueue pipeline job: desired head must be a Git object ID")
@@ -761,6 +789,7 @@ func pipelineJobSemanticKey(spec PipelineJobSpec) (string, error) {
 		DesiredHeadSHA    string          `json:"desired_head_sha"`
 		InputDigest       string          `json:"input_digest"`
 		OwnerDecisionHead string          `json:"owner_decision_head"`
+		DesiredGeneration int64           `json:"desired_generation"`
 	}{
 		Schema:            "no-mistakes.pipeline-job/v1",
 		RunID:             spec.RunID,
@@ -770,6 +799,7 @@ func pipelineJobSemanticKey(spec PipelineJobSpec) (string, error) {
 		DesiredHeadSHA:    spec.DesiredHeadSHA,
 		InputDigest:       spec.InputDigest,
 		OwnerDecisionHead: spec.OwnerDecisionHead,
+		DesiredGeneration: spec.DesiredGeneration,
 	}
 	payload, err := json.Marshal(identity)
 	if err != nil {

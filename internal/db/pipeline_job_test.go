@@ -531,7 +531,7 @@ func TestPipelineJobSchemaStoresOnlyBoundedMetadata(t *testing.T) {
 		"pipeline_jobs": {
 			"id": true, "run_id": true, "step_result_id": true, "kind": true,
 			"round": true, "desired_head_sha": true, "input_digest": true,
-			"owner_decision_head": true, "idempotency_key": true, "status": true,
+			"owner_decision_head": true, "desired_generation": true, "idempotency_key": true, "status": true,
 			"max_attempts": true, "attempts_started": true, "lease_fence": true,
 			"lease_owner": true, "lease_expires_at": true, "heartbeat_at": true,
 			"result_digest": true, "output_head_sha": true, "error_category": true,
@@ -569,5 +569,18 @@ func TestPipelineJobSchemaStoresOnlyBoundedMetadata(t *testing.T) {
 		if len(seen) != len(columns) {
 			t.Fatalf("%s columns = %v, want exact reviewed shape %v", table, seen, columns)
 		}
+	}
+}
+
+func TestPipelineJobRetryCeilingIsSmall(t *testing.T) {
+	database := openTestDB(t)
+	fixture := newPipelineJobFixture(t, database, false)
+	fixture.spec.MaxAttempts = 11
+	if _, _, err := database.EnqueuePipelineJob(fixture.spec); err == nil {
+		t.Fatal("retry budget above hard ceiling was accepted")
+	}
+	fixture.spec.MaxAttempts = 10
+	if _, _, err := database.EnqueuePipelineJob(fixture.spec); err != nil {
+		t.Fatalf("hard ceiling was rejected: %v", err)
 	}
 }
