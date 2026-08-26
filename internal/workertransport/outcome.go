@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 const (
@@ -27,16 +29,30 @@ const (
 // PR mutations, and guest-selected timing. ResultEnvelope binds these bytes by
 // SHA-256 before the controller admits any pipeline outcome.
 type StepOutcomeEnvelope struct {
-	Schema                string          `json:"schema"`
-	Step                  StepOutcomeStep `json:"step"`
-	NeedsApproval         bool            `json:"needs_approval"`
-	AutoFixable           bool            `json:"auto_fixable"`
-	FindingsJSON          string          `json:"findings_json,omitempty"`
-	ExitCode              int             `json:"exit_code"`
-	FixSummary            string          `json:"fix_summary,omitempty"`
-	ReviewApprovedHeadSHA string          `json:"review_approved_head_sha,omitempty"`
-	Skipped               bool            `json:"skipped"`
-	SkipRemaining         bool            `json:"skip_remaining"`
+	Schema                string                  `json:"schema"`
+	Step                  StepOutcomeStep         `json:"step"`
+	NeedsApproval         bool                    `json:"needs_approval"`
+	AutoFixable           bool                    `json:"auto_fixable"`
+	FindingsJSON          string                  `json:"findings_json,omitempty"`
+	ExitCode              int                     `json:"exit_code"`
+	FixSummary            string                  `json:"fix_summary,omitempty"`
+	ReviewApprovedHeadSHA string                  `json:"review_approved_head_sha,omitempty"`
+	Skipped               bool                    `json:"skipped"`
+	SkipRemaining         bool                    `json:"skip_remaining"`
+	QualityOutcome        *QualityOutcomeEnvelope `json:"quality_outcome,omitempty"`
+}
+
+// QualityOutcomeEnvelope is the content-free semantic-rereview observation
+// a controller-authorized review repair may return. The controller supplies
+// run/job custody and performs the durable append.
+type QualityOutcomeEnvelope struct {
+	FixAttemptID       string `json:"fix_attempt_id"`
+	RootID             string `json:"root_id,omitempty"`
+	Classification     string `json:"classification"`
+	FixedHeadSHA       string `json:"fixed_head_sha"`
+	ObservedHeadSHA    string `json:"observed_head_sha"`
+	EvidenceDigest     string `json:"evidence_digest"`
+	EvidenceProvenance string `json:"evidence_provenance"`
 }
 
 func decodeStepOutcome(data []byte, wantStep StepOutcomeStep, outputHead string) (StepOutcomeEnvelope, error) {
@@ -70,6 +86,14 @@ func decodeStepOutcome(data []byte, wantStep StepOutcomeStep, outputHead string)
 	if (outcome.NeedsApproval || outcome.AutoFixable) && outcome.FindingsJSON == "" {
 		return outcome, errors.New("blocking or auto-fixable worker outcome is missing findings")
 	}
+	wantApproval, wantAutoFixable, err := derivedStepOutcomeFlags(outcome)
+	if err != nil {
+		return outcome, err
+	}
+	if outcome.NeedsApproval != wantApproval || outcome.AutoFixable != wantAutoFixable {
+		return outcome, fmt.Errorf("worker step outcome flags are inconsistent with findings and exit code: approval=%t auto_fixable=%t, want %t/%t",
+			outcome.NeedsApproval, outcome.AutoFixable, wantApproval, wantAutoFixable)
+	}
 	if len(outcome.FixSummary) > maxFixSummaryBytes || strings.ContainsAny(outcome.FixSummary, "\r\n\x00") {
 		return outcome, errors.New("worker fix summary is oversized or multiline")
 	}
@@ -80,7 +104,58 @@ func decodeStepOutcome(data []byte, wantStep StepOutcomeStep, outputHead string)
 	} else if outcome.ReviewApprovedHeadSHA != "" {
 		return outcome, errors.New("non-review worker outcome asserted review approval")
 	}
+	if outcome.QualityOutcome != nil {
+		if wantStep != StepOutcomeReview {
+			return outcome, errors.New("non-review worker outcome asserted semantic quality authority")
+		}
+		if err := validateQualityOutcomeEnvelope(*outcome.QualityOutcome, outputHead); err != nil {
+			return outcome, err
+		}
+	}
 	return outcome, nil
+}
+
+func validateQualityOutcomeEnvelope(outcome QualityOutcomeEnvelope, outputHead string) error {
+	switch outcome.Classification {
+	case "clean_fix", "same_root_followup", "introduced_regression", "primary_handoff":
+	default:
+		return fmt.Errorf("worker semantic quality classification is unsupported: %q", outcome.Classification)
+	}
+	if !strings.HasPrefix(outcome.FixAttemptID, "review-fix-") || len(outcome.FixAttemptID) > 64 || strings.ContainsAny(outcome.FixAttemptID, "\r\n\x00") {
+		return errors.New("worker semantic quality fix attempt is invalid")
+	}
+	if len(outcome.RootID) > 128 || strings.ContainsAny(outcome.RootID, "\r\n\x00") {
+		return errors.New("worker semantic quality root is invalid")
+	}
+	if outcome.FixedHeadSHA != outputHead || outcome.ObservedHeadSHA != outputHead {
+		return errors.New("worker semantic quality observation is not bound to the output head")
+	}
+	if outcome.EvidenceProvenance != "semantic_rereview" || len(outcome.EvidenceDigest) != len("sha256:")+64 || !strings.HasPrefix(outcome.EvidenceDigest, "sha256:") || strings.Trim(strings.TrimPrefix(outcome.EvidenceDigest, "sha256:"), "0123456789abcdef") != "" {
+		return errors.New("worker semantic quality evidence binding is invalid")
+	}
+	return nil
+}
+
+func derivedStepOutcomeFlags(outcome StepOutcomeEnvelope) (bool, bool, error) {
+	items := []types.Finding(nil)
+	if outcome.FindingsJSON != "" {
+		findings, err := types.ParseFindingsJSON(outcome.FindingsJSON)
+		if err != nil {
+			return false, false, fmt.Errorf("worker step findings do not match the findings contract: %w", err)
+		}
+		items = findings.Items
+	}
+	blocking := outcome.ExitCode != 0
+	for _, item := range items {
+		if item.Severity == types.FindingSeverityError || item.Severity == types.FindingSeverityWarning {
+			blocking = true
+		}
+	}
+	autoFixable := blocking
+	if outcome.Step == StepOutcomeReview {
+		autoFixable = len(items) > 0
+	}
+	return blocking, autoFixable, nil
 }
 
 // ValidateStepOutcome applies the same closed result contract used by the

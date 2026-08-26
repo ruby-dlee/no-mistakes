@@ -47,6 +47,8 @@ func TestDecodeStepInputRequiresFindingsOnlyForRepair(t *testing.T) {
 		t.Fatal("accepted repair without findings")
 	}
 	input.PreviousFindings = `{"findings":[]}`
+	input.RepairAttempt = 1
+	input.QualityOutcomeAuthority = "semantic-rereview"
 	data, _ = json.Marshal(input)
 	if _, err := DecodeStepInput(data); err != nil {
 		t.Fatalf("repair with findings: %v", err)

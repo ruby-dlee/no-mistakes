@@ -33,6 +33,19 @@ type workerRunDeps struct {
 	newAgent func(types.AgentName, string, []string, agent.Options) (agent.Agent, error)
 }
 
+type workerQualityCollector struct {
+	outcomes []db.QualityOutcome
+}
+
+func (c *workerQualityCollector) InsertQualityOutcome(outcome db.QualityOutcome) (*db.QualityOutcome, error) {
+	if len(c.outcomes) != 0 {
+		return nil, errors.New("isolated worker produced more than one semantic quality outcome")
+	}
+	c.outcomes = append(c.outcomes, outcome)
+	copy := outcome
+	return &copy, nil
+}
+
 func defaultWorkerRunDeps() workerRunDeps {
 	return workerRunDeps{newAgent: agent.NewWithOptions}
 }
@@ -153,7 +166,15 @@ func runWorker(ctx context.Context, logs io.Writer, opts workerRunOptions, deps 
 		}, LogFile: func(string) {},
 		Fixing: input.Fixing, PreviousFindings: input.PreviousFindings, StepResultID: input.StepResultID,
 		EvidenceDir: evidenceDir, UserIntent: input.UserIntent, IntentSource: input.UserIntentSource,
-		ReviewStartingHeadSHA: input.DesiredHeadSHA,
+		ReviewStartingHeadSHA:         input.DesiredHeadSHA,
+		RemotePriorRoundHistory:       input.PriorRoundHistory,
+		RemoteUncertifiedRoundHistory: input.UncertifiedRoundHistory,
+		RemoteRepairAttempt:           input.RepairAttempt,
+	}
+	var qualityCollector *workerQualityCollector
+	if input.QualityOutcomeAuthority == "semantic-rereview" {
+		qualityCollector = &workerQualityCollector{}
+		sctx.QualityOutcomes = qualityCollector
 	}
 	sctx.CommitFixes = func(step types.StepName, summary, fallback string) error {
 		return steps.CommitIsolatedWorkerFixes(sctx, step, summary, fallback)
@@ -184,6 +205,18 @@ func runWorker(ctx context.Context, logs io.Writer, opts workerRunOptions, deps 
 		FindingsJSON: outcome.Findings, ExitCode: outcome.ExitCode, FixSummary: outcome.FixSummary,
 		ReviewApprovedHeadSHA: outcome.ReviewApprovedHeadSHA, Skipped: outcome.Skipped, SkipRemaining: outcome.SkipRemaining,
 	}
+	if qualityCollector != nil {
+		if len(qualityCollector.outcomes) != 1 {
+			return errors.New("authorized review repair returned no semantic quality outcome")
+		}
+		quality := qualityCollector.outcomes[0]
+		closed.QualityOutcome = &workertransport.QualityOutcomeEnvelope{
+			FixAttemptID: stringValue(quality.FixAttemptID), RootID: stringValue(quality.RootID),
+			Classification: string(quality.Classification), FixedHeadSHA: quality.FixedHeadSHA,
+			ObservedHeadSHA: quality.ObservedHeadSHA, EvidenceDigest: quality.EvidenceDigest,
+			EvidenceProvenance: quality.EvidenceProvenance,
+		}
+	}
 	if err := workertransport.ValidateStepOutcome(closed, workertransport.StepOutcomeStep(input.Step), outputHead); err != nil {
 		return fmt.Errorf("validate worker outcome: %w", err)
 	}
@@ -191,6 +224,13 @@ func runWorker(ctx context.Context, logs io.Writer, opts workerRunOptions, deps 
 		return fmt.Errorf("write worker outcome: %w", err)
 	}
 	return nil
+}
+
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func validateWorkerRole(role string, input workertransport.StepInputEnvelope) error {

@@ -13,6 +13,15 @@ func TestExecuteTargetedSemanticProofBindsFailBeforePassAfterAndIntegration(t *t
 	t.Parallel()
 	dir, _, startingHead := setupGitRepo(t)
 	gitCmd(t, dir, "checkout", "--detach", startingHead)
+	if err := os.WriteFile(filepath.Join(dir, "semantic-app.sh"), []byte("#!/bin/sh\ncat semantic-repair.txt 2>/dev/null\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "check-semantic.sh"), []byte("#!/bin/sh\n[ \"$(./semantic-app.sh)\" = fixed ]\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "check-semantic.sh", "semantic-app.sh")
+	gitCmd(t, dir, "commit", "-m", "add public behavior check")
+	startingHead = gitCmd(t, dir, "rev-parse", "HEAD")
 	if err := os.WriteFile(filepath.Join(dir, "semantic-repair.txt"), []byte("fixed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -24,12 +33,12 @@ func TestExecuteTargetedSemanticProofBindsFailBeforePassAfterAndIntegration(t *t
 		WorkDir:            dir,
 		StartingHeadSHA:    startingHead,
 		FixedHeadSHA:       fixedHead,
-		PublicCommand:      "git cat-file -e HEAD:semantic-repair.txt",
-		IntegrationCommand: "git cat-file -e HEAD:semantic-repair.txt",
+		PublicCommand:      "./check-semantic.sh",
+		IntegrationCommand: "./check-semantic.sh",
 	})
 
 	if result.FailureCategory != "" {
-		t.Fatalf("proof failed: %+v", result)
+		t.Fatalf("proof failed: %+v status=%q", result, gitCmd(t, dir, "status", "--porcelain"))
 	}
 	if result.BeforeExit == 0 || result.AfterExit != 0 || result.IntegrationExit != 0 {
 		t.Fatalf("proof exits = before:%d after:%d integration:%d", result.BeforeExit, result.AfterExit, result.IntegrationExit)
@@ -42,6 +51,24 @@ func TestExecuteTargetedSemanticProofBindsFailBeforePassAfterAndIntegration(t *t
 		if !validSemanticProofDigest(digest) {
 			t.Fatalf("%s digest invalid: %q", name, digest)
 		}
+	}
+}
+
+func TestValidateSemanticProofCommandRejectsObjectAndFileExistenceChecks(t *testing.T) {
+	t.Parallel()
+	for _, command := range []string{
+		"git cat-file -e HEAD:semantic-repair.txt",
+		"test -f semantic-repair.txt",
+		"grep -q expected semantic-repair.txt",
+		"/usr/bin/grep -q expected semantic-repair.txt",
+		"sh -c 'test -f semantic-repair.txt'",
+	} {
+		if err := validateSemanticProofCommand(command); err == nil {
+			t.Fatalf("accepted non-behavior proof command %q", command)
+		}
+	}
+	if err := validateSemanticProofCommand("go test ./internal/public -run TestBehavior"); err != nil {
+		t.Fatalf("rejected behavior proof command: %v", err)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -101,6 +102,75 @@ func TestAdoptRemoteRepairFastForwardsExactHeadAndRejectsStaleRunCAS(t *testing.
 			stored, _ := database.GetRun(run.ID)
 			if stored.HeadSHA != newHead {
 				t.Fatalf("stored head = %s", stored.HeadSHA)
+			}
+		})
+	}
+}
+
+func TestExecuteRemoteReviewRepairRecordsAuthorizedQualityOutcome(t *testing.T) {
+	for _, missingQuality := range []bool{false, true} {
+		name := "records-quality"
+		if missingQuality {
+			name = "missing-quality-rolls-back"
+		}
+		t.Run(name, func(t *testing.T) {
+			repoDir := filepath.Join(t.TempDir(), "repo")
+			pipelineGit(t, "", "init", "-q", repoDir)
+			pipelineGit(t, repoDir, "config", "user.email", "worker@example.invalid")
+			pipelineGit(t, repoDir, "config", "user.name", "Worker Test")
+			if err := os.WriteFile(filepath.Join(repoDir, "source.txt"), []byte("source\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			pipelineGit(t, repoDir, "add", "source.txt")
+			pipelineGit(t, repoDir, "commit", "-qm", "source")
+			oldHead := pipelineGit(t, repoDir, "rev-parse", "HEAD")
+			if err := os.WriteFile(filepath.Join(repoDir, "source.txt"), []byte("fixed\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			pipelineGit(t, repoDir, "add", "source.txt")
+			pipelineGit(t, repoDir, "commit", "-qm", "repair")
+			newHead := pipelineGit(t, repoDir, "rev-parse", "HEAD")
+			resultBranch := "no-mistakes/azure-results/quality-1"
+			pipelineGit(t, repoDir, "branch", resultBranch, newHead)
+			pipelineGit(t, repoDir, "reset", "--hard", oldHead)
+
+			database, p, run, _ := setupTest(t)
+			if err := database.UpdateRunHeadSHA(run.ID, oldHead); err != nil {
+				t.Fatal(err)
+			}
+			attempt, root := "review-fix-1", "auth-root"
+			var quality *db.QualityOutcome
+			if !missingQuality {
+				quality = &db.QualityOutcome{
+					FixAttemptID: &attempt, RootID: &root, Classification: db.QualityCleanFix,
+					FixedHeadSHA: newHead, ObservedHeadSHA: newHead,
+					EvidenceDigest: "sha256:" + strings.Repeat("0", 64), EvidenceProvenance: "semantic_rereview",
+				}
+			}
+			executor := NewExecutor(database, p, nil, nil, nil, nil)
+			executor.SetRemoteStepRunner(remoteStepRunnerFunc(func(_ context.Context, request RemoteStepRequest) (*RemoteStepExecution, error) {
+				return &RemoteStepExecution{
+					Outcome: StepOutcome{ReviewApprovedHeadSHA: newHead}, OutputHeadSHA: newHead,
+					ReturnedBranch: resultBranch, QualityOutcome: quality,
+				}, nil
+			}))
+			runHead := oldHead
+			_, err := executor.executeRemoteStep(context.Background(), RemoteStepRequest{
+				RunID: run.ID, Step: types.StepReview, DesiredHeadSHA: oldHead, WorkDir: repoDir,
+				Fixing: true, QualityOutcomeAuthority: "semantic-rereview",
+			}, &runHead)
+			outcomes, getErr := database.GetQualityOutcomesByRun(run.ID)
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+			if missingQuality {
+				if err == nil || runHead != oldHead || pipelineGit(t, repoDir, "rev-parse", "HEAD") != oldHead || len(outcomes) != 0 {
+					t.Fatalf("missing quality err=%v run=%s outcomes=%+v", err, runHead, outcomes)
+				}
+				return
+			}
+			if err != nil || runHead != newHead || len(outcomes) != 1 || outcomes[0].Classification != db.QualityCleanFix {
+				t.Fatalf("recorded quality err=%v run=%s outcomes=%+v", err, runHead, outcomes)
 			}
 		})
 	}

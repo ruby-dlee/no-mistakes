@@ -40,6 +40,15 @@ func bindSemanticExecutorProof(sctx *pipeline.StepContext, startingHead string, 
 		evidence.executorProof = &proof
 		return evidence
 	}
+	if err := validateGeneratedArtifactDiff(sctx.Ctx, sctx.WorkDir, startingHead, sctx.Run.HeadSHA, evidence); err != nil {
+		proof.FailureCategory = "generated_artifact_diff_unverified"
+		evidence.RepairComplete = false
+		evidence.executorProof = &proof
+		if sctx.Log != nil {
+			sctx.Log("semantic repair proof incomplete; primary-agent handoff required (" + err.Error() + ")")
+		}
+		return evidence
+	}
 	request := pipeline.SemanticProofRequest{
 		WorkDir: sctx.WorkDir, StartingHeadSHA: startingHead, FixedHeadSHA: sctx.Run.HeadSHA,
 		PublicCommand: evidence.PublicExecutableCheck, IntegrationCommand: evidence.IntegrationConsumerCheck,
@@ -158,6 +167,14 @@ func validateSemanticProofCommand(command string) error {
 		}
 	}
 	fields := strings.Fields(strings.ToLower(command))
+	if len(fields) == 0 {
+		return fmt.Errorf("semantic proof command must name a behavior interface")
+	}
+	executable := strings.TrimPrefix(filepath.Base(fields[0]), "./")
+	switch executable {
+	case "git", "test", "[", "grep", "egrep", "fgrep", "cat", "ls", "find", "stat", "cmp", "diff", "sha1sum", "sha256sum", "md5", "md5sum", "sh", "bash", "zsh", "dash", "env":
+		return fmt.Errorf("semantic proof command must exercise behavior, a public interface, or an integration boundary")
+	}
 	for _, field := range fields {
 		if field == "./..." || strings.HasSuffix(field, "/...") {
 			return fmt.Errorf("semantic proof command cannot run a recursive suite")

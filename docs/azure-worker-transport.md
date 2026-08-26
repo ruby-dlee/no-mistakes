@@ -27,7 +27,10 @@ private payload directory contains exactly:
   SHA-256 is in the request envelope. It binds `run_id`, `repo_id`,
   `step_result_id`, `step`, `round`, `desired_head_sha`, `base_sha`, `branch`,
   `default_branch`, `fixing`, `previous_findings_json`, `user_intent`, and
-  `user_intent_source`.
+  `user_intent_source`. Review repairs additionally carry bounded sanitized
+  prior-round and uncertified-round history, the recurrence attempt, and the
+  exact `semantic-rereview` quality-outcome authority. No controller database
+  is copied into the guest.
 
 The staged runtime executes exactly:
 
@@ -64,7 +67,10 @@ zero. The semantic object contains only `step`, `needs_approval`,
 including review repair, bind review approval to the exact output head; test
 outcomes, including test repair, cannot assert review authority. This separate
 digest-bound object prevents a remote finding from being collapsed into a
-clear/pass transport result.
+clear/pass transport result. The controller independently derives the blocking
+and auto-fix flags from findings and exit status. An authorized review repair
+also returns one content-free, exact-head-bound semantic quality observation;
+the controller, not the guest, supplies job custody and appends it locally.
 
 Every request binding must be echoed exactly. Unknown fields, trailing data,
 missing files, wrong identities, wrong heads, and stale fences fail closed.

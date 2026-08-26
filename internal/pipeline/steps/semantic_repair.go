@@ -186,6 +186,9 @@ The pipeline executed these exact targeted checks outside the fixer session. Ind
 }
 
 func reviewRepairAttempt(sctx *pipeline.StepContext) int {
+	if sctx != nil && sctx.RemoteRepairAttempt > 0 {
+		return sctx.RemoteRepairAttempt
+	}
 	attempt := 1
 	if sctx == nil || sctx.DB == nil || sctx.StepResultID == "" {
 		return attempt
@@ -217,7 +220,7 @@ Fresh semantic-repair escalation:
 func normalizeSemanticRiskReviewActions(findings Findings) Findings {
 	highRisk := strings.EqualFold(strings.TrimSpace(findings.RiskLevel), "high")
 	for i := range findings.Items {
-		if findings.Items[i].ActionOrDefault() == types.ActionAutoFix && (highRisk || findingHasSemanticRisk(findings.Items[i])) {
+		if findings.Items[i].ActionOrDefault() == types.ActionAutoFix && (highRisk || findingHasSemanticRisk(findings.Items[i], findings.RiskRationale+" "+findings.Summary)) {
 			findings.Items[i].Action = types.ActionAskUser
 		}
 	}
@@ -235,7 +238,7 @@ var semanticRiskFamilies = map[string]bool{
 	"integration-compatibility": true,
 }
 
-func findingHasSemanticRisk(item Finding) bool {
+func findingHasSemanticRisk(item Finding, overallContext string) bool {
 	family := normalizeSemanticIdentity(item.SemanticFamily)
 	if semanticRiskFamilies[family] {
 		return true
@@ -248,19 +251,75 @@ func findingHasSemanticRisk(item Finding) bool {
 	if strings.Contains(path, "generated") || strings.Contains(path, "/gen/") || strings.HasPrefix(path, "gen/") {
 		return true
 	}
-	text := strings.ToLower(strings.Join([]string{item.SemanticRoot, item.Description}, " "))
+	for _, marker := range []string{"/auth/", "auth.", "auth_", "permission", "rbac", "access-control", "policy", "schema", "contract", "deploy", "routing"} {
+		if strings.Contains(path, marker) {
+			return true
+		}
+	}
+	text := strings.ToLower(strings.Join([]string{item.SemanticRoot, item.Description, overallContext}, " "))
 	for _, marker := range []string{
 		"contract", "schema", "serializ", "deserializ", "parser", "parsing",
-		"authentication", "authorization", "permission", "tenant boundary",
+		"authentication", "authorization", "permission", "tenant boundary", "cross-tenant",
+		"rbac", "access control", "privilege", "credential", "oauth", "identity boundary",
+		"session token", "api token", "secret exposure",
 		"security", "unsafe", "safety", "deploy", "rollout", "routing",
 		"generated artifact", "generated output", "emitter", "product behavior",
-		"public behavior", "compatibility", "consumer boundary", "integration boundary",
+		"public behavior", "user-visible behavior", "compatibility", "consumer boundary", "integration boundary",
 	} {
 		if strings.Contains(text, marker) {
 			return true
 		}
 	}
 	return false
+}
+
+func validateGeneratedArtifactDiff(ctx context.Context, workDir, startingHead, fixedHead string, evidence semanticRepairEvidence) error {
+	out, err := git.Run(ctx, workDir, "diff", "--name-only", "-z", startingHead, fixedHead)
+	if err != nil {
+		return fmt.Errorf("inspect generated-artifact diff: %w", err)
+	}
+	changed := strings.Split(strings.TrimSuffix(out, "\x00"), "\x00")
+	generated := 0
+	sources := 0
+	for _, path := range changed {
+		path = normalizeSemanticPath(path)
+		if path == "" {
+			continue
+		}
+		if isGeneratedArtifactPath(path) {
+			generated++
+		} else {
+			sources++
+		}
+	}
+	actualTouched := generated > 0
+	if evidence.GeneratedArtifacts.Touched != actualTouched {
+		return fmt.Errorf("generated-artifact claim does not match the actual changed paths")
+	}
+	if !actualTouched {
+		return nil
+	}
+	generatedEvidence := evidence.GeneratedArtifacts
+	if !generatedEvidence.SourceUpdated || !generatedEvidence.EmitterAvailable || !generatedEvidence.EmitterRun {
+		return fmt.Errorf("generated artifacts changed without complete source-and-emitter evidence")
+	}
+	if sources == 0 {
+		return fmt.Errorf("generated artifacts changed without any changed authoritative source path")
+	}
+	return nil
+}
+
+func isGeneratedArtifactPath(path string) bool {
+	path = strings.ToLower(strings.ReplaceAll(path, "\\", "/"))
+	base := path
+	if slash := strings.LastIndexByte(base, '/'); slash >= 0 {
+		base = base[slash+1:]
+	}
+	return strings.Contains(path, "/generated/") || strings.Contains(path, "/gen/") ||
+		strings.HasPrefix(path, "generated/") || strings.HasPrefix(path, "gen/") ||
+		strings.Contains(base, ".generated.") || strings.HasPrefix(base, "zz_generated") ||
+		strings.HasSuffix(base, "_generated.go") || strings.HasSuffix(base, ".pb.go") ||
+		strings.HasSuffix(base, ".g.cs")
 }
 
 func enforceSemanticRepairHandoff(findings Findings, previousRaw string, attempt int, evidence semanticRepairEvidence, repairExecuted bool) Findings {

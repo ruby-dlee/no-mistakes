@@ -98,6 +98,11 @@ type StepContext struct {
 	// CommitFixes replaces the durable daemon commit bookkeeping for isolated
 	// guest workers. Nil preserves the canonical local DB-backed behavior.
 	CommitFixes func(step types.StepName, summary, fallbackSummary string) error
+	// Remote history is already sanitized and bounded by the controller. It is
+	// used only by an isolated guest that intentionally has no local database.
+	RemotePriorRoundHistory       string
+	RemoteUncertifiedRoundHistory string
+	RemoteRepairAttempt           int
 }
 
 // SemanticProofRequest binds one semantic repair's checks to the exact

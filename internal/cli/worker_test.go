@@ -44,6 +44,12 @@ func newWorkerHarness(t *testing.T, configuredTest bool, timeout string) workerH
 			t.Fatal(err)
 		}
 	}
+	if err := os.WriteFile(filepath.Join(repo, "app.sh"), []byte("#!/bin/sh\ncat app.txt\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "check-app.sh"), []byte("#!/bin/sh\n[ \"$(./app.sh)\" = good ]\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	workerGit(t, repo, "add", ".")
 	workerGit(t, repo, "commit", "-m", "base")
 	base := workerGit(t, repo, "rev-parse", "HEAD")
@@ -81,6 +87,10 @@ func (h workerHarness) writeBrief(t *testing.T, step types.StepName, fixing bool
 		Schema: workertransport.StepInputSchema, RunID: "run-1", RepoID: "repo-1", StepResultID: "step-1",
 		Step: step, Round: 1, DesiredHeadSHA: h.head, BaseSHA: h.base, Branch: "feature", DefaultBranch: "trunk",
 		Fixing: fixing, PreviousFindings: previous,
+	}
+	if fixing && step == types.StepReview {
+		input.RepairAttempt = 1
+		input.QualityOutcomeAuthority = "semantic-rereview"
 	}
 	data, err := json.Marshal(input)
 	if err != nil {
@@ -170,7 +180,7 @@ func TestWorkerRunReviewRepairCommitsDescendantAndRereviews(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(opts.CWD, "app.txt"), []byte("good\n"), 0o644); err != nil {
 				return nil, err
 			}
-			return &agent.Result{Output: []byte(`{"summary":"fix value","repair_complete":true,"semantic_family":"local-mechanical","semantic_root":"value","public_executable_check":"grep -q good app.txt","integration_consumer_check":"grep -q good app.txt","generated_artifacts":{"touched":false,"source_updated":false,"emitter_available":false,"emitter_run":false,"disposition":"none"}}`)}, nil
+			return &agent.Result{Output: []byte(`{"summary":"fix value","repair_complete":true,"semantic_family":"local-mechanical","semantic_root":"value","public_executable_check":"./check-app.sh","integration_consumer_check":"./check-app.sh","generated_artifacts":{"touched":false,"source_updated":false,"emitter_available":false,"emitter_run":false,"disposition":"none"}}`)}, nil
 		}
 		return &agent.Result{Output: []byte(`{"findings":[],"risk_level":"low","risk_rationale":"clear","risk_scope":"source-or-external"}`)}, nil
 	}}
@@ -179,7 +189,7 @@ func TestWorkerRunReviewRepairCommitsDescendantAndRereviews(t *testing.T) {
 	}
 	out := readWorkerOutcome(t, h.result)
 	newHead := workerGit(t, h.repo, "rev-parse", "HEAD")
-	if newHead == h.head || out.ReviewApprovedHeadSHA != newHead || calls != 2 {
+	if newHead == h.head || out.ReviewApprovedHeadSHA != newHead || calls != 2 || out.QualityOutcome == nil || out.QualityOutcome.Classification != "clean_fix" {
 		t.Fatalf("head=%s outcome=%+v calls=%d", newHead, out, calls)
 	}
 	workerGit(t, h.repo, "merge-base", "--is-ancestor", h.head, newHead)

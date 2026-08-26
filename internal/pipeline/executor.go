@@ -1179,12 +1179,20 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			if run.Intent != nil {
 				intent = *run.Intent
 			}
+			remoteContext := RemoteStepContext{}
+			if provider, ok := step.(RemoteStepContextProvider); ok {
+				remoteContext = provider.RemoteStepContext(sctx)
+			}
 			outcome, err = e.executeRemoteStep(ctx, RemoteStepRequest{
 				RunID: run.ID, RepoID: run.RepoID, StepResultID: sr.ID,
 				Step: stepName, Round: roundNum + 1, DesiredHeadSHA: run.HeadSHA,
 				BaseSHA: run.BaseSHA, Branch: run.Branch, DefaultBranch: repo.DefaultBranch, Fixing: sctx.Fixing,
 				PreviousFindings: sctx.PreviousFindings, UserIntent: intent,
 				UserIntentSource: userIntentSource, WorkDir: workDir,
+				PriorRoundHistory:       remoteContext.PriorRoundHistory,
+				UncertifiedRoundHistory: remoteContext.UncertifiedRoundHistory,
+				RepairAttempt:           remoteContext.RepairAttempt,
+				QualityOutcomeAuthority: remoteContext.QualityOutcomeAuthority,
 			}, &run.HeadSHA)
 		} else {
 			outcome, err = step.Execute(sctx)

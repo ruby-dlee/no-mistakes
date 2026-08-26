@@ -39,6 +39,9 @@ const (
 // meant to be appended to an existing prompt and begins with two newlines so
 // it separates cleanly from surrounding context.
 func roundHistoryPromptSection(sctx *pipeline.StepContext) string {
+	if sctx != nil && sctx.RemotePriorRoundHistory != "" {
+		return sctx.RemotePriorRoundHistory
+	}
 	return branchDecisionsPromptSection(sctx) +
 		runDecisionsPromptSection(sctx) +
 		stepRoundHistorySection(sctx)
@@ -369,6 +372,9 @@ func decisionOmissionNote(dropped, truncated int) string {
 // a previous run that left uncertified fixer commits on this branch. Those
 // rounds are claims, not evidence, and travel only as explicit prompt text.
 func uncertifiedRoundHistoryPromptSection(sctx *pipeline.StepContext) string {
+	if sctx != nil && sctx.RemoteUncertifiedRoundHistory != "" {
+		return sctx.RemoteUncertifiedRoundHistory
+	}
 	if sctx == nil || len(sctx.UncertifiedPriorRounds) == 0 {
 		return ""
 	}

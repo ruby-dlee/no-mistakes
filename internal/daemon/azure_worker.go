@@ -133,6 +133,10 @@ func (r *azureWorkerRuntime) ExecuteRemoteStep(ctx context.Context, request pipe
 		DefaultBranch: request.DefaultBranch,
 		Fixing:        request.Fixing, PreviousFindings: request.PreviousFindings,
 		UserIntent: request.UserIntent, UserIntentSource: request.UserIntentSource,
+		PriorRoundHistory:       request.PriorRoundHistory,
+		UncertifiedRoundHistory: request.UncertifiedRoundHistory,
+		RepairAttempt:           request.RepairAttempt,
+		QualityOutcomeAuthority: request.QualityOutcomeAuthority,
 	})
 	if err != nil {
 		return nil, err
@@ -183,6 +187,27 @@ func (r *azureWorkerRuntime) ExecuteRemoteStep(ctx context.Context, request pipe
 			if err != nil {
 				return nil, fmt.Errorf("read completed Azure worker result: %w", err)
 			}
+			qualityExpected := request.QualityOutcomeAuthority == "semantic-rereview" && request.Fixing && request.Step == types.StepReview
+			if qualityExpected != (result.StepOutcome.QualityOutcome != nil) {
+				return nil, errors.New("completed Azure worker result has mismatched semantic quality authority")
+			}
+			var qualityOutcome *db.QualityOutcome
+			if result.StepOutcome.QualityOutcome != nil {
+				quality := result.StepOutcome.QualityOutcome
+				fixAttemptID := quality.FixAttemptID
+				var rootID *string
+				if quality.RootID != "" {
+					root := quality.RootID
+					rootID = &root
+				}
+				jobID := current.ID
+				qualityOutcome = &db.QualityOutcome{
+					RunID: request.RunID, JobID: &jobID, FixAttemptID: &fixAttemptID, RootID: rootID,
+					Classification: db.QualityClassification(quality.Classification),
+					FixedHeadSHA:   quality.FixedHeadSHA, ObservedHeadSHA: quality.ObservedHeadSHA,
+					EvidenceDigest: quality.EvidenceDigest, EvidenceProvenance: quality.EvidenceProvenance,
+				}
+			}
 			return &pipeline.RemoteStepExecution{
 				Outcome: pipeline.StepOutcome{
 					NeedsApproval:         result.StepOutcome.NeedsApproval,
@@ -195,6 +220,7 @@ func (r *azureWorkerRuntime) ExecuteRemoteStep(ctx context.Context, request pipe
 					SkipRemaining:         result.StepOutcome.SkipRemaining,
 				},
 				OutputHeadSHA: result.OutputHeadSHA, ReturnedBranch: result.ReturnedBranch,
+				QualityOutcome: qualityOutcome,
 			}, nil
 		case db.PipelineJobFailed:
 			category := "unknown"

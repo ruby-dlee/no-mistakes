@@ -10,6 +10,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/intent"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/testguidance"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -28,6 +29,31 @@ const (
 )
 
 func (s *ReviewStep) Name() types.StepName { return types.StepReview }
+
+func (s *ReviewStep) RemoteStepContext(sctx *pipeline.StepContext) pipeline.RemoteStepContext {
+	context := pipeline.RemoteStepContext{
+		PriorRoundHistory:       boundedRemoteHistory(roundHistoryPromptSection(sctx)),
+		UncertifiedRoundHistory: boundedRemoteHistory(uncertifiedRoundHistoryPromptSection(sctx)),
+	}
+	if sctx != nil && sctx.Fixing {
+		context.RepairAttempt = reviewRepairAttempt(sctx)
+		context.QualityOutcomeAuthority = "semantic-rereview"
+	}
+	return context
+}
+
+func boundedRemoteHistory(value string) string {
+	value = intent.RedactSecrets(intent.StripAdversarial(value))
+	const limit = 48 << 10
+	if len(value) <= limit {
+		return value
+	}
+	end := limit - len("\n[older remote history omitted]")
+	for end > 0 && value[end]&0xc0 == 0x80 {
+		end--
+	}
+	return value[:end] + "\n[older remote history omitted]"
+}
 
 func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
 	ctx := sctx.Ctx

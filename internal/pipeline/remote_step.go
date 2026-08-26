@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/kunchenguid/no-mistakes/internal/db"
 	gitx "github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -14,26 +15,42 @@ import (
 // review/test execution plane. The implementation owns durable serialization;
 // pipeline remains the canonical owner of step and run state.
 type RemoteStepRequest struct {
-	RunID            string
-	RepoID           string
-	StepResultID     string
-	Step             types.StepName
-	Round            int
-	DesiredHeadSHA   string
-	BaseSHA          string
-	Branch           string
-	DefaultBranch    string
-	Fixing           bool
-	PreviousFindings string
-	UserIntent       string
-	UserIntentSource string
-	WorkDir          string
+	RunID                   string
+	RepoID                  string
+	StepResultID            string
+	Step                    types.StepName
+	Round                   int
+	DesiredHeadSHA          string
+	BaseSHA                 string
+	Branch                  string
+	DefaultBranch           string
+	Fixing                  bool
+	PreviousFindings        string
+	UserIntent              string
+	UserIntentSource        string
+	WorkDir                 string
+	PriorRoundHistory       string
+	UncertifiedRoundHistory string
+	RepairAttempt           int
+	QualityOutcomeAuthority string
+}
+
+type RemoteStepContext struct {
+	PriorRoundHistory       string
+	UncertifiedRoundHistory string
+	RepairAttempt           int
+	QualityOutcomeAuthority string
+}
+
+type RemoteStepContextProvider interface {
+	RemoteStepContext(*StepContext) RemoteStepContext
 }
 
 type RemoteStepExecution struct {
 	Outcome        StepOutcome
 	OutputHeadSHA  string
 	ReturnedBranch string
+	QualityOutcome *db.QualityOutcome
 }
 
 type RemoteStepRunner interface {
@@ -58,6 +75,9 @@ func (e *Executor) executeRemoteStep(ctx context.Context, request RemoteStepRequ
 		return nil, errors.New("remote step returned no exact output head")
 	}
 	if !request.Fixing {
+		if execution.QualityOutcome != nil {
+			return nil, errors.New("read-only remote step returned quality-write authority")
+		}
 		if execution.OutputHeadSHA != request.DesiredHeadSHA || execution.ReturnedBranch != "" {
 			return nil, errors.New("read-only remote step changed the exact head")
 		}
@@ -66,7 +86,30 @@ func (e *Executor) executeRemoteStep(ctx context.Context, request RemoteStepRequ
 	if err := e.adoptRemoteRepair(ctx, request, execution, runHead); err != nil {
 		return nil, err
 	}
+	qualityExpected := request.Step == types.StepReview && request.QualityOutcomeAuthority == "semantic-rereview"
+	if qualityExpected != (execution.QualityOutcome != nil) {
+		return nil, e.rollbackRemoteRepair(ctx, request, execution, runHead, errors.New("remote repair quality outcome authority mismatch"))
+	}
+	if execution.QualityOutcome != nil {
+		outcome := *execution.QualityOutcome
+		outcome.RunID = request.RunID
+		if _, err := e.db.InsertQualityOutcome(outcome); err != nil {
+			return nil, e.rollbackRemoteRepair(ctx, request, execution, runHead, fmt.Errorf("record remote semantic quality outcome: %w", err))
+		}
+	}
 	return &execution.Outcome, nil
+}
+
+func (e *Executor) rollbackRemoteRepair(ctx context.Context, request RemoteStepRequest, execution *RemoteStepExecution, runHead *string, cause error) error {
+	_, worktreeErr := gitx.Run(ctx, request.WorkDir, "reset", "--hard", request.DesiredHeadSHA)
+	reverted, dbErr := e.db.AdvanceRunHeadSHA(request.RunID, execution.OutputHeadSHA, request.DesiredHeadSHA)
+	if dbErr == nil && reverted {
+		*runHead = request.DesiredHeadSHA
+	}
+	if worktreeErr != nil || dbErr != nil || !reverted {
+		return fmt.Errorf("%w (repair rollback failed: worktree=%v database=%v reverted=%t)", cause, worktreeErr, dbErr, reverted)
+	}
+	return cause
 }
 
 func (e *Executor) adoptRemoteRepair(ctx context.Context, request RemoteStepRequest, execution *RemoteStepExecution, runHead *string) error {
