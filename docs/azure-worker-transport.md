@@ -26,7 +26,7 @@ private payload directory contains exactly:
 - `brief.md`: one `no-mistakes.azure-worker-step-input/v1` JSON object whose
   SHA-256 is in the request envelope. It binds `run_id`, `repo_id`,
   `step_result_id`, `step`, `round`, `desired_head_sha`, `base_sha`, `branch`,
-  `default_branch`, `fixing`, `previous_findings_json`, `user_intent`, and
+  `default_branch`, the exact `runtime_identity`, `fixing`, `previous_findings_json`, `user_intent`, and
   `user_intent_source`. Review repairs additionally carry bounded sanitized
   prior-round and uncertified-round history, the recurrence attempt, and the
   exact `semantic-rereview` quality-outcome authority. No controller database
@@ -49,7 +49,7 @@ failures write no outcome.
 `request.json` uses `no-mistakes.firstmate-worker-request/v1`. It binds the job,
 run, canonical step name, step-result ID, kind, round, desired head, input digest, owner-decision head, desired
 generation, attempt, lease owner, and monotonic lease fence. It also binds the
-source bundle digest and size, the required guest argv, the expected result
+immutable wrapper/config snapshot and controller transport policy through `runtime_identity`, the source bundle digest and size, every supported role argv, the expected result
 schema, and Firstmate's `fm.worker-return-contract/v1` result family.
 
 The Firstmate wrapper owns task assignment, account selection, isolated Azure
@@ -81,6 +81,9 @@ materializes that commit on a new
 `no-mistakes/azure-results/*` branch without checking it out or changing the
 source worktree. The canonical pipeline adopts that branch only by a clean,
 exact-head, fast-forward check and a run-head database CAS.
+Adoption is intentionally forward-only: if a post-fast-forward authority or
+database check fails, the controller retains the adopted head and result ref
+for custody recovery and never rewrites the worktree backward.
 
 The wrapper must never put prompts, review prose, diffs, command output,
 credentials, or raw model output in the result envelope. Its result is admitted
@@ -95,3 +98,11 @@ each of review, repair, and test, and resumes queued/expired leased jobs after a
 restart. Those three unexpired fenced leases are the only Azure capacity and
 updater-liveness signal. CI waits, parked gates, raw run status, and daemon
 touch timestamps consume no Azure worker capacity.
+
+At daemon construction, no-mistakes copies the trusted Firstmate wrapper and
+owner-private wrapper config into a private non-writable runtime directory and
+executes only those captured bytes. The identity also covers review, repair,
+and test argv shapes plus lease, heartbeat, and wrapper timeout policy. The
+wrapper config in turn pins the clean Firstmate lifecycle source commit and
+the digest of the sealed guest runtime, so an ordinary updater creates a new
+job identity instead of changing an admitted retry in place.

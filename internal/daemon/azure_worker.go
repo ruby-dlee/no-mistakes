@@ -110,6 +110,9 @@ func (r *azureWorkerRuntime) Close() {
 			r.cancel()
 		}
 		r.wg.Wait()
+		if err := r.service.Close(); err != nil {
+			slog.Warn("Azure worker runtime snapshot cleanup failed", "error", err)
+		}
 	})
 }
 

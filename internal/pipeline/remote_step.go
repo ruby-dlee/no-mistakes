@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	gitx "github.com/kunchenguid/no-mistakes/internal/git"
@@ -84,33 +83,21 @@ func (e *Executor) executeRemoteStep(ctx context.Context, request RemoteStepRequ
 		}
 		return &execution.Outcome, nil
 	}
-	if err := e.adoptRemoteRepair(ctx, request, execution, runHead); err != nil {
-		return nil, err
-	}
 	qualityExpected := request.Step == types.StepReview && request.QualityOutcomeAuthority == "semantic-rereview"
 	if qualityExpected != (execution.QualityOutcome != nil) {
-		return nil, e.rollbackRemoteRepair(ctx, request, execution, runHead, errors.New("remote repair quality outcome authority mismatch"))
+		return nil, errors.New("remote repair quality outcome authority mismatch")
+	}
+	if err := e.adoptRemoteRepair(ctx, request, execution, runHead); err != nil {
+		return nil, err
 	}
 	if execution.QualityOutcome != nil {
 		outcome := *execution.QualityOutcome
 		outcome.RunID = request.RunID
 		if _, err := e.db.InsertQualityOutcome(outcome); err != nil {
-			return nil, e.rollbackRemoteRepair(ctx, request, execution, runHead, fmt.Errorf("record remote semantic quality outcome: %w", err))
+			return nil, fmt.Errorf("record remote semantic quality outcome after retaining adopted repair custody: %w", err)
 		}
 	}
 	return &execution.Outcome, nil
-}
-
-func (e *Executor) rollbackRemoteRepair(ctx context.Context, request RemoteStepRequest, execution *RemoteStepExecution, runHead *string, cause error) error {
-	_, worktreeErr := gitx.Run(ctx, request.WorkDir, "reset", "--hard", request.DesiredHeadSHA)
-	reverted, dbErr := e.db.AdvanceRunHeadSHA(request.RunID, execution.OutputHeadSHA, request.DesiredHeadSHA)
-	if dbErr == nil && reverted {
-		*runHead = request.DesiredHeadSHA
-	}
-	if worktreeErr != nil || dbErr != nil || !reverted {
-		return fmt.Errorf("%w (repair rollback failed: worktree=%v database=%v reverted=%t)", cause, worktreeErr, dbErr, reverted)
-	}
-	return cause
 }
 
 func (e *Executor) adoptRemoteRepair(ctx context.Context, request RemoteStepRequest, execution *RemoteStepExecution, runHead *string) error {
@@ -132,47 +119,17 @@ func (e *Executor) adoptRemoteRepair(ctx context.Context, request RemoteStepRequ
 		return fmt.Errorf("fast-forward remote repair: %w", err)
 	}
 	if err := exactCleanRemoteHead(ctx, request.WorkDir, execution.OutputHeadSHA); err != nil {
-		rollbackErr := rollbackAdoptedRemoteRepair(ctx, request.WorkDir, execution.OutputHeadSHA, request.DesiredHeadSHA)
-		return errors.Join(fmt.Errorf("verify adopted remote repair: %w", err), rollbackErr)
+		return fmt.Errorf("verify adopted remote repair; retained forward custody without reverse worktree mutation: %w", err)
 	}
 	updated, err := e.db.AdvanceRunHeadSHA(request.RunID, request.DesiredHeadSHA, execution.OutputHeadSHA)
 	if err != nil || !updated {
-		rollbackErr := rollbackAdoptedRemoteRepair(ctx, request.WorkDir, execution.OutputHeadSHA, request.DesiredHeadSHA)
 		if err != nil {
-			return errors.Join(fmt.Errorf("record adopted remote repair: %w", err), rollbackErr)
+			return fmt.Errorf("record adopted remote repair; retained forward custody without reverse worktree mutation: %w", err)
 		}
-		return errors.Join(errors.New("record adopted remote repair: run head binding is stale"), rollbackErr)
+		return errors.New("record adopted remote repair: run head binding is stale; retained forward custody without reverse worktree mutation")
 	}
 	*runHead = execution.OutputHeadSHA
 	_, _ = gitx.Run(context.Background(), request.WorkDir, "update-ref", "-d", "refs/heads/"+execution.ReturnedBranch, execution.OutputHeadSHA)
-	return nil
-}
-
-// rollbackAdoptedRemoteRepair restores the pre-adoption head only while HEAD
-// still names the exact adopted commit and the index/worktree can make the
-// guarded tree transition without overwriting a concurrent edit. It never
-// uses reset --hard: if read-tree refuses, the ref is compare-and-swap restored
-// to the adopted head so the operator's edit and the admitted repair remain in
-// one coherent worktree for recovery.
-func rollbackAdoptedRemoteRepair(parent context.Context, workDir, adoptedHead, originalHead string) error {
-	ctx := parent
-	if ctx == nil || ctx.Err() != nil {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-	}
-	if _, err := gitx.Run(ctx, workDir, "update-ref", "HEAD", originalHead, adoptedHead); err != nil {
-		return fmt.Errorf("guarded remote repair rollback refused because HEAD moved: %w", err)
-	}
-	if _, err := gitx.Run(ctx, workDir, "read-tree", "-m", "-u", adoptedHead, originalHead); err != nil {
-		if _, restoreErr := gitx.Run(ctx, workDir, "update-ref", "HEAD", adoptedHead, originalHead); restoreErr != nil {
-			return fmt.Errorf("guarded remote repair rollback refused worktree changes: %v; restoring adopted HEAD also failed: %w", err, restoreErr)
-		}
-		return fmt.Errorf("guarded remote repair rollback refused worktree changes and retained adopted HEAD: %w", err)
-	}
-	if err := exactCleanRemoteHead(ctx, workDir, originalHead); err != nil {
-		return fmt.Errorf("guarded remote repair rollback did not reach the original clean head: %w", err)
-	}
 	return nil
 }
 

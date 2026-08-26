@@ -126,6 +126,8 @@ type Service struct {
 	input           InputProvider
 	results         ResultStore
 	runtimeIdentity string
+	runtimeRoot     string
+	closeOnce       sync.Once
 }
 
 func New(database *db.DB, cfg config.AzureWorkerConfig, workRoot, owner string, input InputProvider, resultStores ...ResultStore) (*Service, error) {
@@ -154,14 +156,17 @@ func New(database *db.DB, cfg config.AzureWorkerConfig, workRoot, owner string, 
 	if cfg.Timeout <= 0 || cfg.Timeout > 24*time.Hour {
 		return nil, errors.New("Azure worker timeout must be positive and at most 24 hours")
 	}
-	runtimeIdentity, err := runtimeIdentityForFiles(cfg.RunnerPath, cfg.ConfigPath)
-	if err != nil {
-		return nil, fmt.Errorf("bind Firstmate worker runtime: %w", err)
-	}
 	if !filepath.IsAbs(workRoot) || strings.TrimSpace(owner) == "" || strings.ContainsAny(owner, "\r\n\x00") {
 		return nil, errors.New("Azure worker transport requires an absolute work root and bounded lease owner")
 	}
-	return &Service{database: database, cfg: cfg, workRoot: filepath.Clean(workRoot), owner: owner, input: input, results: results, runtimeIdentity: runtimeIdentity}, nil
+	capturedConfig, runtimeRoot, runtimeIdentity, err := captureWorkerRuntime(cfg, filepath.Clean(workRoot))
+	if err != nil {
+		return nil, fmt.Errorf("bind Firstmate worker runtime: %w", err)
+	}
+	return &Service{
+		database: database, cfg: capturedConfig, workRoot: filepath.Clean(workRoot), owner: owner,
+		input: input, results: results, runtimeIdentity: runtimeIdentity, runtimeRoot: runtimeRoot,
+	}, nil
 }
 
 func (s *Service) Enabled() bool { return s != nil && s.cfg.Enabled }
@@ -171,6 +176,21 @@ func (s *Service) RuntimeIdentity() string {
 		return ""
 	}
 	return s.runtimeIdentity
+}
+
+func (s *Service) Close() error {
+	if s == nil || s.runtimeRoot == "" {
+		return nil
+	}
+	var closeErr error
+	s.closeOnce.Do(func() {
+		if err := os.Chmod(s.runtimeRoot, 0o700); err != nil {
+			closeErr = err
+			return
+		}
+		closeErr = os.RemoveAll(s.runtimeRoot)
+	})
+	return closeErr
 }
 
 // ProcessOne claims and executes at most one job. A nil execution means the
@@ -353,7 +373,7 @@ func (s *Service) executeClaimed(ctx context.Context, job *db.PipelineJob) (*pre
 	if stepInput.RuntimeIdentity != s.runtimeIdentity {
 		return nil, failureError("runtime_identity_mismatch", false, errors.New("worker input runtime identity does not match the active transport"))
 	}
-	currentRuntimeIdentity, err := runtimeIdentityForFiles(s.cfg.RunnerPath, s.cfg.ConfigPath)
+	currentRuntimeIdentity, err := runtimeIdentityForConfig(s.cfg)
 	if err != nil || currentRuntimeIdentity != s.runtimeIdentity {
 		return nil, failureError("runtime_identity_mismatch", false, errors.New("Firstmate worker runtime identity changed after the job was bound"))
 	}
@@ -461,7 +481,7 @@ func requestFor(job *db.PipelineJob, step types.StepName, owner, runtimeIdentity
 }
 
 func (s *Service) runWrapper(ctx context.Context, dir, request, payload, result, outcome, stepOutcome string) error {
-	currentRuntimeIdentity, err := runtimeIdentityForFiles(s.cfg.RunnerPath, s.cfg.ConfigPath)
+	currentRuntimeIdentity, err := runtimeIdentityForConfig(s.cfg)
 	if err != nil || currentRuntimeIdentity != s.runtimeIdentity {
 		return errors.New("Firstmate worker runtime identity changed before dispatch")
 	}
@@ -510,36 +530,105 @@ func workerGuestArgv(kind db.PipelineJobKind) []string {
 	return []string{"no-mistakes", "worker", "run", "--role", string(kind), "--brief", "brief.md", "--result", "outcome.json"}
 }
 
-func runtimeIdentityForFiles(runnerPath, configPath string) (string, error) {
-	if err := validateTrustedFile(runnerPath, true, false); err != nil {
+func captureWorkerRuntime(cfg config.AzureWorkerConfig, workRoot string) (config.AzureWorkerConfig, string, string, error) {
+	if err := validateTrustedFile(cfg.RunnerPath, true, false); err != nil {
+		return cfg, "", "", fmt.Errorf("validate Firstmate wrapper: %w", err)
+	}
+	if err := validateTrustedFile(cfg.ConfigPath, false, true); err != nil {
+		return cfg, "", "", fmt.Errorf("validate Firstmate wrapper config: %w", err)
+	}
+	runner, err := readRegularBounded(cfg.RunnerPath, 16<<20)
+	if err != nil {
+		return cfg, "", "", fmt.Errorf("capture Firstmate wrapper: %w", err)
+	}
+	wrapperConfig, err := readRegularBounded(cfg.ConfigPath, maxInputBytes)
+	if err != nil {
+		return cfg, "", "", fmt.Errorf("capture Firstmate wrapper config: %w", err)
+	}
+	runtimeRoot, err := os.MkdirTemp(workRoot, "runtime-")
+	if err != nil {
+		return cfg, "", "", err
+	}
+	cleanup := func() {
+		_ = os.Chmod(runtimeRoot, 0o700)
+		_ = os.RemoveAll(runtimeRoot)
+	}
+	if err := os.Chmod(runtimeRoot, 0o700); err != nil {
+		cleanup()
+		return cfg, "", "", err
+	}
+	capturedRunner := filepath.Join(runtimeRoot, "fm-no-mistakes-worker")
+	capturedConfig := filepath.Join(runtimeRoot, "wrapper-config.json")
+	if err := writePrivateAtomic(capturedRunner, runner); err != nil {
+		cleanup()
+		return cfg, "", "", err
+	}
+	if err := writePrivateAtomic(capturedConfig, wrapperConfig); err != nil {
+		cleanup()
+		return cfg, "", "", err
+	}
+	if err := os.Chmod(capturedRunner, 0o500); err != nil {
+		cleanup()
+		return cfg, "", "", err
+	}
+	if err := os.Chmod(capturedConfig, 0o400); err != nil {
+		cleanup()
+		return cfg, "", "", err
+	}
+	if err := os.Chmod(runtimeRoot, 0o500); err != nil {
+		cleanup()
+		return cfg, "", "", err
+	}
+	captured := cfg
+	captured.RunnerPath = capturedRunner
+	captured.ConfigPath = capturedConfig
+	identity, err := runtimeIdentityForConfig(captured)
+	if err != nil {
+		cleanup()
+		return cfg, "", "", err
+	}
+	return captured, runtimeRoot, identity, nil
+}
+
+func runtimeIdentityForConfig(cfg config.AzureWorkerConfig) (string, error) {
+	if err := validateTrustedFile(cfg.RunnerPath, true, false); err != nil {
 		return "", fmt.Errorf("validate Firstmate wrapper: %w", err)
 	}
-	if err := validateTrustedFile(configPath, false, true); err != nil {
+	if err := validateTrustedFile(cfg.ConfigPath, false, true); err != nil {
 		return "", fmt.Errorf("validate Firstmate wrapper config: %w", err)
 	}
-	runnerDigest, _, err := digestFile(runnerPath)
+	runnerDigest, _, err := digestFile(cfg.RunnerPath)
 	if err != nil {
 		return "", fmt.Errorf("digest Firstmate wrapper: %w", err)
 	}
-	configDigest, _, err := digestFile(configPath)
+	configDigest, _, err := digestFile(cfg.ConfigPath)
 	if err != nil {
 		return "", fmt.Errorf("digest Firstmate wrapper config: %w", err)
 	}
 	identity := struct {
-		Schema            string   `json:"schema"`
-		RunnerSHA256      string   `json:"runner_sha256"`
-		ConfigSHA256      string   `json:"config_sha256"`
-		RequestSchema     string   `json:"request_schema"`
-		ResultSchema      string   `json:"result_schema"`
-		StepInputSchema   string   `json:"step_input_schema"`
-		StepOutcomeSchema string   `json:"step_outcome_schema"`
-		GuestArgvShape    []string `json:"guest_argv_shape"`
+		Schema            string     `json:"schema"`
+		RunnerSHA256      string     `json:"runner_sha256"`
+		ConfigSHA256      string     `json:"config_sha256"`
+		RequestSchema     string     `json:"request_schema"`
+		ResultSchema      string     `json:"result_schema"`
+		StepInputSchema   string     `json:"step_input_schema"`
+		StepOutcomeSchema string     `json:"step_outcome_schema"`
+		GuestArgvShapes   [][]string `json:"guest_argv_shapes"`
+		LeaseDurationNS   int64      `json:"lease_duration_ns"`
+		HeartbeatNS       int64      `json:"heartbeat_interval_ns"`
+		TimeoutNS         int64      `json:"timeout_ns"`
 	}{
 		Schema:       "no-mistakes.azure-worker-runtime-identity/v1",
 		RunnerSHA256: runnerDigest, ConfigSHA256: configDigest,
 		RequestSchema: RequestSchema, ResultSchema: ResultSchema,
 		StepInputSchema: StepInputSchema, StepOutcomeSchema: StepOutcomeSchema,
-		GuestArgvShape: workerGuestArgv(db.PipelineJobReview),
+		GuestArgvShapes: [][]string{
+			workerGuestArgv(db.PipelineJobReview),
+			workerGuestArgv(db.PipelineJobRepair),
+			workerGuestArgv(db.PipelineJobTest),
+		},
+		LeaseDurationNS: int64(cfg.LeaseDuration), HeartbeatNS: int64(cfg.HeartbeatInterval),
+		TimeoutNS: int64(cfg.Timeout),
 	}
 	payload, err := json.Marshal(identity)
 	if err != nil {

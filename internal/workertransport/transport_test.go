@@ -38,6 +38,10 @@ type transportFixture struct {
 }
 
 func newTransportFixture(t *testing.T, kind db.PipelineJobKind, maxAttempts int, wrapper fakeWrapperConfig) transportFixture {
+	return newTransportFixtureWithPolicy(t, kind, maxAttempts, wrapper, 5*time.Second, 200*time.Millisecond, 3*time.Second)
+}
+
+func newTransportFixtureWithPolicy(t *testing.T, kind db.PipelineJobKind, maxAttempts int, wrapper fakeWrapperConfig, timeout, heartbeat, lease time.Duration) transportFixture {
 	t.Helper()
 	repo := filepath.Join(t.TempDir(), "repo")
 	runGitTest(t, "", "init", "-q", repo)
@@ -58,7 +62,10 @@ func newTransportFixture(t *testing.T, kind db.PipelineJobKind, maxAttempts int,
 	if err := os.WriteFile(runner, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	runtimeIdentity, err := runtimeIdentityForFiles(runner, control)
+	runtimeIdentity, err := runtimeIdentityForConfig(config.AzureWorkerConfig{
+		Enabled: true, RunnerPath: runner, ConfigPath: control,
+		Timeout: timeout, HeartbeatInterval: heartbeat, LeaseDuration: lease,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,6 +96,8 @@ func newTransportFixture(t *testing.T, kind db.PipelineJobKind, maxAttempts int,
 		Step: stepName, Round: 1, DesiredHeadSHA: head, BaseSHA: head,
 		Branch: run.Branch, DefaultBranch: repository.DefaultBranch, RuntimeIdentity: runtimeIdentity,
 		Fixing: kind == db.PipelineJobRepair, PreviousFindings: map[bool]string{true: `{"findings":[]}`}[kind == db.PipelineJobRepair],
+		RepairAttempt:           map[bool]int{true: 1}[kind == db.PipelineJobRepair],
+		QualityOutcomeAuthority: map[bool]string{true: "semantic-rereview"}[kind == db.PipelineJobRepair],
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -128,6 +137,11 @@ func (f transportFixture) serviceWithResultStore(t *testing.T, timeout, heartbea
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := service.Close(); err != nil {
+			t.Errorf("close worker service: %v", err)
+		}
+	})
 	return service
 }
 
@@ -171,22 +185,32 @@ func TestAzureWorkerTransportReviewSuccess(t *testing.T) {
 	}
 }
 
-func TestAzureWorkerTransportRejectsRuntimeMutationBeforeDispatch(t *testing.T) {
+func TestAzureWorkerTransportUsesImmutableRuntimeSnapshot(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "wrapper-started")
 	fixture := newTransportFixture(t, db.PipelineJobReview, 2, fakeWrapperConfig{Mode: "success", Marker: marker})
 	service := fixture.service(t, 5*time.Second, 200*time.Millisecond, 3*time.Second)
+	capturedIdentity := service.RuntimeIdentity()
 	writeJSONTest(t, fixture.config, fakeWrapperConfig{Mode: "success", Marker: marker, OutputHead: "mutated"}, 0o600)
 
 	result, err := service.ProcessOne(context.Background(), db.PipelineJobReview)
-	if err == nil || !strings.Contains(err.Error(), "runtime identity") || result != nil {
+	if err != nil || result == nil || result.OutputHeadSHA != fixture.job.DesiredHeadSHA {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("wrapper ran after runtime mutation: %v", statErr)
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Fatalf("captured wrapper did not run: %v", statErr)
 	}
-	stored, readErr := fixture.database.GetPipelineJob(fixture.job.ID)
-	if readErr != nil || stored.Status != db.PipelineJobFailed || stored.ErrorCategory == nil || *stored.ErrorCategory != "runtime_identity_mismatch" {
-		t.Fatalf("stored job=%+v err=%v", stored, readErr)
+	if service.RuntimeIdentity() != capturedIdentity {
+		t.Fatal("active runtime identity changed after its source path was replaced")
+	}
+}
+
+func TestAzureWorkerTransportNewSnapshotGetsNewRuntimeIdentity(t *testing.T) {
+	fixture := newTransportFixture(t, db.PipelineJobReview, 2, fakeWrapperConfig{Mode: "success"})
+	first := fixture.service(t, 5*time.Second, 200*time.Millisecond, 3*time.Second)
+	writeJSONTest(t, fixture.config, fakeWrapperConfig{Mode: "success", OutputHead: "new-runtime"}, 0o600)
+	second := fixture.service(t, 6*time.Second, 250*time.Millisecond, 4*time.Second)
+	if first.RuntimeIdentity() == second.RuntimeIdentity() {
+		t.Fatal("new wrapper/config/policy snapshot replayed the prior runtime identity")
 	}
 }
 
@@ -236,6 +260,11 @@ func TestAzureWorkerDurableInputAndResultSurviveStoreRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := service.Close(); err != nil {
+			t.Errorf("close worker service: %v", err)
+		}
+	})
 	if _, err := service.ProcessOne(context.Background(), db.PipelineJobReview); err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +331,7 @@ func TestAzureWorkerTransportRejectsMalformedAndStaleResults(t *testing.T) {
 }
 
 func TestAzureWorkerTransportTimeoutRequeuesWithinBudget(t *testing.T) {
-	fixture := newTransportFixture(t, db.PipelineJobReview, 2, fakeWrapperConfig{Mode: "sleep"})
+	fixture := newTransportFixtureWithPolicy(t, db.PipelineJobReview, 2, fakeWrapperConfig{Mode: "sleep"}, 2*time.Second, 100*time.Millisecond, 3*time.Second)
 	// Leave enough time for the exact-source bundle on a loaded test host; the
 	// fake wrapper itself sleeps five seconds, so the two-second bound still
 	// deterministically exercises wrapper timeout rather than prep timeout.
@@ -317,7 +346,7 @@ func TestAzureWorkerTransportTimeoutRequeuesWithinBudget(t *testing.T) {
 
 func TestAzureWorkerTransportHeartbeatLossStopsWithoutAdmitting(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "started")
-	fixture := newTransportFixture(t, db.PipelineJobReview, 2, fakeWrapperConfig{Mode: "sleep", Marker: marker})
+	fixture := newTransportFixtureWithPolicy(t, db.PipelineJobReview, 2, fakeWrapperConfig{Mode: "sleep", Marker: marker}, 5*time.Second, 50*time.Millisecond, 2*time.Second)
 	service := fixture.service(t, 5*time.Second, 50*time.Millisecond, 2*time.Second)
 	done := make(chan error, 1)
 	go func() {
