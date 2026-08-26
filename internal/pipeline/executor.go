@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
+	"github.com/kunchenguid/no-mistakes/internal/agentcfg"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
@@ -1095,6 +1096,12 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			runID:    run.ID,
 			stepName: stepName,
 			round:    func() int { return roundNum + 1 },
+			requestedProfile: func(agentName string) agentcfg.Profile {
+				if e.config == nil {
+					return agentcfg.Profile{}
+				}
+				return e.config.AgentProfileFor(types.AgentName(agentName))
+			},
 		}
 	}
 	ciReady := run.CIReadyAt != nil

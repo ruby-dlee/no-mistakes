@@ -207,6 +207,14 @@ type Result struct {
 	// ModelProvider is the provider that served the model (e.g. "openai",
 	// "anthropic"), when the adapter can report it. Instrumentation only.
 	ModelProvider string
+	// EffectiveReasoning is the provider- or harness-reported reasoning level
+	// actually used. It is empty when the harness does not expose this datum;
+	// instrumentation records that as unknown rather than inferring it from the
+	// request.
+	EffectiveReasoning string
+	// HarnessVersion is the concrete agent CLI/harness version when an adapter
+	// can report it. Empty remains unknown.
+	HarnessVersion string
 	// Provider is the adapter provider that served this invocation. It lets
 	// fallback wrappers persist a session against the provider that minted it.
 	Provider string

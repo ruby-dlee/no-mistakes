@@ -88,7 +88,16 @@ CREATE TABLE IF NOT EXISTS agent_invocations (
     purpose               TEXT NOT NULL,
     agent                 TEXT NOT NULL,
     model                 TEXT,
+    requested_model       TEXT,
+    served_model          TEXT,
+    requested_reasoning   TEXT,
+    effective_reasoning   TEXT,
     model_provider        TEXT,
+    prompt_digest         TEXT,
+    no_mistakes_version   TEXT,
+    no_mistakes_build_sha TEXT,
+    harness_name          TEXT,
+    harness_version       TEXT,
     session_mode          TEXT NOT NULL,
     session_key           TEXT,
     fallback_reason       TEXT,
@@ -122,6 +131,44 @@ CREATE TABLE IF NOT EXISTS agent_invocations (
 
 CREATE INDEX IF NOT EXISTS idx_agent_invocations_run_started_id
     ON agent_invocations (run_id, started_at, id);
+
+-- Local-only, append-only quality labels. A later observation supersedes an
+-- earlier row by reference; it never edits the evidence that was observed at
+-- the time. Digests and bounded provenance labels identify evidence without
+-- retaining prompt, output, diff, or transcript bytes.
+CREATE TABLE IF NOT EXISTS quality_outcomes (
+    id                  TEXT PRIMARY KEY,
+    run_id              TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    job_id              TEXT,
+    fix_attempt_id      TEXT,
+    root_id             TEXT,
+    classification      TEXT NOT NULL CHECK (classification IN (
+        'clean_fix', 'same_root_followup', 'introduced_regression',
+        'overridden', 'reverted', 'primary_handoff'
+    )),
+    fixed_head_sha      TEXT NOT NULL,
+    observed_head_sha   TEXT NOT NULL,
+    evidence_digest     TEXT NOT NULL,
+    evidence_provenance TEXT NOT NULL,
+    supersedes_id       TEXT REFERENCES quality_outcomes(id) ON DELETE CASCADE,
+    created_at          INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_quality_outcomes_run_created_id
+    ON quality_outcomes (run_id, created_at, id);
+
+CREATE TRIGGER IF NOT EXISTS quality_outcomes_no_update
+BEFORE UPDATE ON quality_outcomes
+BEGIN
+    SELECT RAISE(ABORT, 'quality outcomes are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS quality_outcomes_no_delete
+BEFORE DELETE ON quality_outcomes
+WHEN EXISTS (SELECT 1 FROM runs WHERE id = OLD.run_id)
+BEGIN
+    SELECT RAISE(ABORT, 'quality outcomes are append-only');
+END;
 
 CREATE TABLE IF NOT EXISTS run_agent_sessions (
     run_id     TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -284,4 +331,16 @@ var migrationStatements = []string{
 	`ALTER TABLE agent_invocations ADD COLUMN workload_files INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN workload_lines INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN finding_count INTEGER`,
+	// Quality identity is local-only and content-free. Every new field remains
+	// nullable so historical rows and harnesses that cannot report a datum stay
+	// unknown rather than acquiring a fabricated default.
+	`ALTER TABLE agent_invocations ADD COLUMN requested_model TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN served_model TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN requested_reasoning TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN effective_reasoning TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN prompt_digest TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN no_mistakes_version TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN no_mistakes_build_sha TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN harness_name TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN harness_version TEXT`,
 }

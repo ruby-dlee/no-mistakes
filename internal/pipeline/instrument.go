@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
+	"github.com/kunchenguid/no-mistakes/internal/agentcfg"
+	"github.com/kunchenguid/no-mistakes/internal/buildinfo"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -27,6 +29,9 @@ type perfRecordingAgent struct {
 	stepName types.StepName
 	// round returns the 1-based round the current invocation belongs to.
 	round func() int
+	// requestedProfile resolves the harness-neutral request for the concrete
+	// adapter attempt. Nil keeps programmatic/test callers honest as unknown.
+	requestedProfile func(string) agentcfg.Profile
 }
 
 func (a *perfRecordingAgent) Name() string { return a.inner.Name() }
@@ -74,18 +79,38 @@ func (a *perfRecordingAgent) record(ctx context.Context, opts agent.RunOpts, age
 	}
 
 	sessionKey := invocationSessionKey(opts, result)
+	promptSum := sha256.Sum256([]byte(opts.Prompt))
+	promptDigest := "sha256:" + hex.EncodeToString(promptSum[:])
+	toolVersion := buildinfo.CurrentVersion()
+	toolBuildSHA := buildinfo.Commit
+	harnessName := agentName
 	inv := db.AgentInvocation{
-		RunID:       a.runID,
-		StepName:    string(a.stepName),
-		Round:       a.round(),
-		Purpose:     purpose,
-		Agent:       agentName,
-		SessionMode: invocationSessionMode(opts, result),
-		SessionKey:  sessionKey,
-		StartedAt:   startedAt.Unix(),
-		CompletedAt: completedAt.Unix(),
-		DurationMS:  completedAt.Sub(startedAt).Milliseconds(),
-		ExitStatus:  "ok",
+		RunID:              a.runID,
+		StepName:           string(a.stepName),
+		Round:              a.round(),
+		Purpose:            purpose,
+		Agent:              agentName,
+		HarnessName:        &harnessName,
+		PromptDigest:       &promptDigest,
+		NoMistakesVersion:  &toolVersion,
+		NoMistakesBuildSHA: &toolBuildSHA,
+		SessionMode:        invocationSessionMode(opts, result),
+		SessionKey:         sessionKey,
+		StartedAt:          startedAt.Unix(),
+		CompletedAt:        completedAt.Unix(),
+		DurationMS:         completedAt.Sub(startedAt).Milliseconds(),
+		ExitStatus:         "ok",
+	}
+	if a.requestedProfile != nil {
+		profile := a.requestedProfile(agentName)
+		if profile.Model != "" {
+			model := profile.Model
+			inv.RequestedModel = &model
+		}
+		if profile.Effort != "" {
+			effort := string(profile.Effort)
+			inv.RequestedReasoning = &effort
+		}
 	}
 	if opts.SessionFallback && opts.SessionFallbackReason != "" {
 		reason := opts.SessionFallbackReason
@@ -121,9 +146,21 @@ func (a *perfRecordingAgent) recordResult(inv *db.AgentInvocation, sessionKey st
 		return
 	}
 	inv.Model = result.Model
+	if result.Model != "" {
+		model := result.Model
+		inv.ServedModel = &model
+	}
 	if result.ModelProvider != "" {
 		provider := result.ModelProvider
 		inv.ModelProvider = &provider
+	}
+	if result.EffectiveReasoning != "" {
+		effort := result.EffectiveReasoning
+		inv.EffectiveReasoning = &effort
+	}
+	if result.HarnessVersion != "" {
+		version := result.HarnessVersion
+		inv.HarnessVersion = &version
 	}
 	inv.InputTokens = result.Usage.InputTokens
 	inv.OutputTokens = result.Usage.OutputTokens

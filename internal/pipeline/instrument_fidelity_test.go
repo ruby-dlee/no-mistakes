@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
+	"github.com/kunchenguid/no-mistakes/internal/agentcfg"
+	"github.com/kunchenguid/no-mistakes/internal/buildinfo"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -75,6 +78,9 @@ func TestPerfRecording_ResumedSessionRecordsPerRoundDeltas(t *testing.T) {
 		runID:    run.ID,
 		stepName: types.StepReview,
 		round:    func() int { return roundNum },
+		requestedProfile: func(string) agentcfg.Profile {
+			return agentcfg.Profile{Model: "glm-5.2", Effort: agentcfg.EffortHigh}
+		},
 	}
 	sessions := NewRunSessions(database, run.ID, wrapped, true)
 
@@ -127,9 +133,19 @@ func TestPerfRecording_ResumedSessionRecordsPerRoundDeltas(t *testing.T) {
 	assertPtr(t, "r2 workload files", r2.WorkloadFiles, 4)
 	assertPtr(t, "r2 workload lines", r2.WorkloadLines, 120)
 	assertPtr(t, "r2 finding count", r2.FindingCount, 2)
-	// Model identity.
-	if r2.Model != "gpt-5.6-sol" || r2.ModelProvider == nil || *r2.ModelProvider != "openai" {
-		t.Fatalf("model/provider = %q/%v", r2.Model, r2.ModelProvider)
+	// Requested and served identity are distinct. Effective effort stays unknown
+	// because this fixture reports no provider-confirmed effective level.
+	if r2.RequestedModel == nil || *r2.RequestedModel != "glm-5.2" ||
+		r2.ServedModel == nil || *r2.ServedModel != "gpt-5.6-sol" ||
+		r2.RequestedReasoning == nil || *r2.RequestedReasoning != "high" ||
+		r2.EffectiveReasoning != nil || r2.ModelProvider == nil || *r2.ModelProvider != "openai" {
+		t.Fatalf("model/reasoning/provider identity = %+v", r2)
+	}
+	if r2.PromptDigest == nil || !strings.HasPrefix(*r2.PromptDigest, "sha256:") ||
+		r2.NoMistakesVersion == nil || *r2.NoMistakesVersion != buildinfo.CurrentVersion() ||
+		r2.NoMistakesBuildSHA == nil || *r2.NoMistakesBuildSHA != buildinfo.Commit ||
+		r2.HarnessName == nil || *r2.HarnessName != "codex" {
+		t.Fatalf("tool/harness/prompt identity = %+v", r2)
 	}
 	// Cache creation is unknown (codex does not report it), not a fabricated 0.
 	if r2.CacheCreationTokens != nil {

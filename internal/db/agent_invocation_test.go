@@ -6,6 +6,67 @@ import (
 	"testing"
 )
 
+func TestAgentInvocations_QualityIdentityRoundTrip(t *testing.T) {
+	d, _, run := openSessionTestDB(t)
+
+	inv := AgentInvocation{
+		RunID: run.ID, StepName: "review", Round: 1, Purpose: "review", Agent: "pi",
+		RequestedModel: strPtr("glm-5.2"), ServedModel: strPtr("glm-5.2-202608"),
+		RequestedReasoning: strPtr("high"), EffectiveReasoning: strPtr("medium"),
+		PromptDigest:      strPtr("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		NoMistakesVersion: strPtr("v1.2.3"), NoMistakesBuildSHA: strPtr("0123456789abcdef"),
+		HarnessName: strPtr("pi"), HarnessVersion: strPtr("0.42.0"),
+		SessionMode: InvocationModeCold, StartedAt: 1, CompletedAt: 2, DurationMS: 1, ExitStatus: "ok",
+	}
+	if _, err := d.InsertAgentInvocation(inv); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	rows, err := d.GetAgentInvocationsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := rows[0]
+	if got.RequestedModel == nil || *got.RequestedModel != "glm-5.2" ||
+		got.ServedModel == nil || *got.ServedModel != "glm-5.2-202608" ||
+		got.RequestedReasoning == nil || *got.RequestedReasoning != "high" ||
+		got.EffectiveReasoning == nil || *got.EffectiveReasoning != "medium" ||
+		got.PromptDigest == nil || *got.PromptDigest != *inv.PromptDigest ||
+		got.NoMistakesVersion == nil || *got.NoMistakesVersion != "v1.2.3" ||
+		got.NoMistakesBuildSHA == nil || *got.NoMistakesBuildSHA != "0123456789abcdef" ||
+		got.HarnessName == nil || *got.HarnessName != "pi" || got.HarnessVersion == nil || *got.HarnessVersion != "0.42.0" {
+		t.Fatalf("quality identity readback mismatch: %+v", got)
+	}
+
+	if _, err := d.InsertAgentInvocation(AgentInvocation{
+		RunID: run.ID, StepName: "test", Round: 1, Purpose: "test-evidence", Agent: "pi",
+		SessionMode: InvocationModeCold, StartedAt: 3, CompletedAt: 4, DurationMS: 1, ExitStatus: "ok",
+	}); err != nil {
+		t.Fatalf("insert unknown fields: %v", err)
+	}
+	rows, err = d.GetAgentInvocationsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown := rows[1]
+	if unknown.RequestedModel != nil || unknown.ServedModel != nil || unknown.RequestedReasoning != nil ||
+		unknown.EffectiveReasoning != nil || unknown.PromptDigest != nil || unknown.NoMistakesVersion != nil ||
+		unknown.NoMistakesBuildSHA != nil || unknown.HarnessName != nil || unknown.HarnessVersion != nil {
+		t.Fatalf("unknown quality identity must remain NULL: %+v", unknown)
+	}
+}
+
+func TestAgentInvocations_RejectsNonDigestPromptData(t *testing.T) {
+	d, _, run := openSessionTestDB(t)
+	bad := "review the secret source bytes"
+	if _, err := d.InsertAgentInvocation(AgentInvocation{
+		RunID: run.ID, StepName: "review", Round: 1, Purpose: "review", Agent: "pi",
+		PromptDigest: &bad, SessionMode: InvocationModeCold,
+		StartedAt: 1, CompletedAt: 2, DurationMS: 1, ExitStatus: "ok",
+	}); err == nil {
+		t.Fatal("non-digest prompt data unexpectedly accepted")
+	}
+}
+
 func TestAgentInvocations_InsertAndReadBack(t *testing.T) {
 	d, _, run := openSessionTestDB(t)
 
@@ -144,6 +205,9 @@ func TestAgentInvocations_PrivacySafeShape(t *testing.T) {
 		lower := strings.ToLower(col)
 		if strings.HasSuffix(lower, "_tokens") {
 			continue // token counts are numeric usage data, not content
+		}
+		if lower == "prompt_digest" {
+			continue // one-way content identity, never prompt bytes
 		}
 		for _, forbidden := range []string{"prompt", "output", "diff", "transcript", "secret", "credential", "text", "content"} {
 			if strings.Contains(lower, forbidden) {
@@ -439,5 +503,31 @@ func TestOpenMigratesSessionFidelityColumns(t *testing.T) {
 		ModelRoundtrips: intPtr(3), ToolCalls: intPtr(2), SubprocessWaitMS: int64Ptr(500),
 	}); err != nil {
 		t.Fatalf("insert after migration: %v", err)
+	}
+}
+
+func TestOpenMigratesQualityIdentityColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.sqlite")
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, col := range []string{"requested_model", "served_model", "requested_reasoning", "effective_reasoning", "prompt_digest", "no_mistakes_version", "no_mistakes_build_sha", "harness_name", "harness_version"} {
+		if _, err := d.sql.Exec(`ALTER TABLE agent_invocations DROP COLUMN ` + col); err != nil {
+			t.Fatalf("drop %s: %v", col, err)
+		}
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer d.Close()
+	for _, col := range []string{"requested_model", "served_model", "requested_reasoning", "effective_reasoning", "prompt_digest", "no_mistakes_version", "no_mistakes_build_sha", "harness_name", "harness_version"} {
+		if !d.hasColumn("agent_invocations", col) {
+			t.Errorf("quality identity column %s missing after migration", col)
+		}
 	}
 }
