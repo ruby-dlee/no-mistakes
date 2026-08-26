@@ -238,12 +238,117 @@ CREATE TABLE IF NOT EXISTS owner_decision_events (
 
 CREATE INDEX IF NOT EXISTS idx_owner_decision_events_run_gate
     ON owner_decision_events (run_id, gate_id);
+
+-- Pipeline jobs are execution records, never a second source of truth for a
+-- run or step. Their semantic key binds one exact unit of work to the run,
+-- step, round, Git head, input digest, and externally retained owner-decision
+-- head that authorized it. Empty owner_decision_head means the run is
+-- unprotected; protected runs require their exact verified journal head.
+CREATE TABLE IF NOT EXISTS pipeline_jobs (
+    id                    TEXT PRIMARY KEY,
+    run_id                TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    step_result_id        TEXT NOT NULL REFERENCES step_results(id) ON DELETE CASCADE,
+    kind                  TEXT NOT NULL CHECK (kind IN ('review', 'repair', 'test', 'ci_monitor')),
+    round                 INTEGER NOT NULL CHECK (round >= 0),
+    desired_head_sha      TEXT NOT NULL,
+    input_digest          TEXT NOT NULL,
+    owner_decision_head   TEXT NOT NULL DEFAULT '',
+    desired_generation    INTEGER NOT NULL DEFAULT 0 CHECK (desired_generation >= 0),
+    idempotency_key       TEXT NOT NULL UNIQUE,
+    status                TEXT NOT NULL CHECK (status IN ('queued', 'leased', 'completed', 'failed', 'superseded')),
+    max_attempts          INTEGER NOT NULL CHECK (max_attempts > 0),
+    attempts_started      INTEGER NOT NULL DEFAULT 0 CHECK (attempts_started >= 0),
+    lease_fence           INTEGER NOT NULL DEFAULT 0 CHECK (lease_fence >= 0),
+    lease_owner           TEXT,
+    lease_expires_at      INTEGER,
+    heartbeat_at          INTEGER,
+    result_digest         TEXT,
+    output_head_sha       TEXT,
+    error_category        TEXT,
+    superseded_at         INTEGER,
+    completed_at          INTEGER,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL,
+    UNIQUE (run_id, step_result_id, kind, round, desired_head_sha, input_digest, owner_decision_head, desired_generation)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_claim
+    ON pipeline_jobs (kind, status, created_at, id);
+
+-- The event stream is append-only through the DB API. It records only bounded
+-- execution metadata and digests: never prompts, model output, diffs, command
+-- arguments, or result payloads.
+CREATE TABLE IF NOT EXISTS pipeline_job_events (
+    id               TEXT PRIMARY KEY,
+    job_id           TEXT NOT NULL REFERENCES pipeline_jobs(id) ON DELETE CASCADE,
+    event_type       TEXT NOT NULL CHECK (event_type IN ('created', 'leased', 'heartbeat', 'expired_requeued', 'expired_failed', 'completed', 'superseded')),
+    status           TEXT NOT NULL,
+    attempt          INTEGER NOT NULL CHECK (attempt >= 0),
+    lease_fence      INTEGER NOT NULL CHECK (lease_fence >= 0),
+    lease_owner      TEXT,
+    result_digest    TEXT,
+    output_head_sha  TEXT,
+    created_at       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_job_events_job_created
+    ON pipeline_job_events (job_id, created_at, id);
+
+CREATE TABLE IF NOT EXISTS branch_desired_state (
+    repo_id         TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    branch          TEXT NOT NULL,
+    revision        INTEGER NOT NULL CHECK (revision > 0),
+    head_sha        TEXT NOT NULL,
+    input_digest    TEXT NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, branch)
+);
+
+CREATE TABLE IF NOT EXISTS github_deliveries (
+    delivery_id     TEXT PRIMARY KEY,
+    payload_digest  TEXT NOT NULL,
+    repo_id         TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    pr_number       INTEGER NOT NULL CHECK (pr_number > 0),
+    head_sha        TEXT NOT NULL,
+    event_type      TEXT NOT NULL,
+    received_at     INTEGER NOT NULL,
+    confirmed_at    INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ci_waits (
+    id                  TEXT PRIMARY KEY,
+    run_id              TEXT NOT NULL UNIQUE REFERENCES runs(id) ON DELETE CASCADE,
+    repo_id             TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    branch              TEXT NOT NULL,
+    pr_number           INTEGER NOT NULL CHECK (pr_number > 0),
+    head_sha            TEXT NOT NULL,
+    input_digest        TEXT NOT NULL,
+    desired_generation  INTEGER NOT NULL CHECK (desired_generation > 0),
+    status              TEXT NOT NULL CHECK (status IN ('waiting', 'ready', 'failed', 'closed')),
+    check_state         TEXT NOT NULL,
+    next_reconcile_at   INTEGER NOT NULL,
+    interval_seconds    INTEGER NOT NULL CHECK (interval_seconds > 0),
+    last_delivery_id    TEXT,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ci_waits_due
+    ON ci_waits (status, next_reconcile_at, id);
+
+CREATE TABLE IF NOT EXISTS ci_reconciliations (
+    wait_id          TEXT PRIMARY KEY REFERENCES ci_waits(id) ON DELETE CASCADE,
+    reason           TEXT NOT NULL CHECK (reason IN ('delivery', 'periodic')),
+    delivery_id      TEXT,
+    requested_at     INTEGER NOT NULL
+);
 `
 
 // migrationStatements hold additive schema changes applied to databases that
 // were created before the referenced columns existed. Each statement must be
 // idempotent via its error being tolerated when the column already exists.
 var migrationStatements = []string{
+	`ALTER TABLE pipeline_jobs ADD COLUMN desired_generation INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE repos ADD COLUMN fork_url TEXT`,
 	`ALTER TABLE owner_decision_authorities ADD COLUMN repo_id TEXT`,
 	`ALTER TABLE owner_decision_authorities ADD COLUMN branch TEXT`,
