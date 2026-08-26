@@ -176,6 +176,43 @@ func TestExecuteRemoteReviewRepairRecordsAuthorizedQualityOutcome(t *testing.T) 
 	}
 }
 
+func TestRollbackAdoptedRemoteRepairRefusesToEraseConcurrentEdit(t *testing.T) {
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	pipelineGit(t, "", "init", "-q", repoDir)
+	pipelineGit(t, repoDir, "config", "user.email", "worker@example.invalid")
+	pipelineGit(t, repoDir, "config", "user.name", "Worker Test")
+	if err := os.WriteFile(filepath.Join(repoDir, "source.txt"), []byte("source\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pipelineGit(t, repoDir, "add", "source.txt")
+	pipelineGit(t, repoDir, "commit", "-qm", "source")
+	oldHead := pipelineGit(t, repoDir, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repoDir, "repair.txt"), []byte("repair\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pipelineGit(t, repoDir, "add", "repair.txt")
+	pipelineGit(t, repoDir, "commit", "-qm", "repair")
+	newHead := pipelineGit(t, repoDir, "rev-parse", "HEAD")
+
+	// This edit lands after the remote repair was adopted. Rolling back to the
+	// old head would remove repair.txt, so a guarded worktree move must refuse
+	// rather than erase the edit.
+	concurrent := []byte("captain edit\n")
+	if err := os.WriteFile(filepath.Join(repoDir, "repair.txt"), concurrent, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := rollbackAdoptedRemoteRepair(context.Background(), repoDir, newHead, oldHead); err == nil {
+		t.Fatal("rollback unexpectedly overwrote a concurrent edit")
+	}
+	if got := pipelineGit(t, repoDir, "rev-parse", "HEAD"); got != newHead {
+		t.Fatalf("HEAD = %s, want adopted head %s retained", got, newHead)
+	}
+	got, err := os.ReadFile(filepath.Join(repoDir, "repair.txt"))
+	if err != nil || string(got) != string(concurrent) {
+		t.Fatalf("concurrent edit = %q, err %v", got, err)
+	}
+}
+
 func pipelineGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	command := exec.Command("git", args...)

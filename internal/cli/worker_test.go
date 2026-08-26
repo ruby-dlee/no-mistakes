@@ -86,7 +86,7 @@ func (h workerHarness) writeBrief(t *testing.T, step types.StepName, fixing bool
 	input := workertransport.StepInputEnvelope{
 		Schema: workertransport.StepInputSchema, RunID: "run-1", RepoID: "repo-1", StepResultID: "step-1",
 		Step: step, Round: 1, DesiredHeadSHA: h.head, BaseSHA: h.base, Branch: "feature", DefaultBranch: "trunk",
-		Fixing: fixing, PreviousFindings: previous,
+		RuntimeIdentity: strings.Repeat("c", 64), Fixing: fixing, PreviousFindings: previous,
 	}
 	if fixing && step == types.StepReview {
 		input.RepairAttempt = 1

@@ -83,7 +83,7 @@ func TestAzureWorkerRuntimeExecutesOneExactReviewThroughWrapper(t *testing.T) {
 		result, err := runtime.ExecuteRemoteStep(context.Background(), pipeline.RemoteStepRequest{
 			RunID: run.ID, RepoID: repository.ID, StepResultID: step.ID,
 			Step: types.StepReview, Round: 1, DesiredHeadSHA: head,
-			BaseSHA: run.BaseSHA, Branch: run.Branch, WorkDir: repoDir,
+			BaseSHA: run.BaseSHA, Branch: run.Branch, DefaultBranch: repository.DefaultBranch, WorkDir: repoDir,
 		})
 		if err != nil {
 			errCh <- err
@@ -164,6 +164,7 @@ func TestFakeAzureWorkerWrapperProcess(t *testing.T) {
 		Schema: workertransport.ResultSchema, JobID: request.JobID, RunID: request.RunID,
 		StepResultID: request.StepResultID, Step: request.Step, Kind: request.Kind, Round: request.Round,
 		DesiredHeadSHA: request.DesiredHeadSHA, InputDigest: request.InputDigest,
+		RuntimeIdentity:   request.RuntimeIdentity,
 		OwnerDecisionHead: request.OwnerDecisionHead, DesiredGeneration: request.DesiredGeneration,
 		Attempt: request.Attempt, LeaseFence: request.LeaseFence, LeaseOwner: request.LeaseOwner,
 		SourceBundleSHA256: request.SourceBundleSHA256, Outcome: "succeeded",

@@ -27,6 +27,7 @@ type StepInputEnvelope struct {
 	BaseSHA                 string         `json:"base_sha"`
 	Branch                  string         `json:"branch"`
 	DefaultBranch           string         `json:"default_branch"`
+	RuntimeIdentity         string         `json:"runtime_identity"`
 	Fixing                  bool           `json:"fixing"`
 	PreviousFindings        string         `json:"previous_findings_json,omitempty"`
 	UserIntent              string         `json:"user_intent,omitempty"`
@@ -68,6 +69,9 @@ func DecodeStepInput(data []byte) (StepInputEnvelope, error) {
 		if len(value) != 40 || strings.Trim(value, "0123456789abcdef") != "" {
 			return input, fmt.Errorf("worker step %s is not a lowercase full SHA-1", name)
 		}
+	}
+	if !validDigestString(input.RuntimeIdentity) {
+		return input, errors.New("worker step runtime identity is not a lowercase SHA-256")
 	}
 	if len(input.PreviousFindings) > maxFindingsBytes || (input.PreviousFindings != "" && !json.Valid([]byte(input.PreviousFindings))) {
 		return input, errors.New("worker previous findings are oversized or invalid JSON")

@@ -50,6 +50,19 @@ func newTransportFixture(t *testing.T, kind db.PipelineJobKind, maxAttempts int,
 	runGitTest(t, repo, "commit", "-qm", "source")
 	head := runGitTest(t, repo, "rev-parse", "HEAD")
 
+	control := filepath.Join(t.TempDir(), "wrapper.json")
+	writeJSONTest(t, control, wrapper, 0o600)
+	runner := filepath.Join(t.TempDir(), "fm-no-mistakes-worker")
+	quotedSelf := "'" + strings.ReplaceAll(os.Args[0], "'", "'\\''") + "'"
+	script := "#!/bin/sh\nexec " + quotedSelf + " -test.run=^TestFakeFirstmateWrapperProcess$ -- \"$@\"\n"
+	if err := os.WriteFile(runner, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runtimeIdentity, err := runtimeIdentityForFiles(runner, control)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	database, err := db.Open(filepath.Join(t.TempDir(), "state.sqlite"))
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +84,16 @@ func newTransportFixture(t *testing.T, kind db.PipelineJobKind, maxAttempts int,
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := []byte("bounded worker instructions\n")
+	input, err := json.Marshal(StepInputEnvelope{
+		Schema: StepInputSchema, RunID: run.ID, RepoID: repository.ID, StepResultID: step.ID,
+		Step: stepName, Round: 1, DesiredHeadSHA: head, BaseSHA: head,
+		Branch: run.Branch, DefaultBranch: repository.DefaultBranch, RuntimeIdentity: runtimeIdentity,
+		Fixing: kind == db.PipelineJobRepair, PreviousFindings: map[bool]string{true: `{"findings":[]}`}[kind == db.PipelineJobRepair],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input = append(input, '\n')
 	inputSum := sha256.Sum256(input)
 	job, _, err := database.EnqueuePipelineJob(db.PipelineJobSpec{
 		RunID: run.ID, StepResultID: step.ID, Kind: kind, Round: 1,
@@ -81,14 +103,6 @@ func newTransportFixture(t *testing.T, kind db.PipelineJobKind, maxAttempts int,
 		t.Fatal(err)
 	}
 
-	control := filepath.Join(t.TempDir(), "wrapper.json")
-	writeJSONTest(t, control, wrapper, 0o600)
-	runner := filepath.Join(t.TempDir(), "fm-no-mistakes-worker")
-	quotedSelf := "'" + strings.ReplaceAll(os.Args[0], "'", "'\\''") + "'"
-	script := "#!/bin/sh\nexec " + quotedSelf + " -test.run=^TestFakeFirstmateWrapperProcess$ -- \"$@\"\n"
-	if err := os.WriteFile(runner, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
 	return transportFixture{database: database, job: job, repo: repo, input: input, runner: runner, config: control, workRoot: t.TempDir()}
 }
 
@@ -154,6 +168,25 @@ func TestAzureWorkerTransportReviewSuccess(t *testing.T) {
 	stored, err := fixture.database.GetPipelineJob(fixture.job.ID)
 	if err != nil || stored.Status != db.PipelineJobCompleted || stored.ResultDigest == nil {
 		t.Fatalf("stored job = %+v, err %v", stored, err)
+	}
+}
+
+func TestAzureWorkerTransportRejectsRuntimeMutationBeforeDispatch(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "wrapper-started")
+	fixture := newTransportFixture(t, db.PipelineJobReview, 2, fakeWrapperConfig{Mode: "success", Marker: marker})
+	service := fixture.service(t, 5*time.Second, 200*time.Millisecond, 3*time.Second)
+	writeJSONTest(t, fixture.config, fakeWrapperConfig{Mode: "success", Marker: marker, OutputHead: "mutated"}, 0o600)
+
+	result, err := service.ProcessOne(context.Background(), db.PipelineJobReview)
+	if err == nil || !strings.Contains(err.Error(), "runtime identity") || result != nil {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("wrapper ran after runtime mutation: %v", statErr)
+	}
+	stored, readErr := fixture.database.GetPipelineJob(fixture.job.ID)
+	if readErr != nil || stored.Status != db.PipelineJobFailed || stored.ErrorCategory == nil || *stored.ErrorCategory != "runtime_identity_mismatch" {
+		t.Fatalf("stored job=%+v err=%v", stored, readErr)
 	}
 }
 
@@ -322,7 +355,11 @@ func TestAzureWorkerTransportHeartbeatLossStopsWithoutAdmitting(t *testing.T) {
 }
 
 func TestAzureWorkerTransportMaterializesRepairBranch(t *testing.T) {
-	fixture := newTransportFixture(t, db.PipelineJobRepair, 2, fakeWrapperConfig{Mode: "pending"})
+	returnRef := "refs/heads/fm-repair-result"
+	bundle := filepath.Join(t.TempDir(), "repair.bundle")
+	fixture := newTransportFixture(t, db.PipelineJobRepair, 2, fakeWrapperConfig{
+		Mode: "repair", OutcomeBundle: bundle, ReturnRef: returnRef,
+	})
 	clone := filepath.Join(t.TempDir(), "repair")
 	runGitTest(t, "", "clone", "-q", fixture.repo, clone)
 	runGitTest(t, clone, "config", "user.email", "worker@example.invalid")
@@ -333,13 +370,8 @@ func TestAzureWorkerTransportMaterializesRepairBranch(t *testing.T) {
 	runGitTest(t, clone, "add", "repair.txt")
 	runGitTest(t, clone, "commit", "-qm", "repair")
 	outputHead := runGitTest(t, clone, "rev-parse", "HEAD")
-	returnRef := "refs/heads/fm-repair-result"
 	runGitTest(t, clone, "branch", "fm-repair-result", outputHead)
-	bundle := filepath.Join(t.TempDir(), "repair.bundle")
 	runGitTest(t, clone, "bundle", "create", bundle, returnRef)
-	writeJSONTest(t, fixture.config, fakeWrapperConfig{
-		Mode: "repair", OutcomeBundle: bundle, OutputHead: outputHead, ReturnRef: returnRef,
-	}, 0o600)
 
 	result, err := fixture.service(t, 5*time.Second, 200*time.Millisecond, 3*time.Second).ProcessOne(context.Background(), db.PipelineJobRepair)
 	if err != nil {
@@ -403,6 +435,7 @@ func TestFakeFirstmateWrapperProcess(t *testing.T) {
 		Schema: ResultSchema, JobID: request.JobID, RunID: request.RunID,
 		StepResultID: request.StepResultID, Step: request.Step, Kind: request.Kind, Round: request.Round,
 		DesiredHeadSHA: request.DesiredHeadSHA, InputDigest: request.InputDigest,
+		RuntimeIdentity:   request.RuntimeIdentity,
 		OwnerDecisionHead: request.OwnerDecisionHead, DesiredGeneration: request.DesiredGeneration,
 		Attempt: request.Attempt, LeaseFence: request.LeaseFence, LeaseOwner: request.LeaseOwner,
 		SourceBundleSHA256: request.SourceBundleSHA256,
@@ -421,6 +454,10 @@ func TestFakeFirstmateWrapperProcess(t *testing.T) {
 		}
 		sum := sha256.Sum256(contents)
 		result.OutputHeadSHA = control.OutputHead
+		if result.OutputHeadSHA == "" {
+			listed := runGitTest(t, "", "bundle", "list-heads", control.OutcomeBundle)
+			result.OutputHeadSHA = strings.Fields(listed)[0]
+		}
 		result.ReturnRef = control.ReturnRef
 		result.ReturnBundleSHA256 = hex.EncodeToString(sum[:])
 	}

@@ -51,6 +51,7 @@ type Request struct {
 	Round                   int                `json:"round"`
 	DesiredHeadSHA          string             `json:"desired_head_sha"`
 	InputDigest             string             `json:"input_digest"`
+	RuntimeIdentity         string             `json:"runtime_identity"`
 	OwnerDecisionHead       string             `json:"owner_decision_head"`
 	DesiredGeneration       int64              `json:"desired_generation"`
 	Attempt                 int                `json:"attempt"`
@@ -77,6 +78,7 @@ type ResultEnvelope struct {
 	Round              int                `json:"round"`
 	DesiredHeadSHA     string             `json:"desired_head_sha"`
 	InputDigest        string             `json:"input_digest"`
+	RuntimeIdentity    string             `json:"runtime_identity"`
 	OwnerDecisionHead  string             `json:"owner_decision_head"`
 	DesiredGeneration  int64              `json:"desired_generation"`
 	Attempt            int                `json:"attempt"`
@@ -117,12 +119,13 @@ type ResultStore interface {
 }
 
 type Service struct {
-	database *db.DB
-	cfg      config.AzureWorkerConfig
-	workRoot string
-	owner    string
-	input    InputProvider
-	results  ResultStore
+	database        *db.DB
+	cfg             config.AzureWorkerConfig
+	workRoot        string
+	owner           string
+	input           InputProvider
+	results         ResultStore
+	runtimeIdentity string
 }
 
 func New(database *db.DB, cfg config.AzureWorkerConfig, workRoot, owner string, input InputProvider, resultStores ...ResultStore) (*Service, error) {
@@ -151,19 +154,24 @@ func New(database *db.DB, cfg config.AzureWorkerConfig, workRoot, owner string, 
 	if cfg.Timeout <= 0 || cfg.Timeout > 24*time.Hour {
 		return nil, errors.New("Azure worker timeout must be positive and at most 24 hours")
 	}
-	if err := validateTrustedFile(cfg.RunnerPath, true, false); err != nil {
-		return nil, fmt.Errorf("validate Firstmate wrapper: %w", err)
-	}
-	if err := validateTrustedFile(cfg.ConfigPath, false, true); err != nil {
-		return nil, fmt.Errorf("validate Firstmate wrapper config: %w", err)
+	runtimeIdentity, err := runtimeIdentityForFiles(cfg.RunnerPath, cfg.ConfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("bind Firstmate worker runtime: %w", err)
 	}
 	if !filepath.IsAbs(workRoot) || strings.TrimSpace(owner) == "" || strings.ContainsAny(owner, "\r\n\x00") {
 		return nil, errors.New("Azure worker transport requires an absolute work root and bounded lease owner")
 	}
-	return &Service{database: database, cfg: cfg, workRoot: filepath.Clean(workRoot), owner: owner, input: input, results: results}, nil
+	return &Service{database: database, cfg: cfg, workRoot: filepath.Clean(workRoot), owner: owner, input: input, results: results, runtimeIdentity: runtimeIdentity}, nil
 }
 
 func (s *Service) Enabled() bool { return s != nil && s.cfg.Enabled }
+
+func (s *Service) RuntimeIdentity() string {
+	if s == nil {
+		return ""
+	}
+	return s.runtimeIdentity
+}
 
 // ProcessOne claims and executes at most one job. A nil execution means the
 // queue had no job of kind. The existing local pipeline remains the caller's
@@ -338,6 +346,17 @@ func (s *Service) executeClaimed(ctx context.Context, job *db.PipelineJob) (*pre
 	if len(input) == 0 || len(input) > maxInputBytes || bytes.IndexByte(input, 0) >= 0 || digestBytes(input) != job.InputDigest {
 		return nil, failureError("input_mismatch", false, errors.New("worker input is empty, oversized, binary, or digest-mismatched"))
 	}
+	stepInput, err := DecodeStepInput(input)
+	if err != nil {
+		return nil, failureError("input_mismatch", false, fmt.Errorf("decode exact worker input: %w", err))
+	}
+	if stepInput.RuntimeIdentity != s.runtimeIdentity {
+		return nil, failureError("runtime_identity_mismatch", false, errors.New("worker input runtime identity does not match the active transport"))
+	}
+	currentRuntimeIdentity, err := runtimeIdentityForFiles(s.cfg.RunnerPath, s.cfg.ConfigPath)
+	if err != nil || currentRuntimeIdentity != s.runtimeIdentity {
+		return nil, failureError("runtime_identity_mismatch", false, errors.New("Firstmate worker runtime identity changed after the job was bound"))
+	}
 	stage, err := os.MkdirTemp(s.workRoot, "firstmate-worker-")
 	if err != nil {
 		return nil, failureError("staging_failure", true, err)
@@ -365,7 +384,7 @@ func (s *Service) executeClaimed(ctx context.Context, job *db.PipelineJob) (*pre
 	if err != nil {
 		return nil, failureError("staging_failure", true, err)
 	}
-	request := requestFor(job, stepResult.StepName, s.owner, bundleDigest, bundleSize)
+	request := requestFor(job, stepResult.StepName, s.owner, s.runtimeIdentity, bundleDigest, bundleSize)
 	requestPath := filepath.Join(stage, "request.json")
 	if err := writeJSONFile(requestPath, request); err != nil {
 		return nil, failureError("staging_failure", true, err)
@@ -428,20 +447,24 @@ func (s *Service) executeClaimed(ctx context.Context, job *db.PipelineJob) (*pre
 	return prepared, nil
 }
 
-func requestFor(job *db.PipelineJob, step types.StepName, owner, bundleDigest string, bundleSize int64) Request {
+func requestFor(job *db.PipelineJob, step types.StepName, owner, runtimeIdentity, bundleDigest string, bundleSize int64) Request {
 	return Request{
 		Schema: RequestSchema, JobID: job.ID, RunID: job.RunID, StepResultID: job.StepResultID,
 		Step: step, Kind: job.Kind, Round: job.Round, DesiredHeadSHA: job.DesiredHeadSHA,
-		InputDigest: job.InputDigest, OwnerDecisionHead: job.OwnerDecisionHead,
+		InputDigest: job.InputDigest, RuntimeIdentity: runtimeIdentity, OwnerDecisionHead: job.OwnerDecisionHead,
 		DesiredGeneration: job.DesiredGeneration, Attempt: job.AttemptsStarted,
 		LeaseFence: job.LeaseFence, LeaseOwner: owner, SourceRef: "HEAD",
 		SourceBundleSHA256: bundleDigest, SourceBundleSize: bundleSize,
-		GuestArgv:            []string{"no-mistakes", "worker", "run", "--role", string(job.Kind), "--brief", "brief.md", "--result", "outcome.json"},
+		GuestArgv:            workerGuestArgv(job.Kind),
 		ExpectedResultSchema: ResultSchema, ExpectedFirstmateReturn: "fm.worker-return-contract/v1",
 	}
 }
 
 func (s *Service) runWrapper(ctx context.Context, dir, request, payload, result, outcome, stepOutcome string) error {
+	currentRuntimeIdentity, err := runtimeIdentityForFiles(s.cfg.RunnerPath, s.cfg.ConfigPath)
+	if err != nil || currentRuntimeIdentity != s.runtimeIdentity {
+		return errors.New("Firstmate worker runtime identity changed before dispatch")
+	}
 	// Re-check the executable trust boundary immediately before every dispatch;
 	// startup validation alone would allow a later path replacement.
 	if err := validateTrustedFile(s.cfg.RunnerPath, true, false); err != nil {
@@ -481,6 +504,48 @@ func (s *Service) runWrapper(ctx context.Context, dir, request, payload, result,
 	shellenv.ConfigureShellCommand(cmd)
 	cmd.WaitDelay = 250 * time.Millisecond
 	return shellenv.RunShellCommand(cmd)
+}
+
+func workerGuestArgv(kind db.PipelineJobKind) []string {
+	return []string{"no-mistakes", "worker", "run", "--role", string(kind), "--brief", "brief.md", "--result", "outcome.json"}
+}
+
+func runtimeIdentityForFiles(runnerPath, configPath string) (string, error) {
+	if err := validateTrustedFile(runnerPath, true, false); err != nil {
+		return "", fmt.Errorf("validate Firstmate wrapper: %w", err)
+	}
+	if err := validateTrustedFile(configPath, false, true); err != nil {
+		return "", fmt.Errorf("validate Firstmate wrapper config: %w", err)
+	}
+	runnerDigest, _, err := digestFile(runnerPath)
+	if err != nil {
+		return "", fmt.Errorf("digest Firstmate wrapper: %w", err)
+	}
+	configDigest, _, err := digestFile(configPath)
+	if err != nil {
+		return "", fmt.Errorf("digest Firstmate wrapper config: %w", err)
+	}
+	identity := struct {
+		Schema            string   `json:"schema"`
+		RunnerSHA256      string   `json:"runner_sha256"`
+		ConfigSHA256      string   `json:"config_sha256"`
+		RequestSchema     string   `json:"request_schema"`
+		ResultSchema      string   `json:"result_schema"`
+		StepInputSchema   string   `json:"step_input_schema"`
+		StepOutcomeSchema string   `json:"step_outcome_schema"`
+		GuestArgvShape    []string `json:"guest_argv_shape"`
+	}{
+		Schema:       "no-mistakes.azure-worker-runtime-identity/v1",
+		RunnerSHA256: runnerDigest, ConfigSHA256: configDigest,
+		RequestSchema: RequestSchema, ResultSchema: ResultSchema,
+		StepInputSchema: StepInputSchema, StepOutcomeSchema: StepOutcomeSchema,
+		GuestArgvShape: workerGuestArgv(db.PipelineJobReview),
+	}
+	payload, err := json.Marshal(identity)
+	if err != nil {
+		return "", err
+	}
+	return digestBytes(payload), nil
 }
 
 type boundedBuffer struct {
@@ -616,6 +681,7 @@ func resultMatchesRequest(result ResultEnvelope, request Request) bool {
 		result.RunID == request.RunID && result.StepResultID == request.StepResultID &&
 		result.Step == request.Step && result.Kind == request.Kind && result.Round == request.Round &&
 		result.DesiredHeadSHA == request.DesiredHeadSHA && result.InputDigest == request.InputDigest &&
+		result.RuntimeIdentity == request.RuntimeIdentity && validDigestString(result.RuntimeIdentity) &&
 		result.OwnerDecisionHead == request.OwnerDecisionHead && result.DesiredGeneration == request.DesiredGeneration &&
 		result.Attempt == request.Attempt && result.LeaseFence == request.LeaseFence && result.LeaseOwner == request.LeaseOwner &&
 		result.SourceBundleSHA256 == request.SourceBundleSHA256

@@ -14,12 +14,26 @@ func validStepInputBytes(t *testing.T) []byte {
 		Schema: StepInputSchema, RunID: "run-1", RepoID: "repo-1", StepResultID: "step-1",
 		Step: types.StepReview, Round: 1,
 		DesiredHeadSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("b", 40),
-		Branch: "feature", DefaultBranch: "main",
+		Branch: "feature", DefaultBranch: "main", RuntimeIdentity: strings.Repeat("c", 64),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return data
+}
+
+func TestDecodeStepInputRequiresExactRuntimeIdentity(t *testing.T) {
+	var input StepInputEnvelope
+	if err := json.Unmarshal(validStepInputBytes(t), &input); err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range []string{"", strings.Repeat("A", 64), strings.Repeat("a", 63)} {
+		input.RuntimeIdentity = invalid
+		data, _ := json.Marshal(input)
+		if _, err := DecodeStepInput(data); err == nil {
+			t.Fatalf("accepted runtime identity %q", invalid)
+		}
+	}
 }
 
 func TestDecodeStepInputStrictAndRoleBounded(t *testing.T) {
