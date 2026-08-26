@@ -14,13 +14,17 @@ var ErrFatalGateReconciliation = errors.New("fatal gate reconciliation")
 
 // StepContext provides shared resources to pipeline steps during execution.
 type StepContext struct {
-	Ctx                   context.Context
-	Run                   *db.Run
-	Repo                  *db.Repo
-	WorkDir               string
-	Agent                 agent.Agent
-	Config                *config.Config
-	DB                    *db.DB
+	Ctx     context.Context
+	Run     *db.Run
+	Repo    *db.Repo
+	WorkDir string
+	Agent   agent.Agent
+	Config  *config.Config
+	DB      *db.DB
+	// QualityOutcomes is explicitly enabled by the executor for durable runs.
+	// Embeddings may leave it nil; once enabled, write failures are gate errors,
+	// not best-effort telemetry loss.
+	QualityOutcomes       QualityOutcomeWriter
 	Log                   func(string) // discrete log line (newline-terminated, user-visible + file)
 	LogChunk              func(string) // raw streaming chunk (user-visible + file)
 	LogFile               func(string) // file-only log callback (not shown to user)
@@ -80,6 +84,13 @@ type StepContext struct {
 	// OnPRMerged is a best-effort hook after a merged PR state is persisted.
 	// Eval uses it to relabel auto-fix/shipped-unfixed gold; nil is a no-op.
 	OnPRMerged func(ctx context.Context, runID string)
+}
+
+// QualityOutcomeWriter is the narrow append-only quality evidence boundary.
+// *db.DB implements it; the interface also keeps failure behavior executable
+// in focused pipeline tests.
+type QualityOutcomeWriter interface {
+	InsertQualityOutcome(db.QualityOutcome) (*db.QualityOutcome, error)
 }
 
 // RunAgentSession executes one turn of a durable review-loop role session,

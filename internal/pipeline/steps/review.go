@@ -327,10 +327,13 @@ Risk assessment (after listing all findings):
 
 	// Parse structured findings
 	var findings Findings
+	structuredReview := false
 	if result.Output != nil {
 		if err := json.Unmarshal(result.Output, &findings); err != nil {
 			sctx.Log("could not parse structured output, using text response")
 			findings = Findings{Summary: result.Text}
+		} else {
+			structuredReview = true
 		}
 	}
 
@@ -342,8 +345,30 @@ Risk assessment (after listing all findings):
 		sctx.Log(fmt.Sprintf("dropped %d deferred pipeline-owned delivery finding(s) (owned by later push/PR/CI steps)", n))
 		findings = stripped
 	}
+	if repairExecuted && !structuredReview {
+		findings.Items = append(findings.Items, Finding{
+			ID:          "review-semantic-rereview-proof",
+			Severity:    types.FindingSeverityWarning,
+			Description: "The independent rereview did not return structured evidence; primary-agent handoff is required.",
+			Action:      types.ActionAskUser,
+			ReviewScope: types.FindingReviewScopeSource,
+		})
+	}
 	findings = enforceSemanticRepairHandoff(findings, sctx.PreviousFindings, repairAttempt, repairEvidence, repairExecuted)
 	findings = normalizeSemanticRiskReviewActions(findings)
+	if repairExecuted {
+		if err := recordSemanticRepairQualityOutcome(sctx, semanticQualityObservation{
+			PreviousFindings: sctx.PreviousFindings,
+			Findings:         findings,
+			Evidence:         repairEvidence,
+			RepairAttempt:    repairAttempt,
+			FixedHeadSHA:     reviewTargetSHA,
+			ObservedHeadSHA:  reviewTargetSHA,
+			StructuredReview: structuredReview,
+		}); err != nil {
+			return nil, err
+		}
+	}
 
 	needsApproval := hasBlockingFindings(findings.Items)
 	findingsJSON, _ := json.Marshal(findings)

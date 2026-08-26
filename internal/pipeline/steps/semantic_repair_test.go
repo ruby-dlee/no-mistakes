@@ -3,6 +3,7 @@ package steps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -151,6 +152,7 @@ func TestReviewStep_FixerGetsCompleteSemanticContextAndProofContract(t *testing.
 		},
 	}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.QualityOutcomes = sctx.DB
 	sctx.Fixing = true
 	sctx.PreviousFindings = `{"findings":[{"id":"review-1","severity":"error","file":"feature.txt","line":1,"description":"public behavior regressed","action":"auto-fix","review_scope":"source"}],"risk_level":"medium","risk_rationale":"regression","risk_scope":"source-or-external"}`
 	sctx.UserIntent = "Preserve the public widget behavior and its generated client contract."
@@ -169,6 +171,19 @@ func TestReviewStep_FixerGetsCompleteSemanticContextAndProofContract(t *testing.
 	}
 	if outcome.NeedsApproval {
 		t.Fatalf("complete proven repair unexpectedly parked: %s", outcome.Findings)
+	}
+	quality, err := sctx.DB.GetQualityOutcomesByRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(quality) != 1 || quality[0].Classification != db.QualityCleanFix ||
+		quality[0].FixedHeadSHA != outcome.ReviewApprovedHeadSHA || quality[0].ObservedHeadSHA != outcome.ReviewApprovedHeadSHA {
+		t.Fatalf("automatic semantic quality observation = %+v, outcome=%+v", quality, outcome)
+	}
+	for _, recorded := range quality {
+		if recorded.Classification == db.QualityOverridden || recorded.Classification == db.QualityReverted {
+			t.Fatalf("review loop fabricated lifecycle classification: %+v", recorded)
+		}
 	}
 	if len(ag.calls) != 2 {
 		t.Fatalf("calls = %d, want fix plus cold rereview", len(ag.calls))
@@ -256,6 +271,7 @@ func TestReviewStep_IncompleteSemanticRepairProofParksEvenIfReviewerReturnsClean
 		},
 	}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.QualityOutcomes = sctx.DB
 	sctx.Fixing = true
 	sctx.PreviousFindings = `{"findings":[{"id":"review-1","severity":"error","file":"feature.txt","description":"generated client is stale","action":"auto-fix","review_scope":"source"}]}`
 
@@ -272,6 +288,40 @@ func TestReviewStep_IncompleteSemanticRepairProofParksEvenIfReviewerReturnsClean
 	}
 	if !strings.Contains(findings.Items[0].Description, "could not prove the semantic repair") {
 		t.Fatalf("handoff finding did not explain missing proof: %+v", findings.Items[0])
+	}
+	quality, err := sctx.DB.GetQualityOutcomesByRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(quality) != 1 || quality[0].Classification != db.QualityPrimaryHandoff {
+		t.Fatalf("incomplete-proof quality observation = %+v", quality)
+	}
+}
+
+func TestReviewStep_QualityOutcomeWriteFailureBlocksCleanRepair(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", headSHA)
+
+	call := 0
+	ag := &mockAgent{
+		name: "semantic-quality-failure",
+		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+			call++
+			if call == 1 {
+				return &agent.Result{Output: completeSemanticRepairResult("repair public behavior")}, nil
+			}
+			return &agent.Result{Output: json.RawMessage(`{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"verified","risk_scope":"source-or-external"}`)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.QualityOutcomes = &qualityOutcomeRecorderStub{err: errors.New("quality store unavailable")}
+	sctx.Fixing = true
+	sctx.PreviousFindings = `{"findings":[{"id":"review-1","severity":"error","file":"feature.txt","description":"public behavior regressed","action":"auto-fix","semantic_family":"product-behavior","semantic_root":"public-regression"}]}`
+
+	_, err := (&ReviewStep{}).Execute(sctx)
+	if err == nil || !strings.Contains(err.Error(), "record semantic repair quality outcome") || !strings.Contains(err.Error(), "quality store unavailable") {
+		t.Fatalf("review error = %v, want fail-closed quality recording error", err)
 	}
 }
 

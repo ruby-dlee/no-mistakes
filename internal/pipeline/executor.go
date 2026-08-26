@@ -1123,6 +1123,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		Agent:            stepAgent,
 		Config:           e.config,
 		DB:               e.db,
+		QualityOutcomes:  e.db,
 		StepResultID:     sr.ID,
 		UserIntent:       userIntent,
 		IntentSource:     userIntentSource,
