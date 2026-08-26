@@ -289,13 +289,13 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, globalCfg *config.GlobalConf
 	}
 	preservedExternalRuns := append([]string(nil), coordinatorCIWaitRuns...)
 	if azureWorkers != nil {
-		workerRuns, workerErr := d.RecoverablePipelineJobRunIDs()
+		recoveries, workerErr := azureWorkers.recoverableRemoteSteps(context.Background())
 		if workerErr != nil {
 			return fmt.Errorf("load Azure worker restart custody: %w", workerErr)
 		}
-		preservedExternalRuns = append(preservedExternalRuns, workerRuns...)
-		if len(workerRuns) > 0 {
-			slog.Info("preserving active Azure worker jobs across startup", "count", len(workerRuns))
+		mgr.setRemoteRecoveries(recoveries)
+		if len(recoveries) > 0 {
+			slog.Info("reattaching active Azure worker jobs across startup", "count", len(recoveries))
 		}
 	}
 	recoverOnStartup(d, p, mgr, layout, preservedExternalRuns)

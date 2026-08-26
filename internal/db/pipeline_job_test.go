@@ -410,6 +410,48 @@ func TestPipelineJobCompletionIsExactAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestRecoverablePipelineJobsIncludesUnconsumedAndReplayableTerminalResults(t *testing.T) {
+	database := openTestDB(t)
+	fixture := newPipelineJobFixture(t, database, false)
+	if err := database.UpdateRunStatus(fixture.run.ID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateStepStatus(fixture.step.ID, types.StepStatusRunning); err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := database.EnqueuePipelineJob(fixture.spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := database.ClaimPipelineJob(job.Kind, "worker", time.Now(), time.Minute)
+	if err != nil || lease == nil {
+		t.Fatalf("claim = %+v, err %v", lease, err)
+	}
+	if _, err := database.CompletePipelineJob(PipelineJobCompletion{
+		JobID: job.ID, LeaseOwner: "worker", LeaseFence: lease.LeaseFence,
+		DesiredHeadSHA: job.DesiredHeadSHA, InputDigest: job.InputDigest,
+		OwnerDecisionHead: job.OwnerDecisionHead, DesiredGeneration: job.DesiredGeneration,
+		ResultDigest: pipelineJobResult, OutputHeadSHA: pipelineJobHead, CompletedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertOnly := func(stage string) {
+		t.Helper()
+		jobs, err := database.RecoverablePipelineJobs()
+		if err != nil || len(jobs) != 1 || jobs[0].ID != job.ID {
+			t.Fatalf("%s recoverable jobs = %+v, err %v", stage, jobs, err)
+		}
+	}
+	assertOnly("before result consumption")
+	if _, err := database.InsertRemoteReviewStepRoundWithProvenance(
+		job.ID, fixture.step.ID, 1, "initial", nil, nil,
+		pipelineJobHead, pipelineJobHead, "", nil, nil, 10,
+	); err != nil {
+		t.Fatal(err)
+	}
+	assertOnly("after replayable round persistence")
+}
+
 func TestPipelineJobTransitionsRejectWrongBindingsAndSupersedeExactly(t *testing.T) {
 	database := openTestDB(t)
 	fixture := newPipelineJobFixture(t, database, true)

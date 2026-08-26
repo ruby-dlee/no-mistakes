@@ -93,9 +93,12 @@ or invalid returned results fail terminally. Losing the heartbeat/fence cancels
 the wrapper process tree and admits nothing.
 
 When enabled, the daemon stores content-addressed inputs and exact-bound result
-records privately below `NM_HOME/azure-worker`, starts one bounded loop for
-each of review, repair, and test, and resumes queued/expired leased jobs after a
-restart. Those three unexpired fenced leases are the only Azure capacity and
+records privately below `NM_HOME/azure-worker`. The global-only
+`review_concurrency`, `repair_concurrency`, and `test_concurrency` settings
+default to one, independently bound each role to 1-16 workers, and are capped
+at 16 workers in aggregate. The daemon reattaches the canonical pipeline
+consumer to exact queued, leased, completed, or failed jobs after a restart.
+Unexpired fenced leases are the only Azure capacity and
 updater-liveness signal. CI waits, parked gates, raw run status, and daemon
 touch timestamps consume no Azure worker capacity.
 

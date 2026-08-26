@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 )
@@ -56,8 +57,11 @@ type StepRound struct {
 	// the fix attempt performed during this round. It is only set when the
 	// round itself was a fix round (trigger=="auto_fix").
 	FixSummary *string
-	DurationMS int64
-	CreatedAt  int64
+	// RemoteJobID makes canonical worker-result consumption replayable after a
+	// daemon crash. Local rounds remain NULL.
+	RemoteJobID *string
+	DurationMS  int64
+	CreatedAt   int64
 }
 
 // StepRoundStats summarizes execution rounds for a step. It lets status
@@ -158,7 +162,11 @@ func hasSelectedFinding(raw *string) bool {
 // InsertStepRound creates a new round record for a step result. fixSummary may
 // be nil for non-fix rounds or when the agent produced no summary.
 func (d *DB) InsertStepRound(stepResultID string, round int, trigger string, findingsJSON *string, fixSummary *string, durationMS int64) (*StepRound, error) {
-	return d.insertStepRound(stepResultID, round, trigger, findingsJSON, fixSummary, nil, nil, nil, nil, nil, durationMS)
+	return d.insertStepRound(stepResultID, round, trigger, findingsJSON, fixSummary, nil, nil, nil, nil, nil, nil, durationMS)
+}
+
+func (d *DB) InsertRemoteStepRound(remoteJobID, stepResultID string, round int, trigger string, findingsJSON *string, fixSummary *string, durationMS int64) (*StepRound, error) {
+	return d.insertStepRound(stepResultID, round, trigger, findingsJSON, fixSummary, nil, nil, nil, nil, nil, &remoteJobID, durationMS)
 }
 
 // InsertReviewStepRound persists a review round's examined commit as a
@@ -169,6 +177,14 @@ func (d *DB) InsertReviewStepRound(stepResultID string, round int, trigger strin
 }
 
 func (d *DB) InsertReviewStepRoundWithProvenance(stepResultID string, round int, trigger string, findingsJSON *string, fixSummary *string, reviewedHeadSHA, startingHeadSHA, trustedConfigSHA string, globalConfigYAML, repoConfigYAML []byte, durationMS int64) (*StepRound, error) {
+	return d.insertReviewStepRoundWithProvenance(nil, stepResultID, round, trigger, findingsJSON, fixSummary, reviewedHeadSHA, startingHeadSHA, trustedConfigSHA, globalConfigYAML, repoConfigYAML, durationMS)
+}
+
+func (d *DB) InsertRemoteReviewStepRoundWithProvenance(remoteJobID, stepResultID string, round int, trigger string, findingsJSON *string, fixSummary *string, reviewedHeadSHA, startingHeadSHA, trustedConfigSHA string, globalConfigYAML, repoConfigYAML []byte, durationMS int64) (*StepRound, error) {
+	return d.insertReviewStepRoundWithProvenance(&remoteJobID, stepResultID, round, trigger, findingsJSON, fixSummary, reviewedHeadSHA, startingHeadSHA, trustedConfigSHA, globalConfigYAML, repoConfigYAML, durationMS)
+}
+
+func (d *DB) insertReviewStepRoundWithProvenance(remoteJobID *string, stepResultID string, round int, trigger string, findingsJSON *string, fixSummary *string, reviewedHeadSHA, startingHeadSHA, trustedConfigSHA string, globalConfigYAML, repoConfigYAML []byte, durationMS int64) (*StepRound, error) {
 	var reviewed, starting, trusted *string
 	if reviewedHeadSHA != "" {
 		reviewed = &reviewedHeadSHA
@@ -179,10 +195,10 @@ func (d *DB) InsertReviewStepRoundWithProvenance(stepResultID string, round int,
 	if trustedConfigSHA != "" {
 		trusted = &trustedConfigSHA
 	}
-	return d.insertStepRound(stepResultID, round, trigger, findingsJSON, fixSummary, reviewed, starting, trusted, globalConfigYAML, repoConfigYAML, durationMS)
+	return d.insertStepRound(stepResultID, round, trigger, findingsJSON, fixSummary, reviewed, starting, trusted, globalConfigYAML, repoConfigYAML, remoteJobID, durationMS)
 }
 
-func (d *DB) insertStepRound(stepResultID string, round int, trigger string, findingsJSON *string, fixSummary, reviewedHeadSHA, startingHeadSHA, trustedConfigSHA *string, globalConfigYAML, repoConfigYAML []byte, durationMS int64) (*StepRound, error) {
+func (d *DB) insertStepRound(stepResultID string, round int, trigger string, findingsJSON *string, fixSummary, reviewedHeadSHA, startingHeadSHA, trustedConfigSHA *string, globalConfigYAML, repoConfigYAML []byte, remoteJobID *string, durationMS int64) (*StepRound, error) {
 	r := &StepRound{
 		ID:               newID(),
 		StepResultID:     stepResultID,
@@ -195,17 +211,50 @@ func (d *DB) insertStepRound(stepResultID string, round int, trigger string, fin
 		GlobalConfigYAML: append([]byte(nil), globalConfigYAML...),
 		RepoConfigYAML:   append([]byte(nil), repoConfigYAML...),
 		FixSummary:       fixSummary,
+		RemoteJobID:      remoteJobID,
 		DurationMS:       durationMS,
 		CreatedAt:        now(),
 	}
 	_, err := d.sql.Exec(
-		`INSERT INTO step_rounds (id, step_result_id, round, trigger_type, findings_json, reviewed_head_sha, starting_head_sha, trusted_config_sha, global_config_yaml, repo_config_yaml, user_findings_json, selected_finding_ids, selection_source, fix_summary, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.StepResultID, r.Round, r.Trigger, r.FindingsJSON, r.ReviewedHeadSHA, r.StartingHeadSHA, r.TrustedConfigSHA, r.GlobalConfigYAML, r.RepoConfigYAML, r.UserFindingsJSON, r.SelectedFindingIDs, r.SelectionSource, r.FixSummary, r.DurationMS, r.CreatedAt,
+		`INSERT INTO step_rounds (id, step_result_id, round, trigger_type, findings_json, reviewed_head_sha, starting_head_sha, trusted_config_sha, global_config_yaml, repo_config_yaml, user_findings_json, selected_finding_ids, selection_source, fix_summary, remote_job_id, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.StepResultID, r.Round, r.Trigger, r.FindingsJSON, r.ReviewedHeadSHA, r.StartingHeadSHA, r.TrustedConfigSHA, r.GlobalConfigYAML, r.RepoConfigYAML, r.UserFindingsJSON, r.SelectedFindingIDs, r.SelectionSource, r.FixSummary, r.RemoteJobID, r.DurationMS, r.CreatedAt,
 	)
 	if err != nil {
+		if remoteJobID != nil {
+			existing, loadErr := d.stepRoundByRemoteJobID(*remoteJobID)
+			if loadErr == nil && sameRemoteStepRound(existing, r) {
+				return existing, nil
+			}
+			if loadErr != nil {
+				return nil, fmt.Errorf("insert step round: %w; load replay: %v", err, loadErr)
+			}
+			return nil, fmt.Errorf("insert step round: remote job replay conflicts with durable round")
+		}
 		return nil, fmt.Errorf("insert step round: %w", err)
 	}
 	return r, nil
+}
+
+func (d *DB) stepRoundByRemoteJobID(remoteJobID string) (*StepRound, error) {
+	r := &StepRound{}
+	err := d.sql.QueryRow(`SELECT id, step_result_id, round, trigger_type, findings_json, reviewed_head_sha, starting_head_sha, trusted_config_sha, global_config_yaml, repo_config_yaml, user_findings_json, selected_finding_ids, selection_source, fix_summary, remote_job_id, duration_ms, created_at FROM step_rounds WHERE remote_job_id = ?`, remoteJobID).
+		Scan(&r.ID, &r.StepResultID, &r.Round, &r.Trigger, &r.FindingsJSON, &r.ReviewedHeadSHA, &r.StartingHeadSHA, &r.TrustedConfigSHA, &r.GlobalConfigYAML, &r.RepoConfigYAML, &r.UserFindingsJSON, &r.SelectedFindingIDs, &r.SelectionSource, &r.FixSummary, &r.RemoteJobID, &r.DurationMS, &r.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func sameRemoteStepRound(a, b *StepRound) bool {
+	return a != nil && b != nil && a.StepResultID == b.StepResultID && a.Round == b.Round && a.Trigger == b.Trigger &&
+		equalOptionalString(a.FindingsJSON, b.FindingsJSON) && equalOptionalString(a.ReviewedHeadSHA, b.ReviewedHeadSHA) &&
+		equalOptionalString(a.StartingHeadSHA, b.StartingHeadSHA) && equalOptionalString(a.TrustedConfigSHA, b.TrustedConfigSHA) &&
+		bytes.Equal(a.GlobalConfigYAML, b.GlobalConfigYAML) && bytes.Equal(a.RepoConfigYAML, b.RepoConfigYAML) &&
+		equalOptionalString(a.FixSummary, b.FixSummary) && equalOptionalString(a.RemoteJobID, b.RemoteJobID)
+}
+
+func equalOptionalString(a, b *string) bool {
+	return (a == nil && b == nil) || (a != nil && b != nil && *a == *b)
 }
 
 // SetStepRoundSelection records which findings were selected for fix AFTER the
@@ -271,7 +320,7 @@ func (d *DB) SetStepRoundUserFindings(id string, userFindingsJSON *string) error
 // GetRoundsByStep returns all rounds for a step result, ordered by round number.
 func (d *DB) GetRoundsByStep(stepResultID string) ([]*StepRound, error) {
 	rows, err := d.sql.Query(
-		`SELECT id, step_result_id, round, trigger_type, findings_json, reviewed_head_sha, starting_head_sha, trusted_config_sha, global_config_yaml, repo_config_yaml, user_findings_json, selected_finding_ids, selection_source, fix_summary, duration_ms, created_at FROM step_rounds WHERE step_result_id = ? ORDER BY round`,
+		`SELECT id, step_result_id, round, trigger_type, findings_json, reviewed_head_sha, starting_head_sha, trusted_config_sha, global_config_yaml, repo_config_yaml, user_findings_json, selected_finding_ids, selection_source, fix_summary, remote_job_id, duration_ms, created_at FROM step_rounds WHERE step_result_id = ? ORDER BY round`,
 		stepResultID,
 	)
 	if err != nil {
@@ -281,7 +330,7 @@ func (d *DB) GetRoundsByStep(stepResultID string) ([]*StepRound, error) {
 	var rounds []*StepRound
 	for rows.Next() {
 		r := &StepRound{}
-		if err := rows.Scan(&r.ID, &r.StepResultID, &r.Round, &r.Trigger, &r.FindingsJSON, &r.ReviewedHeadSHA, &r.StartingHeadSHA, &r.TrustedConfigSHA, &r.GlobalConfigYAML, &r.RepoConfigYAML, &r.UserFindingsJSON, &r.SelectedFindingIDs, &r.SelectionSource, &r.FixSummary, &r.DurationMS, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.StepResultID, &r.Round, &r.Trigger, &r.FindingsJSON, &r.ReviewedHeadSHA, &r.StartingHeadSHA, &r.TrustedConfigSHA, &r.GlobalConfigYAML, &r.RepoConfigYAML, &r.UserFindingsJSON, &r.SelectedFindingIDs, &r.SelectionSource, &r.FixSummary, &r.RemoteJobID, &r.DurationMS, &r.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan step round: %w", err)
 		}
 		rounds = append(rounds, r)

@@ -767,6 +767,11 @@ func insertPipelineJobEventTx(tx *sql.Tx, job *PipelineJob, eventType string, at
 }
 
 func (d *DB) verifyPipelineJobCanonicalBindingsTx(tx *sql.Tx, job *PipelineJob) error {
+	_, err := d.verifyPipelineJobBindingsTx(tx, job, false)
+	return err
+}
+
+func (d *DB) verifyPipelineJobBindingsTx(tx *sql.Tx, job *PipelineJob, allowAdoptedRepair bool) (bool, error) {
 	var runHead, stepRunID, repoID, branch string
 	var runStatus types.RunStatus
 	if err := tx.QueryRow(
@@ -775,20 +780,22 @@ func (d *DB) verifyPipelineJobCanonicalBindingsTx(tx *sql.Tx, job *PipelineJob) 
 		  WHERE r.id = ?`, job.StepResultID, job.RunID,
 	).Scan(&runHead, &stepRunID, &repoID, &branch, &runStatus); err != nil {
 		if err == sql.ErrNoRows {
-			return errors.New("run or step binding is absent")
+			return false, errors.New("run or step binding is absent")
 		}
-		return fmt.Errorf("verify run and step binding: %w", err)
+		return false, fmt.Errorf("verify run and step binding: %w", err)
 	}
-	if stepRunID != job.RunID || runHead != job.DesiredHeadSHA ||
+	alreadyAdopted := allowAdoptedRepair && job.Kind == PipelineJobRepair && job.Status == PipelineJobCompleted &&
+		job.OutputHeadSHA != nil && runHead == *job.OutputHeadSHA
+	if stepRunID != job.RunID || (runHead != job.DesiredHeadSHA && !alreadyAdopted) ||
 		(runStatus != types.RunPending && runStatus != types.RunRunning) {
-		return errors.New("run, step, or desired head binding changed")
+		return false, errors.New("run, step, or desired head binding changed")
 	}
 	var revision int64
 	var desiredHead, inputDigest string
 	err := tx.QueryRow(`SELECT revision, head_sha, input_digest FROM worker_desired_state WHERE repo_id = ? AND branch = ?`, repoID, branch).
 		Scan(&revision, &desiredHead, &inputDigest)
 	if err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("verify desired generation: %w", err)
+		return false, fmt.Errorf("verify desired generation: %w", err)
 	}
 	if err == sql.ErrNoRows {
 		if job.DesiredGeneration == 0 {
@@ -804,46 +811,49 @@ func (d *DB) verifyPipelineJobCanonicalBindingsTx(tx *sql.Tx, job *PipelineJob) 
 				Scan(&revision, &desiredHead, &inputDigest)
 			if err != nil {
 				if err == sql.ErrNoRows {
-					return errors.New("job names a desired generation without worker or migration state")
+					return false, errors.New("job names a desired generation without worker or migration state")
 				}
-				return fmt.Errorf("verify migrated desired generation: %w", err)
+				return false, fmt.Errorf("verify migrated desired generation: %w", err)
 			}
 			if revision != job.DesiredGeneration || desiredHead != job.DesiredHeadSHA || inputDigest != job.InputDigest {
-				return errors.New("migrated desired generation, head, or input binding changed")
+				return false, errors.New("migrated desired generation, head, or input binding changed")
 			}
 		}
 	} else if revision != job.DesiredGeneration || desiredHead != job.DesiredHeadSHA || inputDigest != job.InputDigest {
-		return errors.New("desired generation, head, or input binding changed")
+		return false, errors.New("desired generation, head, or input binding changed")
 	}
 	authority, err := getOwnerDecisionAuthorityTx(tx, job.RunID)
 	if err != nil {
-		return fmt.Errorf("verify owner-decision authority: %w", err)
+		return false, fmt.Errorf("verify owner-decision authority: %w", err)
 	}
 	if authority == nil {
 		if job.OwnerDecisionHead != "" {
-			return errors.New("unprotected run has an owner-decision head")
+			return false, errors.New("unprotected run has an owner-decision head")
 		}
-		return nil
+		return alreadyAdopted, nil
 	}
 	if job.OwnerDecisionHead == "" {
-		return errors.New("protected run has no owner-decision head")
+		return false, errors.New("protected run has no owner-decision head")
 	}
 	if _, err := d.verifyOwnerDecisionHistory(job.RunID, authority, job.OwnerDecisionHead, tx); err != nil {
-		return fmt.Errorf("owner-decision head binding changed: %w", err)
+		return false, fmt.Errorf("owner-decision head binding changed: %w", err)
 	}
-	return nil
+	return alreadyAdopted, nil
 }
 
-// RecoverablePipelineJobRunIDs returns active runs with at least one queued or
-// leased worker job whose run, step, head, worker generation, and owner history
-// are still exact. Startup uses this set before generic stale-run recovery.
-func (d *DB) RecoverablePipelineJobRunIDs() ([]string, error) {
+// RecoverablePipelineJobs returns the exact unconsumed worker round for each
+// active review/repair/test step. Terminal jobs are included because a daemon
+// can stop after Azure stored a result but before the pipeline consumed it.
+func (d *DB) RecoverablePipelineJobs() ([]*PipelineJob, error) {
 	tx, err := d.sql.Begin()
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.Query(`SELECT `+pipelineJobColumns+` FROM pipeline_jobs WHERE status IN (?, ?) ORDER BY run_id, id`, PipelineJobQueued, PipelineJobLeased)
+	rows, err := tx.Query(`SELECT `+pipelineJobColumns+` FROM pipeline_jobs
+		WHERE kind IN (?, ?, ?) AND status IN (?, ?, ?, ?, ?) ORDER BY run_id, id`,
+		PipelineJobReview, PipelineJobRepair, PipelineJobTest,
+		PipelineJobQueued, PipelineJobLeased, PipelineJobCompleted, PipelineJobFailed, PipelineJobSuperseded)
 	if err != nil {
 		return nil, err
 	}
@@ -859,18 +869,62 @@ func (d *DB) RecoverablePipelineJobRunIDs() ([]string, error) {
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	seen := make(map[string]struct{})
+	var candidates []*PipelineJob
 	for _, job := range jobs {
-		if err := d.verifyPipelineJobCanonicalBindingsTx(tx, job); err == nil {
-			seen[job.RunID] = struct{}{}
+		if _, err := d.verifyPipelineJobBindingsTx(tx, job, true); err != nil {
+			continue
 		}
+		var stepStatus types.StepStatus
+		var completedRounds int
+		var latestRemoteJobID sql.NullString
+		if err := tx.QueryRow(`SELECT status,
+			(SELECT COUNT(*) FROM step_rounds WHERE step_result_id = step_results.id),
+			COALESCE((SELECT remote_job_id FROM step_rounds WHERE step_result_id = step_results.id ORDER BY round DESC LIMIT 1), '')
+			FROM step_results WHERE id = ? AND run_id = ?`, job.StepResultID, job.RunID).Scan(&stepStatus, &completedRounds, &latestRemoteJobID); err != nil {
+			if err == sql.ErrNoRows {
+				continue
+			}
+			return nil, fmt.Errorf("inspect recoverable pipeline step: %w", err)
+		}
+		unconsumed := job.Round == completedRounds+1
+		replayLatest := job.Round == completedRounds && latestRemoteJobID.Valid && latestRemoteJobID.String == job.ID
+		if (stepStatus != types.StepStatusRunning && stepStatus != types.StepStatusFixing) || (!unconsumed && !replayLatest) {
+			continue
+		}
+		candidates = append(candidates, job)
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	latestRound := make(map[string]int)
+	for _, job := range candidates {
+		if job.Round > latestRound[job.RunID] {
+			latestRound[job.RunID] = job.Round
+		}
+	}
+	recoverable := make([]*PipelineJob, 0, len(candidates))
+	for _, job := range candidates {
+		if job.Round == latestRound[job.RunID] {
+			recoverable = append(recoverable, job)
+		}
+	}
+	return recoverable, nil
+}
+
+// RecoverablePipelineJobRunIDs preserves the compatibility surface used by
+// startup tests while deriving liveness from exact unconsumed jobs.
+func (d *DB) RecoverablePipelineJobRunIDs() ([]string, error) {
+	jobs, err := d.RecoverablePipelineJobs()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(jobs))
+	for _, job := range jobs {
+		seen[job.RunID] = struct{}{}
+	}
 	ids := make([]string, 0, len(seen))
-	for id := range seen {
-		ids = append(ids, id)
+	for runID := range seen {
+		ids = append(ids, runID)
 	}
 	sort.Strings(ids)
 	return ids, nil

@@ -71,6 +71,30 @@ func TestQualityOutcomesAllowWholeRepoPrivacyDeletion(t *testing.T) {
 	}
 }
 
+func TestSemanticRereviewQualityReplayIsExactAndIdempotent(t *testing.T) {
+	d, _, run := openSessionTestDB(t)
+	outcome := QualityOutcome{
+		RunID: run.ID, JobID: strPtr("semantic-job-1"), FixAttemptID: strPtr("fix-1"), RootID: strPtr("root-1"),
+		Classification: QualityCleanFix, FixedHeadSHA: qualityFixedHead, ObservedHeadSHA: qualityObservedHead,
+		EvidenceDigest: qualityDigest, EvidenceProvenance: "semantic_rereview",
+	}
+	first, err := d.InsertQualityOutcome(outcome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := d.InsertQualityOutcome(outcome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.ID != first.ID {
+		t.Fatalf("semantic quality replay id = %s, want %s", replay.ID, first.ID)
+	}
+	outcome.Classification = QualityIntroducedRegression
+	if _, err := d.InsertQualityOutcome(outcome); err == nil {
+		t.Fatal("conflicting semantic quality replay was accepted")
+	}
+}
+
 func TestQualityOutcomesExactEnumsAndSupersessionBinding(t *testing.T) {
 	d, repo, run := openSessionTestDB(t)
 	for _, classification := range []QualityClassification{

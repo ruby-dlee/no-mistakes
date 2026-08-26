@@ -164,6 +164,39 @@ func TestGetRoundsByStepEmpty(t *testing.T) {
 	}
 }
 
+func TestRemoteStepRoundReplayIsExactAndIdempotent(t *testing.T) {
+	d, _, run := openSessionTestDB(t)
+	step, err := d.InsertStepResult(run.ID, types.StepReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	findings := `{"findings":[],"summary":"clear"}`
+	first, err := d.InsertRemoteReviewStepRoundWithProvenance(
+		"remote-job-1", step.ID, 1, "initial", &findings, nil,
+		qualityFixedHead, qualityFixedHead, "", nil, nil, 41,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := d.InsertRemoteReviewStepRoundWithProvenance(
+		"remote-job-1", step.ID, 1, "initial", &findings, nil,
+		qualityFixedHead, qualityFixedHead, "", nil, nil, 99,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.ID != first.ID || replay.DurationMS != 41 {
+		t.Fatalf("remote round replay = %+v, want original %+v", replay, first)
+	}
+	conflict := `{"findings":[{"severity":"warning"}]}`
+	if _, err := d.InsertRemoteReviewStepRoundWithProvenance(
+		"remote-job-1", step.ID, 1, "initial", &conflict, nil,
+		qualityFixedHead, qualityFixedHead, "", nil, nil, 41,
+	); err == nil {
+		t.Fatal("conflicting remote round replay was accepted")
+	}
+}
+
 func TestStepFixSummaries(t *testing.T) {
 	d := openTestDB(t)
 	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")

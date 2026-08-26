@@ -463,6 +463,36 @@ func TestGeneratedArtifactDiffRejectsOutputOnlyChangeDespiteFixerClaim(t *testin
 	}
 }
 
+func TestGeneratedArtifactDiffHonorsAuthoritativeGitAttributes(t *testing.T) {
+	t.Parallel()
+	dir, _, startingHead := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", startingHead)
+	if err := os.MkdirAll(filepath.Join(dir, "contracts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".gitattributes"), []byte("contracts/client.ts linguist-generated=true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "contracts", "client.ts"), []byte("export const version = 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", ".gitattributes", "contracts/client.ts")
+	gitCmd(t, dir, "commit", "-m", "declare generated client")
+	startingHead = gitCmd(t, dir, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(dir, "contracts", "client.ts"), []byte("export const version = 2;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "contracts/client.ts")
+	gitCmd(t, dir, "commit", "-m", "hand edit ordinary named client")
+	fixedHead := gitCmd(t, dir, "rev-parse", "HEAD")
+	evidence := semanticRepairEvidence{GeneratedArtifacts: generatedArtifactDisposition{
+		Touched: false, Disposition: "no generated artifacts changed",
+	}}
+	if err := validateGeneratedArtifactDiff(context.Background(), dir, startingHead, fixedHead, evidence); err == nil {
+		t.Fatal("accepted an ordinary-named generated output hidden by fixer self-report")
+	}
+}
+
 func TestNormalizeSemanticRiskActionsCatchesMechanicalLabelEvasion(t *testing.T) {
 	findings := Findings{
 		RiskLevel: "medium", RiskRationale: "authorization boundary is affected",

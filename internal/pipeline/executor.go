@@ -595,6 +595,124 @@ type stepExecutionState struct {
 	autoFixAttempts  int
 	executionMS      int64
 	currentRoundID   string
+	recoveryRequest  *RemoteStepRequest
+}
+
+type recoveredRemoteStep struct {
+	index      int
+	step       Step
+	stepResult *db.StepResult
+	state      stepExecutionState
+}
+
+// ValidateRecoveredRemoteRun proves that one durable worker job is the exact
+// missing execution round in an otherwise coherent running pipeline.
+func ValidateRecoveredRemoteRun(database *db.DB, run *db.Run, steps []Step, request RemoteStepRequest) error {
+	_, err := (&Executor{db: database, steps: steps}).recoveredRemoteStep(run, request)
+	return err
+}
+
+func (e *Executor) recoveredRemoteStep(run *db.Run, request RemoteStepRequest) (*recoveredRemoteStep, error) {
+	if run == nil || run.Status != types.RunRunning || run.AwaitingAgentSince != nil {
+		return nil, fmt.Errorf("run is not an active remote-worker run")
+	}
+	if request.RecoveryJobID == "" || request.RunID != run.ID || request.RepoID != run.RepoID ||
+		request.Branch != run.Branch || request.BaseSHA != run.BaseSHA {
+		return nil, fmt.Errorf("remote recovery identity does not match the running run")
+	}
+	if request.RecoveryAdoptedHeadSHA == "" {
+		if request.DesiredHeadSHA != run.HeadSHA {
+			return nil, fmt.Errorf("remote recovery desired head does not match the running run")
+		}
+	} else if !request.Fixing || request.RecoveryAdoptedHeadSHA != run.HeadSHA {
+		return nil, fmt.Errorf("remote recovery adopted head does not match a repair run")
+	}
+	results, err := e.db.GetStepsByRun(run.ID)
+	if err != nil {
+		return nil, fmt.Errorf("get remote recovery steps: %w", err)
+	}
+	if len(results) != len(e.steps) {
+		return nil, fmt.Errorf("remote recovery has %d step records for %d steps", len(results), len(e.steps))
+	}
+	var recovered *recoveredRemoteStep
+	for index, result := range results {
+		if result.StepName != e.steps[index].Name() {
+			return nil, fmt.Errorf("remote recovery step %d is %q, want %q", index, result.StepName, e.steps[index].Name())
+		}
+		if result.ID == request.StepResultID {
+			if recovered != nil || result.StepName != request.Step ||
+				(result.Status != types.StepStatusRunning && result.Status != types.StepStatusFixing) {
+				return nil, fmt.Errorf("remote recovery active step binding is invalid")
+			}
+			rounds, roundErr := e.db.GetRoundsByStep(result.ID)
+			if roundErr != nil {
+				return nil, fmt.Errorf("get remote recovery rounds: %w", roundErr)
+			}
+			replayPersistedRound := len(rounds) > 0 && request.Round == len(rounds) &&
+				rounds[len(rounds)-1].RemoteJobID != nil && *rounds[len(rounds)-1].RemoteJobID == request.RecoveryJobID
+			if request.Round != len(rounds)+1 && !replayPersistedRound {
+				return nil, fmt.Errorf("remote recovery round is %d, incompatible with %d durable rounds", request.Round, len(rounds))
+			}
+			state := stepExecutionState{fixing: request.Fixing, previousFindings: request.PreviousFindings, roundNum: request.Round - 1, recoveryRequest: &request}
+			for roundIndex, round := range rounds {
+				if round.Round != roundIndex+1 {
+					return nil, fmt.Errorf("remote recovery round history is not contiguous")
+				}
+				if round.Round < request.Round {
+					state.executionMS += round.DurationMS
+					state.currentRoundID = round.ID
+					if round.SelectionSource != nil && *round.SelectionSource == db.RoundSelectionSourceAutoFix {
+						state.autoFixAttempts++
+					}
+				}
+			}
+			if request.Fixing != (request.PreviousFindings != "") {
+				return nil, fmt.Errorf("remote recovery repair findings binding is invalid")
+			}
+			recovered = &recoveredRemoteStep{index: index, step: e.steps[index], stepResult: result, state: state}
+			continue
+		}
+		if recovered == nil {
+			if result.Status != types.StepStatusCompleted && result.Status != types.StepStatusSkipped {
+				return nil, fmt.Errorf("remote recovery step %s is %s before active step", result.StepName, result.Status)
+			}
+		} else if result.Status != types.StepStatusPending {
+			return nil, fmt.Errorf("remote recovery step %s is %s after active step", result.StepName, result.Status)
+		}
+	}
+	if recovered == nil {
+		return nil, fmt.Errorf("remote recovery has no matching active step")
+	}
+	return recovered, nil
+}
+
+// ResumeRemote reattaches the pipeline consumer to one exact durable Azure
+// job, then continues the ordinary pipeline from the resulting step outcome.
+func (e *Executor) ResumeRemote(ctx context.Context, run *db.Run, repo *db.Repo, workDir string, request RemoteStepRequest) error {
+	e.workDir = workDir
+	if repo == nil {
+		return fmt.Errorf("recovered remote run has no repository")
+	}
+	if err := e.bindOwnerDecisionRun(run, repo); err != nil {
+		return err
+	}
+	recovered, err := e.recoveredRemoteStep(run, request)
+	if err != nil {
+		return err
+	}
+	logDir := e.paths.RunLogDir(run.ID)
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return e.failRun(run, repo, fmt.Errorf("create log dir: %w", err))
+	}
+	e.initializeRunScopes(run.ID)
+	skipRemaining, err := e.executeStep(ctx, recovered.step, recovered.stepResult, run, repo, workDir, logDir, recovered.state)
+	if err != nil {
+		return e.failRun(run, repo, err, ctx)
+	}
+	if skipRemaining {
+		return e.skipRecoveredRemainder(run, repo, recovered.index+1)
+	}
+	return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, recovered.index+1)
 }
 
 type recoveredGate struct {
@@ -1171,6 +1289,9 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			return false, fmt.Errorf("before step %s round %d: %w", stepName, roundNum+1, err)
 		}
 		reviewStartingHeadSHA := run.HeadSHA
+		if state.recoveryRequest != nil {
+			reviewStartingHeadSHA = state.recoveryRequest.DesiredHeadSHA
+		}
 		sctx.ReviewStartingHeadSHA = reviewStartingHeadSHA
 		var outcome *StepOutcome
 		var err error
@@ -1183,7 +1304,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			if provider, ok := step.(RemoteStepContextProvider); ok {
 				remoteContext = provider.RemoteStepContext(sctx)
 			}
-			outcome, err = e.executeRemoteStep(ctx, RemoteStepRequest{
+			request := RemoteStepRequest{
 				RunID: run.ID, RepoID: run.RepoID, StepResultID: sr.ID,
 				Step: stepName, Round: roundNum + 1, DesiredHeadSHA: run.HeadSHA,
 				BaseSHA: run.BaseSHA, Branch: run.Branch, DefaultBranch: repo.DefaultBranch, Fixing: sctx.Fixing,
@@ -1193,7 +1314,12 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 				UncertifiedRoundHistory: remoteContext.UncertifiedRoundHistory,
 				RepairAttempt:           remoteContext.RepairAttempt,
 				QualityOutcomeAuthority: remoteContext.QualityOutcomeAuthority,
-			}, &run.HeadSHA)
+			}
+			if state.recoveryRequest != nil {
+				request = *state.recoveryRequest
+				state.recoveryRequest = nil
+			}
+			outcome, err = e.executeRemoteStep(ctx, request, &run.HeadSHA)
 		} else {
 			outcome, err = step.Execute(sctx)
 		}
@@ -1250,11 +1376,22 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		var inserted *db.StepRound
 		var dbErr error
 		if stepName == types.StepReview {
-			if e.config != nil && e.config.CaptureEvalProvenance {
+			if outcome.RemoteJobID != "" {
+				trustedConfigSHA := ""
+				var globalConfigYAML, repoConfigYAML []byte
+				if e.config != nil && e.config.CaptureEvalProvenance {
+					trustedConfigSHA = e.config.TrustedConfigSHA
+					globalConfigYAML = e.config.ReplayGlobalYAML
+					repoConfigYAML = e.config.ReplayRepoYAML
+				}
+				inserted, dbErr = e.db.InsertRemoteReviewStepRoundWithProvenance(outcome.RemoteJobID, sr.ID, roundNum, nextTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, reviewStartingHeadSHA, trustedConfigSHA, globalConfigYAML, repoConfigYAML, roundDuration)
+			} else if e.config != nil && e.config.CaptureEvalProvenance {
 				inserted, dbErr = e.db.InsertReviewStepRoundWithProvenance(sr.ID, roundNum, nextTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, reviewStartingHeadSHA, e.config.TrustedConfigSHA, e.config.ReplayGlobalYAML, e.config.ReplayRepoYAML, roundDuration)
 			} else {
 				inserted, dbErr = e.db.InsertReviewStepRound(sr.ID, roundNum, nextTrigger, findingsPtr, fixSummaryPtr, reviewApprovedHeadSHA, roundDuration)
 			}
+		} else if outcome.RemoteJobID != "" {
+			inserted, dbErr = e.db.InsertRemoteStepRound(outcome.RemoteJobID, sr.ID, roundNum, nextTrigger, findingsPtr, fixSummaryPtr, roundDuration)
 		} else {
 			inserted, dbErr = e.db.InsertStepRound(sr.ID, roundNum, nextTrigger, findingsPtr, fixSummaryPtr, roundDuration)
 		}

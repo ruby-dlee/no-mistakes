@@ -14,10 +14,13 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	gitpkg "github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 	"github.com/kunchenguid/no-mistakes/internal/workertransport"
+	"github.com/kunchenguid/no-mistakes/internal/worktrees"
 )
 
 func TestAzureWorkerRuntimeExecutesOneExactReviewThroughWrapper(t *testing.T) {
@@ -123,6 +126,183 @@ func TestAzureWorkerRuntimeExecutesOneExactReviewThroughWrapper(t *testing.T) {
 		}
 	}
 	t.Fatal("Azure worker review did not complete")
+}
+
+func TestAzureWorkerRestart_ReattachesQueuedJob(t *testing.T) {
+	t.Setenv("NM_DEMO", "1")
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	repository, head := setupTestGitRepo(t, p, database, "azure-restart")
+	run, err := database.InsertRun(repository.ID, "feature/restart", head, strings.Repeat("0", 40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workDir := p.WorktreeDir(repository.ID, run.ID)
+	if err := gitpkg.WorktreeAdd(context.Background(), p.RepoDir(repository.ID), workDir, head); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetRunWorktreeDir(run.ID, workDir); err != nil {
+		t.Fatal(err)
+	}
+	step, err := database.InsertStepResult(run.ID, types.StepReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateStepStatus(step.ID, types.StepStatusRunning); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := filepath.Join(t.TempDir(), "fm-no-mistakes-worker")
+	quotedSelf := "'" + strings.ReplaceAll(os.Args[0], "'", "'\\''") + "'"
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\nexec "+quotedSelf+" -test.run=^TestFakeAzureWorkerWrapperProcess$ -- \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	wrapperConfig := filepath.Join(t.TempDir(), "wrapper.json")
+	if err := os.WriteFile(wrapperConfig, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := newAzureWorkerRuntime(config.AzureWorkerConfig{
+		Enabled: true, RunnerPath: runner, ConfigPath: wrapperConfig,
+		LeaseDuration: 3 * time.Second, HeartbeatInterval: 200 * time.Millisecond, Timeout: 5 * time.Second,
+	}, database, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(runtime.Close)
+	request := pipeline.RemoteStepRequest{
+		RunID: run.ID, RepoID: repository.ID, StepResultID: step.ID,
+		Step: types.StepReview, Round: 1, DesiredHeadSHA: head,
+		BaseSHA: run.BaseSHA, Branch: run.Branch, DefaultBranch: repository.DefaultBranch, WorkDir: workDir,
+	}
+	if _, err := runtime.enqueueRemoteStep(request, db.PipelineJobReview); err != nil {
+		t.Fatal(err)
+	}
+	recoveries, err := runtime.recoverableRemoteSteps(context.Background())
+	if err != nil || len(recoveries) != 1 {
+		t.Fatalf("recoveries = %+v, err %v", recoveries, err)
+	}
+	manager := NewRunManager(database, p, func() []pipeline.Step { return []pipeline.Step{&steps.ReviewStep{}} })
+	manager.SetRemoteStepRunner(runtime)
+	manager.setRemoteRecoveries(recoveries)
+	recoverOnStartup(database, p, manager, worktrees.New(p, nil), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	runtime.Start(ctx)
+	t.Cleanup(func() {
+		cancel()
+		manager.Shutdown()
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		stored, err := database.GetRun(run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.Status == types.RunCompleted {
+			rounds, err := database.GetRoundsByStep(step.ID)
+			if err != nil || len(rounds) != 1 {
+				t.Fatalf("recovered rounds = %+v, err %v", rounds, err)
+			}
+			if stored.ReviewApprovedHeadSHA == nil || *stored.ReviewApprovedHeadSHA != head {
+				t.Fatalf("recovered review head = %#v", stored.ReviewApprovedHeadSHA)
+			}
+			return
+		}
+		if stored.Status == types.RunFailed {
+			t.Fatalf("recovered run failed: %v", stored.Error)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("recovered Azure job did not complete its pipeline run")
+}
+
+func TestAzureWorkerRecoveryConsumesCompletedAndFailedJobs(t *testing.T) {
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	repository, head := setupTestGitRepo(t, p, database, "azure-terminal-recovery")
+	runner := filepath.Join(t.TempDir(), "fm-no-mistakes-worker")
+	quotedSelf := "'" + strings.ReplaceAll(os.Args[0], "'", "'\\''") + "'"
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\nexec "+quotedSelf+" -test.run=^TestFakeAzureWorkerWrapperProcess$ -- \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	wrapperConfig := filepath.Join(t.TempDir(), "wrapper.json")
+	if err := os.WriteFile(wrapperConfig, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := newAzureWorkerRuntime(config.AzureWorkerConfig{
+		Enabled: true, RunnerPath: runner, ConfigPath: wrapperConfig,
+		LeaseDuration: 3 * time.Second, HeartbeatInterval: 200 * time.Millisecond, Timeout: 5 * time.Second,
+	}, database, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(runtime.Close)
+
+	newRequest := func(branch string) (pipeline.RemoteStepRequest, *db.PipelineJob) {
+		run, err := database.InsertRun(repository.ID, branch, head, strings.Repeat("0", 40))
+		if err != nil {
+			t.Fatal(err)
+		}
+		step, err := database.InsertStepResult(run.ID, types.StepReview)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := pipeline.RemoteStepRequest{
+			RunID: run.ID, RepoID: repository.ID, StepResultID: step.ID,
+			Step: types.StepReview, Round: 1, DesiredHeadSHA: head,
+			BaseSHA: run.BaseSHA, Branch: run.Branch, DefaultBranch: repository.DefaultBranch,
+		}
+		job, err := runtime.enqueueRemoteStep(request, db.PipelineJobReview)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return request, job
+	}
+
+	completedRequest, completedJob := newRequest("feature/completed")
+	if execution, err := runtime.service.ProcessOne(context.Background(), db.PipelineJobReview); err != nil || execution == nil {
+		t.Fatalf("complete seeded job: execution=%+v err=%v", execution, err)
+	}
+	completedRequest.RecoveryJobID = completedJob.ID
+	result, err := runtime.ExecuteRemoteStep(context.Background(), completedRequest)
+	if err != nil || result.JobID != completedJob.ID || result.OutputHeadSHA != head {
+		t.Fatalf("completed recovery = %+v, err %v", result, err)
+	}
+
+	failedRequest, failedJob := newRequest("feature/failed")
+	lease, err := database.ClaimPipelineJob(db.PipelineJobReview, "failed-worker", time.Now(), time.Minute)
+	if err != nil || lease == nil || lease.ID != failedJob.ID {
+		t.Fatalf("claim failed-job fixture = %+v, err %v", lease, err)
+	}
+	if _, err := database.FailPipelineJob(db.PipelineJobFailure{
+		JobID: failedJob.ID, LeaseOwner: "failed-worker", LeaseFence: lease.LeaseFence,
+		DesiredHeadSHA: failedJob.DesiredHeadSHA, InputDigest: failedJob.InputDigest,
+		OwnerDecisionHead: failedJob.OwnerDecisionHead, DesiredGeneration: failedJob.DesiredGeneration,
+		ErrorCategory: "wrapper_failure", Retryable: false, FailedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	failedRequest.RecoveryJobID = failedJob.ID
+	if _, err := runtime.ExecuteRemoteStep(context.Background(), failedRequest); err == nil || !strings.Contains(err.Error(), "wrapper_failure") {
+		t.Fatalf("failed recovery error = %v", err)
+	}
 }
 
 func TestFakeAzureWorkerWrapperProcess(t *testing.T) {

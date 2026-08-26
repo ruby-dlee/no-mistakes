@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS step_rounds (
     selected_finding_ids TEXT,
     selection_source     TEXT,
     fix_summary          TEXT,
+    remote_job_id        TEXT,
     duration_ms          INTEGER NOT NULL,
     created_at           INTEGER NOT NULL
 );
@@ -401,6 +402,10 @@ var migrationStatements = []string{
 	`ALTER TABLE step_rounds ADD COLUMN trusted_config_sha TEXT`,
 	`ALTER TABLE step_rounds ADD COLUMN global_config_yaml BLOB`,
 	`ALTER TABLE step_rounds ADD COLUMN repo_config_yaml BLOB`,
+	`ALTER TABLE step_rounds ADD COLUMN remote_job_id TEXT`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_step_rounds_remote_job ON step_rounds(remote_job_id) WHERE remote_job_id IS NOT NULL`,
+	`DROP INDEX IF EXISTS idx_quality_outcomes_job`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_quality_outcomes_semantic_job ON quality_outcomes(job_id) WHERE job_id IS NOT NULL AND evidence_provenance = 'semantic_rereview'`,
 	`ALTER TABLE runs ADD COLUMN intent TEXT`,
 	`ALTER TABLE runs ADD COLUMN intent_source TEXT`,
 	`ALTER TABLE runs ADD COLUMN intent_session_id TEXT`,

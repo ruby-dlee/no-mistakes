@@ -196,6 +196,9 @@ type AzureWorkerConfig struct {
 	Enabled           bool
 	RunnerPath        string
 	ConfigPath        string
+	ReviewConcurrency int
+	RepairConcurrency int
+	TestConcurrency   int
 	LeaseDuration     time.Duration
 	HeartbeatInterval time.Duration
 	Timeout           time.Duration
@@ -205,6 +208,9 @@ type azureWorkerRaw struct {
 	Enabled           bool   `yaml:"enabled"`
 	RunnerPath        string `yaml:"runner_path"`
 	ConfigPath        string `yaml:"config_path"`
+	ReviewConcurrency *int   `yaml:"review_concurrency"`
+	RepairConcurrency *int   `yaml:"repair_concurrency"`
+	TestConcurrency   *int   `yaml:"test_concurrency"`
 	LeaseDuration     string `yaml:"lease_duration"`
 	HeartbeatInterval string `yaml:"heartbeat_interval"`
 	Timeout           string `yaml:"timeout"`
@@ -839,6 +845,9 @@ coordinator:
 #   enabled: true
 #   runner_path: /opt/firstmate/bin/fm-no-mistakes-worker
 #   config_path: /etc/firstmate/no-mistakes-worker.yaml
+#   review_concurrency: 1
+#   repair_concurrency: 1
+#   test_concurrency: 1
 #   lease_duration: 2m
 #   heartbeat_interval: 30s
 #   timeout: 30m
@@ -1636,6 +1645,9 @@ func DefaultGlobalConfig() *GlobalConfig {
 		Eval:                    evalDefaults(),
 		Coordinator:             coordinatorDefaults(),
 		AzureWorker: AzureWorkerConfig{
+			ReviewConcurrency: 1,
+			RepairConcurrency: 1,
+			TestConcurrency:   1,
 			LeaseDuration:     2 * time.Minute,
 			HeartbeatInterval: 30 * time.Second,
 			Timeout:           30 * time.Minute,
@@ -2008,6 +2020,15 @@ func parseAzureWorker(raw azureWorkerRaw, defaults AzureWorkerConfig) (AzureWork
 	cfg.Enabled = raw.Enabled
 	cfg.RunnerPath = strings.TrimSpace(raw.RunnerPath)
 	cfg.ConfigPath = strings.TrimSpace(raw.ConfigPath)
+	if raw.ReviewConcurrency != nil {
+		cfg.ReviewConcurrency = *raw.ReviewConcurrency
+	}
+	if raw.RepairConcurrency != nil {
+		cfg.RepairConcurrency = *raw.RepairConcurrency
+	}
+	if raw.TestConcurrency != nil {
+		cfg.TestConcurrency = *raw.TestConcurrency
+	}
 	parse := func(name, value string, current *time.Duration) error {
 		if value == "" {
 			return nil
@@ -2033,6 +2054,18 @@ func parseAzureWorker(raw azureWorkerRaw, defaults AzureWorkerConfig) (AzureWork
 	}
 	if !filepath.IsAbs(cfg.RunnerPath) || !filepath.IsAbs(cfg.ConfigPath) {
 		return AzureWorkerConfig{}, errors.New("parse azure_worker: enabled runner_path and config_path must be absolute")
+	}
+	for name, value := range map[string]int{
+		"review_concurrency": cfg.ReviewConcurrency,
+		"repair_concurrency": cfg.RepairConcurrency,
+		"test_concurrency":   cfg.TestConcurrency,
+	} {
+		if value < 1 || value > 16 {
+			return AzureWorkerConfig{}, fmt.Errorf("parse azure_worker.%s: must be between 1 and 16", name)
+		}
+	}
+	if cfg.ReviewConcurrency+cfg.RepairConcurrency+cfg.TestConcurrency > 16 {
+		return AzureWorkerConfig{}, errors.New("parse azure_worker: aggregate worker concurrency must not exceed 16")
 	}
 	if cfg.LeaseDuration < time.Minute || cfg.LeaseDuration > 24*time.Hour || cfg.LeaseDuration%time.Second != 0 {
 		return AzureWorkerConfig{}, errors.New("parse azure_worker.lease_duration: must be whole seconds between one minute and 24 hours")

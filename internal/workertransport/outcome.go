@@ -147,7 +147,15 @@ func derivedStepOutcomeFlags(outcome StepOutcomeEnvelope) (bool, bool, error) {
 	}
 	blocking := outcome.ExitCode != 0
 	for _, item := range items {
-		if item.Severity == types.FindingSeverityError || item.Severity == types.FindingSeverityWarning {
+		severity := types.NormalizeFindingSeverity(item.Severity)
+		if !types.IsKnownFindingSeverity(item.Severity) || item.Severity != severity {
+			return false, false, fmt.Errorf("worker step finding severity is unsupported: %q", item.Severity)
+		}
+		action := types.NormalizeFindingAction(item.Action)
+		if !types.IsKnownFindingAction(item.Action) || item.Action != action {
+			return false, false, fmt.Errorf("worker step finding action is unsupported: %q", item.Action)
+		}
+		if severity == types.FindingSeverityError || severity == types.FindingSeverityWarning {
 			blocking = true
 		}
 	}

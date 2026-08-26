@@ -44,3 +44,34 @@ func TestDecodeStepOutcomeRejectsInventedApprovalFlags(t *testing.T) {
 		t.Fatal("accepted approval flags unsupported by findings or exit code")
 	}
 }
+
+func TestDecodeStepOutcomeRejectsUnknownFindingVocabulary(t *testing.T) {
+	head := strings.Repeat("c", 40)
+	for name, tc := range map[string]struct {
+		finding       map[string]any
+		needsApproval bool
+	}{
+		"severity":              {finding: map[string]any{"severity": "critical", "description": "remote blocker", "action": "ask-user"}},
+		"action":                {finding: map[string]any{"severity": "warning", "description": "remote blocker", "action": "escalate"}, needsApproval: true},
+		"noncanonical_severity": {finding: map[string]any{"severity": "Warning", "description": "remote blocker", "action": "ask-user"}, needsApproval: true},
+		"noncanonical_action":   {finding: map[string]any{"severity": "warning", "description": "remote blocker", "action": "ASK-USER"}, needsApproval: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			findings, err := json.Marshal(map[string]any{
+				"findings": []map[string]any{tc.finding},
+				"summary":  "blocked",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			outcome := StepOutcomeEnvelope{
+				Schema: StepOutcomeSchema, Step: StepOutcomeReview, FindingsJSON: string(findings),
+				NeedsApproval: tc.needsApproval, AutoFixable: true, ReviewApprovedHeadSHA: head,
+			}
+			data, _ := json.Marshal(outcome)
+			if _, err := decodeStepOutcome(data, StepOutcomeReview, head); err == nil {
+				t.Fatalf("accepted unknown finding %s vocabulary", name)
+			}
+		})
+	}
+}

@@ -82,6 +82,18 @@ func (d *DB) InsertQualityOutcome(out QualityOutcome) (*QualityOutcome, error) {
 	if err := validateQualityOutcome(out); err != nil {
 		return nil, err
 	}
+	if out.JobID != nil && out.EvidenceProvenance == "semantic_rereview" {
+		existing, err := d.qualityOutcomeByJobID(*out.JobID)
+		if err == nil {
+			if sameQualityOutcome(existing, &out) {
+				return existing, nil
+			}
+			return nil, fmt.Errorf("quality outcome: remote job replay conflicts with durable evidence")
+		}
+		if err != sql.ErrNoRows {
+			return nil, fmt.Errorf("quality outcome: read remote job replay: %w", err)
+		}
+	}
 	if out.SupersedesID != nil {
 		var priorRun string
 		var priorRoot sql.NullString
@@ -105,9 +117,37 @@ func (d *DB) InsertQualityOutcome(out QualityOutcome) (*QualityOutcome, error) {
 		out.FixedHeadSHA, out.ObservedHeadSHA, out.EvidenceDigest, out.EvidenceProvenance,
 		out.SupersedesID, out.CreatedAt)
 	if err != nil {
+		if out.JobID != nil && out.EvidenceProvenance == "semantic_rereview" {
+			existing, loadErr := d.qualityOutcomeByJobID(*out.JobID)
+			if loadErr == nil && sameQualityOutcome(existing, &out) {
+				return existing, nil
+			}
+		}
 		return nil, fmt.Errorf("insert quality outcome: %w", err)
 	}
 	return &out, nil
+}
+
+func (d *DB) qualityOutcomeByJobID(jobID string) (*QualityOutcome, error) {
+	var out QualityOutcome
+	err := d.sql.QueryRow(`SELECT id, run_id, job_id, fix_attempt_id, root_id, classification,
+		fixed_head_sha, observed_head_sha, evidence_digest, evidence_provenance, supersedes_id, created_at
+		FROM quality_outcomes WHERE job_id = ? AND evidence_provenance = 'semantic_rereview'`, jobID).
+		Scan(&out.ID, &out.RunID, &out.JobID, &out.FixAttemptID, &out.RootID, &out.Classification,
+			&out.FixedHeadSHA, &out.ObservedHeadSHA, &out.EvidenceDigest, &out.EvidenceProvenance,
+			&out.SupersedesID, &out.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func sameQualityOutcome(a, b *QualityOutcome) bool {
+	return a != nil && b != nil && a.RunID == b.RunID && equalOptionalString(a.JobID, b.JobID) &&
+		equalOptionalString(a.FixAttemptID, b.FixAttemptID) && equalOptionalString(a.RootID, b.RootID) &&
+		a.Classification == b.Classification && a.FixedHeadSHA == b.FixedHeadSHA &&
+		a.ObservedHeadSHA == b.ObservedHeadSHA && a.EvidenceDigest == b.EvidenceDigest &&
+		a.EvidenceProvenance == b.EvidenceProvenance && equalOptionalString(a.SupersedesID, b.SupersedesID)
 }
 
 // GetQualityOutcomesByRun returns the immutable classification history in

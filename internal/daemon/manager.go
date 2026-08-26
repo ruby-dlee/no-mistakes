@@ -57,6 +57,7 @@ type RunManager struct {
 	steps            StepFactory
 	remoteSteps      pipeline.RemoteStepRunner
 	coordinatorRuns  map[string]coordinatorCleanupPlan
+	remoteRecoveries map[string]azureRemoteRecovery
 
 	branchLocks sync.Map // repoID+"/"+branch → *sync.Mutex
 
@@ -115,12 +116,22 @@ func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *Ru
 		dones:            make(map[string]chan struct{}),
 		pendingProtected: make(map[string]recoveredRunPlan),
 		coordinatorRuns:  make(map[string]coordinatorCleanupPlan),
+		remoteRecoveries: make(map[string]azureRemoteRecovery),
 		db:               database,
 		paths:            p,
 		steps:            stepFactory,
 		subscribers:      make(map[string][]*eventMailbox),
 		stateRevs:        make(map[string]int64),
 		completedRuns:    make(map[string]bool),
+	}
+}
+
+func (m *RunManager) setRemoteRecoveries(recoveries []azureRemoteRecovery) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.remoteRecoveries = make(map[string]azureRemoteRecovery, len(recoveries))
+	for _, recovery := range recoveries {
+		m.remoteRecoveries[recovery.job.RunID] = recovery
 	}
 }
 
@@ -147,6 +158,7 @@ type recoveredRunPlan struct {
 	agent                    agent.Agent
 	steps                    []pipeline.Step
 	ownerCheckpointChallenge *ownerdecision.Challenge
+	remoteRecovery           *azureRemoteRecovery
 }
 
 func (m *RunManager) recoverableParkedRuns(ctx context.Context) []recoveredRunPlan {
@@ -156,6 +168,12 @@ func (m *RunManager) recoverableParkedRuns(ctx context.Context) []recoveredRunPl
 		return nil
 	}
 	plans := make([]recoveredRunPlan, 0, len(runs))
+	m.mu.Lock()
+	remoteRecoveries := make(map[string]azureRemoteRecovery, len(m.remoteRecoveries))
+	for runID, recovery := range m.remoteRecoveries {
+		remoteRecoveries[runID] = recovery
+	}
+	m.mu.Unlock()
 	branchCounts := make(map[string]int, len(runs))
 	for _, run := range runs {
 		branchCounts[run.RepoID+"\x00"+run.Branch]++
@@ -165,7 +183,13 @@ func (m *RunManager) recoverableParkedRuns(ctx context.Context) []recoveredRunPl
 			slog.Warn("active run cannot be safely resumed", "run_id", run.ID, "error", "conflicting active run for branch")
 			continue
 		}
-		plan, err := m.prepareRecoveredRun(ctx, run)
+		var plan *recoveredRunPlan
+		var err error
+		if recovery, ok := remoteRecoveries[run.ID]; ok && run.AwaitingAgentSince == nil {
+			plan, err = m.prepareRecoveredRemoteRun(ctx, run, recovery)
+		} else {
+			plan, err = m.prepareRecoveredRun(ctx, run)
+		}
 		if err != nil {
 			slog.Warn("active run cannot be safely resumed", "run_id", run.ID, "error", err)
 			continue
@@ -179,6 +203,35 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	if run == nil || run.Status != types.RunRunning || run.AwaitingAgentSince == nil || run.Branch == "" {
 		return nil, fmt.Errorf("run is not a parked running run")
 	}
+	return m.prepareRecoveredRunIdentity(ctx, run, "", func(execSteps []pipeline.Step) error {
+		return pipeline.ValidateRecoveredRun(m.db, run, execSteps)
+	})
+}
+
+func (m *RunManager) prepareRecoveredRemoteRun(ctx context.Context, run *db.Run, recovery azureRemoteRecovery) (*recoveredRunPlan, error) {
+	if run == nil || recovery.job == nil || recovery.job.RunID != run.ID || run.AwaitingAgentSince != nil {
+		return nil, fmt.Errorf("run is not bound to one recoverable remote job")
+	}
+	alternateWorktreeHead := ""
+	if recovery.job.Kind == db.PipelineJobRepair && recovery.job.Status == db.PipelineJobCompleted && recovery.job.OutputHeadSHA != nil {
+		alternateWorktreeHead = *recovery.job.OutputHeadSHA
+	}
+	plan, err := m.prepareRecoveredRunIdentity(ctx, run, alternateWorktreeHead, func(execSteps []pipeline.Step) error {
+		return pipeline.ValidateRecoveredRemoteRun(m.db, run, execSteps, recovery.request)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if recovery.request.DefaultBranch != plan.repo.DefaultBranch {
+		_ = plan.agent.Close()
+		return nil, fmt.Errorf("remote recovery default branch binding changed")
+	}
+	recovery.request.WorkDir = plan.workDir
+	plan.remoteRecovery = &recovery
+	return plan, nil
+}
+
+func (m *RunManager) prepareRecoveredRunIdentity(ctx context.Context, run *db.Run, alternateWorktreeHead string, validate func([]pipeline.Step) error) (*recoveredRunPlan, error) {
 	authority, err := m.db.GetOwnerDecisionAuthority(run.ID)
 	if err != nil {
 		return nil, fmt.Errorf("read recovered owner-decision authority: %w", err)
@@ -200,7 +253,7 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 		return nil, fmt.Errorf("worktree is missing")
 	}
 	headSHA, err := git.HeadSHA(ctx, workDir)
-	if err != nil || headSHA != run.HeadSHA {
+	if err != nil || (headSHA != run.HeadSHA && (alternateWorktreeHead == "" || headSHA != alternateWorktreeHead)) {
 		return nil, fmt.Errorf("worktree head does not match run head")
 	}
 	gateDir := m.paths.RepoDir(repo.ID)
@@ -213,7 +266,7 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	}
 
 	execSteps := m.steps()
-	if err := pipeline.ValidateRecoveredRun(m.db, run, execSteps); err != nil {
+	if err := validate(execSteps); err != nil {
 		return nil, err
 	}
 	cfg, err := m.loadRecoveredConfig(ctx, run, repo, workDir)
@@ -379,6 +432,16 @@ func (m *RunManager) resumeRecoveredRuns(plans []recoveredRunPlan) {
 			slog.Info("protected recovered run is waiting for a signed history checkpoint", "run_id", plan.run.ID)
 			continue
 		}
+		if plan.remoteRecovery != nil {
+			if err := m.resumeRecoveredRunArmed(plan, ""); err != nil {
+				reason := "unprotected remote run could not reattach after daemon restart"
+				if failErr := m.db.FailUnboundRecoveredRun(plan.run.ID, plan.run.HeadSHA, reason); failErr != nil {
+					slog.Error("failed to terminalize unattachable remote run", "run_id", plan.run.ID, "error", failErr)
+				}
+				_ = plan.agent.Close()
+			}
+			continue
+		}
 		// After a restart, total deletion of a protected run's local authority
 		// row is indistinguishable from a historical legacy run. Auto-resuming
 		// either would create a same-UID downgrade path. Legacy/unbound parked
@@ -458,20 +521,26 @@ func (m *RunManager) resumeRecoveredRunArmed(plan recoveredRunPlan, expectedOwne
 			m.mu.Unlock()
 		}()
 
-		if err := executor.Resume(runCtx, plan.run, plan.repo, plan.workDir); errors.Is(err, pipeline.ErrPipelineDeferred) {
+		var executeErr error
+		if plan.remoteRecovery != nil {
+			executeErr = executor.ResumeRemote(runCtx, plan.run, plan.repo, plan.workDir, plan.remoteRecovery.request)
+		} else {
+			executeErr = executor.Resume(runCtx, plan.run, plan.repo, plan.workDir)
+		}
+		if errors.Is(executeErr, pipeline.ErrPipelineDeferred) {
 			coordinatorDeferred = true
 			slog.Info("recovered pipeline CI custody transferred to coordinator", "run_id", plan.run.ID)
 			return
-		} else if err != nil {
+		} else if executeErr != nil {
 			if plan.run.Status == types.RunRunning {
-				errMsg := err.Error()
+				errMsg := executeErr.Error()
 				plan.run.Status = types.RunFailed
 				plan.run.Error = &errMsg
 				if dbErr := m.db.UpdateRunErrorStatus(plan.run.ID, errMsg, types.RunFailed); dbErr != nil {
 					slog.Error("failed to mark recovered run failed", "run_id", plan.run.ID, "error", dbErr)
 				}
 			}
-			slog.Error("recovered pipeline failed", "run_id", plan.run.ID, "error", err)
+			slog.Error("recovered pipeline failed", "run_id", plan.run.ID, "error", executeErr)
 		}
 		fields := telemetry.Fields{
 			"action":      "finished",

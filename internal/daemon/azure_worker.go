@@ -20,14 +20,20 @@ import (
 )
 
 type azureWorkerRuntime struct {
-	database *db.DB
-	store    *workertransport.DurableStore
-	service  *workertransport.Service
-	wake     map[db.PipelineJobKind]chan struct{}
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	start    sync.Once
-	close    sync.Once
+	database    *db.DB
+	store       *workertransport.DurableStore
+	service     *workertransport.Service
+	wake        map[db.PipelineJobKind]chan struct{}
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	start       sync.Once
+	close       sync.Once
+	concurrency map[db.PipelineJobKind]int
+}
+
+type azureRemoteRecovery struct {
+	job     *db.PipelineJob
+	request pipeline.RemoteStepRequest
 }
 
 func newAzureWorkerRuntime(cfg config.AzureWorkerConfig, database *db.DB, p *paths.Paths) (*azureWorkerRuntime, error) {
@@ -51,8 +57,25 @@ func newAzureWorkerRuntime(cfg config.AzureWorkerConfig, database *db.DB, p *pat
 	if err != nil {
 		return nil, err
 	}
+	reviewConcurrency := cfg.ReviewConcurrency
+	repairConcurrency := cfg.RepairConcurrency
+	testConcurrency := cfg.TestConcurrency
+	if reviewConcurrency == 0 {
+		reviewConcurrency = 1
+	}
+	if repairConcurrency == 0 {
+		repairConcurrency = 1
+	}
+	if testConcurrency == 0 {
+		testConcurrency = 1
+	}
 	return &azureWorkerRuntime{
 		database: database, store: store, service: service,
+		concurrency: map[db.PipelineJobKind]int{
+			db.PipelineJobReview: reviewConcurrency,
+			db.PipelineJobRepair: repairConcurrency,
+			db.PipelineJobTest:   testConcurrency,
+		},
 		wake: map[db.PipelineJobKind]chan struct{}{
 			db.PipelineJobReview: make(chan struct{}, 1),
 			db.PipelineJobRepair: make(chan struct{}, 1),
@@ -74,8 +97,10 @@ func (r *azureWorkerRuntime) Start(parent context.Context) {
 			slog.Info("Azure worker recovered expired leases", "count", count)
 		}
 		for _, kind := range []db.PipelineJobKind{db.PipelineJobReview, db.PipelineJobRepair, db.PipelineJobTest} {
-			r.wg.Add(1)
-			go r.workerLoop(ctx, kind)
+			for index := 0; index < r.concurrency[kind]; index++ {
+				r.wg.Add(1)
+				go r.workerLoop(ctx, kind)
+			}
 		}
 	})
 }
@@ -129,6 +154,104 @@ func (r *azureWorkerRuntime) ExecuteRemoteStep(ctx context.Context, request pipe
 	if request.Fixing {
 		kind = db.PipelineJobRepair
 	}
+	var job *db.PipelineJob
+	if request.RecoveryJobID != "" {
+		var err error
+		job, err = r.database.GetPipelineJob(request.RecoveryJobID)
+		if err != nil {
+			return nil, err
+		}
+		if job == nil {
+			return nil, errors.New("recovered Azure worker job disappeared")
+		}
+		inputBytes, err := r.store.InputFor(ctx, job)
+		if err != nil {
+			return nil, fmt.Errorf("read recovered Azure worker input: %w", err)
+		}
+		input, err := workertransport.DecodeStepInput(inputBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decode recovered Azure worker input: %w", err)
+		}
+		if err := validateAzureRecoveryBinding(job, input, request); err != nil {
+			return nil, err
+		}
+	} else {
+		var err error
+		job, err = r.enqueueRemoteStep(request, kind)
+		if err != nil {
+			return nil, err
+		}
+	}
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		current, err := r.database.GetPipelineJob(job.ID)
+		if err != nil {
+			return nil, err
+		}
+		if current == nil {
+			return nil, errors.New("Azure worker job disappeared")
+		}
+		switch current.Status {
+		case db.PipelineJobCompleted:
+			result, err := r.store.ReadResult(current)
+			if err != nil {
+				return nil, fmt.Errorf("read completed Azure worker result: %w", err)
+			}
+			qualityExpected := request.QualityOutcomeAuthority == "semantic-rereview" && request.Fixing && request.Step == types.StepReview
+			if qualityExpected != (result.StepOutcome.QualityOutcome != nil) {
+				return nil, errors.New("completed Azure worker result has mismatched semantic quality authority")
+			}
+			var qualityOutcome *db.QualityOutcome
+			if result.StepOutcome.QualityOutcome != nil {
+				quality := result.StepOutcome.QualityOutcome
+				fixAttemptID := quality.FixAttemptID
+				var rootID *string
+				if quality.RootID != "" {
+					root := quality.RootID
+					rootID = &root
+				}
+				jobID := current.ID
+				qualityOutcome = &db.QualityOutcome{
+					RunID: request.RunID, JobID: &jobID, FixAttemptID: &fixAttemptID, RootID: rootID,
+					Classification: db.QualityClassification(quality.Classification),
+					FixedHeadSHA:   quality.FixedHeadSHA, ObservedHeadSHA: quality.ObservedHeadSHA,
+					EvidenceDigest: quality.EvidenceDigest, EvidenceProvenance: quality.EvidenceProvenance,
+				}
+			}
+			return &pipeline.RemoteStepExecution{
+				JobID: current.ID,
+				Outcome: pipeline.StepOutcome{
+					NeedsApproval:         result.StepOutcome.NeedsApproval,
+					AutoFixable:           result.StepOutcome.AutoFixable,
+					Findings:              result.StepOutcome.FindingsJSON,
+					ExitCode:              result.StepOutcome.ExitCode,
+					FixSummary:            result.StepOutcome.FixSummary,
+					ReviewApprovedHeadSHA: result.StepOutcome.ReviewApprovedHeadSHA,
+					Skipped:               result.StepOutcome.Skipped,
+					SkipRemaining:         result.StepOutcome.SkipRemaining,
+				},
+				OutputHeadSHA: result.OutputHeadSHA, ReturnedBranch: result.ReturnedBranch,
+				QualityOutcome: qualityOutcome,
+			}, nil
+		case db.PipelineJobFailed:
+			category := "unknown"
+			if current.ErrorCategory != nil {
+				category = *current.ErrorCategory
+			}
+			return nil, fmt.Errorf("Azure worker job failed closed: %s", category)
+		case db.PipelineJobSuperseded:
+			return nil, errors.New("Azure worker job was superseded by newer exact state")
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (r *azureWorkerRuntime) enqueueRemoteStep(request pipeline.RemoteStepRequest, kind db.PipelineJobKind) (*db.PipelineJob, error) {
 	inputBytes, err := json.Marshal(workertransport.StepInputEnvelope{
 		Schema: workertransport.StepInputSchema, RunID: request.RunID, RepoID: request.RepoID,
 		StepResultID: request.StepResultID, Step: request.Step, Round: request.Round,
@@ -173,70 +296,88 @@ func (r *azureWorkerRuntime) ExecuteRemoteStep(ctx context.Context, request pipe
 	case r.wake[kind] <- struct{}{}:
 	default:
 	}
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		current, err := r.database.GetPipelineJob(job.ID)
-		if err != nil {
-			return nil, err
-		}
-		if current == nil {
-			return nil, errors.New("Azure worker job disappeared")
-		}
-		switch current.Status {
-		case db.PipelineJobCompleted:
-			result, err := r.store.ReadResult(current)
-			if err != nil {
-				return nil, fmt.Errorf("read completed Azure worker result: %w", err)
-			}
-			qualityExpected := request.QualityOutcomeAuthority == "semantic-rereview" && request.Fixing && request.Step == types.StepReview
-			if qualityExpected != (result.StepOutcome.QualityOutcome != nil) {
-				return nil, errors.New("completed Azure worker result has mismatched semantic quality authority")
-			}
-			var qualityOutcome *db.QualityOutcome
-			if result.StepOutcome.QualityOutcome != nil {
-				quality := result.StepOutcome.QualityOutcome
-				fixAttemptID := quality.FixAttemptID
-				var rootID *string
-				if quality.RootID != "" {
-					root := quality.RootID
-					rootID = &root
-				}
-				jobID := current.ID
-				qualityOutcome = &db.QualityOutcome{
-					RunID: request.RunID, JobID: &jobID, FixAttemptID: &fixAttemptID, RootID: rootID,
-					Classification: db.QualityClassification(quality.Classification),
-					FixedHeadSHA:   quality.FixedHeadSHA, ObservedHeadSHA: quality.ObservedHeadSHA,
-					EvidenceDigest: quality.EvidenceDigest, EvidenceProvenance: quality.EvidenceProvenance,
-				}
-			}
-			return &pipeline.RemoteStepExecution{
-				Outcome: pipeline.StepOutcome{
-					NeedsApproval:         result.StepOutcome.NeedsApproval,
-					AutoFixable:           result.StepOutcome.AutoFixable,
-					Findings:              result.StepOutcome.FindingsJSON,
-					ExitCode:              result.StepOutcome.ExitCode,
-					FixSummary:            result.StepOutcome.FixSummary,
-					ReviewApprovedHeadSHA: result.StepOutcome.ReviewApprovedHeadSHA,
-					Skipped:               result.StepOutcome.Skipped,
-					SkipRemaining:         result.StepOutcome.SkipRemaining,
-				},
-				OutputHeadSHA: result.OutputHeadSHA, ReturnedBranch: result.ReturnedBranch,
-				QualityOutcome: qualityOutcome,
-			}, nil
-		case db.PipelineJobFailed:
-			category := "unknown"
-			if current.ErrorCategory != nil {
-				category = *current.ErrorCategory
-			}
-			return nil, fmt.Errorf("Azure worker job failed closed: %s", category)
-		case db.PipelineJobSuperseded:
-			return nil, errors.New("Azure worker job was superseded by newer exact state")
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-ticker.C:
-		}
+	return job, nil
+}
+
+func validateAzureRecoveryBinding(job *db.PipelineJob, input workertransport.StepInputEnvelope, request pipeline.RemoteStepRequest) error {
+	wantKind := db.PipelineJobReview
+	if input.Step == types.StepTest {
+		wantKind = db.PipelineJobTest
+	} else if input.Fixing {
+		wantKind = db.PipelineJobRepair
 	}
+	if job.ID != request.RecoveryJobID || job.Kind != wantKind || job.RunID != input.RunID ||
+		job.StepResultID != input.StepResultID || job.Round != input.Round || job.DesiredHeadSHA != input.DesiredHeadSHA {
+		return errors.New("recovered Azure worker job and durable input binding changed")
+	}
+	if request.RunID != input.RunID || request.RepoID != input.RepoID || request.StepResultID != input.StepResultID ||
+		request.Step != input.Step || request.Round != input.Round || request.DesiredHeadSHA != input.DesiredHeadSHA ||
+		request.BaseSHA != input.BaseSHA || request.Branch != input.Branch || request.DefaultBranch != input.DefaultBranch ||
+		request.Fixing != input.Fixing || request.PreviousFindings != input.PreviousFindings ||
+		request.UserIntent != input.UserIntent || request.UserIntentSource != input.UserIntentSource ||
+		request.PriorRoundHistory != input.PriorRoundHistory || request.UncertifiedRoundHistory != input.UncertifiedRoundHistory ||
+		request.RepairAttempt != input.RepairAttempt || request.QualityOutcomeAuthority != input.QualityOutcomeAuthority {
+		return errors.New("recovered Azure worker request does not match its durable input")
+	}
+	return nil
+}
+
+func (r *azureWorkerRuntime) recoverableRemoteSteps(ctx context.Context) ([]azureRemoteRecovery, error) {
+	jobs, err := r.database.RecoverablePipelineJobs()
+	if err != nil {
+		return nil, err
+	}
+	byRun := make(map[string]azureRemoteRecovery, len(jobs))
+	duplicates := make(map[string]bool)
+	for _, job := range jobs {
+		data, readErr := r.store.InputFor(ctx, job)
+		if readErr != nil {
+			slog.Warn("discarding unrecoverable Azure worker custody", "run_id", job.RunID, "job_id", job.ID, "error", readErr)
+			continue
+		}
+		input, decodeErr := workertransport.DecodeStepInput(data)
+		if decodeErr != nil {
+			slog.Warn("discarding malformed Azure worker recovery input", "run_id", job.RunID, "job_id", job.ID, "error", decodeErr)
+			continue
+		}
+		if input.RuntimeIdentity != r.service.RuntimeIdentity() {
+			slog.Warn("discarding Azure worker recovery from a different runtime revision", "run_id", job.RunID, "job_id", job.ID)
+			continue
+		}
+		request := pipeline.RemoteStepRequest{
+			RunID: input.RunID, RepoID: input.RepoID, StepResultID: input.StepResultID,
+			Step: input.Step, Round: input.Round, DesiredHeadSHA: input.DesiredHeadSHA,
+			BaseSHA: input.BaseSHA, Branch: input.Branch, DefaultBranch: input.DefaultBranch,
+			Fixing: input.Fixing, PreviousFindings: input.PreviousFindings,
+			UserIntent: input.UserIntent, UserIntentSource: input.UserIntentSource,
+			PriorRoundHistory: input.PriorRoundHistory, UncertifiedRoundHistory: input.UncertifiedRoundHistory,
+			RepairAttempt: input.RepairAttempt, QualityOutcomeAuthority: input.QualityOutcomeAuthority,
+			RecoveryJobID: job.ID,
+		}
+		run, runErr := r.database.GetRun(job.RunID)
+		if runErr != nil || run == nil {
+			slog.Warn("discarding Azure worker recovery without a running run", "run_id", job.RunID, "job_id", job.ID, "error", runErr)
+			continue
+		}
+		if job.Kind == db.PipelineJobRepair && job.Status == db.PipelineJobCompleted && job.OutputHeadSHA != nil && run.HeadSHA == *job.OutputHeadSHA {
+			request.RecoveryAdoptedHeadSHA = *job.OutputHeadSHA
+		}
+		if err := validateAzureRecoveryBinding(job, input, request); err != nil {
+			slog.Warn("discarding inexact Azure worker recovery", "run_id", job.RunID, "job_id", job.ID, "error", err)
+			continue
+		}
+		if _, exists := byRun[job.RunID]; exists {
+			duplicates[job.RunID] = true
+		}
+		byRun[job.RunID] = azureRemoteRecovery{job: job, request: request}
+	}
+	result := make([]azureRemoteRecovery, 0, len(byRun))
+	for runID, recovery := range byRun {
+		if duplicates[runID] {
+			slog.Warn("discarding ambiguous Azure worker recovery", "run_id", runID)
+			continue
+		}
+		result = append(result, recovery)
+	}
+	return result, nil
 }

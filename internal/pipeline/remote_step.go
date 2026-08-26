@@ -33,6 +33,11 @@ type RemoteStepRequest struct {
 	UncertifiedRoundHistory string
 	RepairAttempt           int
 	QualityOutcomeAuthority string
+	// RecoveryJobID reattaches one exact durable worker job after controller
+	// restart. RecoveryAdoptedHeadSHA is set only when a completed repair was
+	// already fast-forwarded and durably recorded before the process stopped.
+	RecoveryJobID          string
+	RecoveryAdoptedHeadSHA string
 }
 
 type RemoteStepContext struct {
@@ -47,6 +52,7 @@ type RemoteStepContextProvider interface {
 }
 
 type RemoteStepExecution struct {
+	JobID          string
 	Outcome        StepOutcome
 	OutputHeadSHA  string
 	ReturnedBranch string
@@ -81,11 +87,16 @@ func (e *Executor) executeRemoteStep(ctx context.Context, request RemoteStepRequ
 		if execution.OutputHeadSHA != request.DesiredHeadSHA || execution.ReturnedBranch != "" {
 			return nil, errors.New("read-only remote step changed the exact head")
 		}
+		execution.Outcome.RemoteJobID = execution.JobID
 		return &execution.Outcome, nil
 	}
 	qualityExpected := request.Step == types.StepReview && request.QualityOutcomeAuthority == "semantic-rereview"
 	if qualityExpected != (execution.QualityOutcome != nil) {
 		return nil, errors.New("remote repair quality outcome authority mismatch")
+	}
+	if request.RecoveryAdoptedHeadSHA != "" &&
+		(execution.OutputHeadSHA != request.RecoveryAdoptedHeadSHA || *runHead != request.RecoveryAdoptedHeadSHA) {
+		return nil, errors.New("recovered remote repair does not match its already-adopted head")
 	}
 	if err := e.adoptRemoteRepair(ctx, request, execution, runHead); err != nil {
 		return nil, err
@@ -97,6 +108,7 @@ func (e *Executor) executeRemoteStep(ctx context.Context, request RemoteStepRequ
 			return nil, fmt.Errorf("record remote semantic quality outcome after retaining adopted repair custody: %w", err)
 		}
 	}
+	execution.Outcome.RemoteJobID = execution.JobID
 	return &execution.Outcome, nil
 }
 
@@ -105,30 +117,44 @@ func (e *Executor) adoptRemoteRepair(ctx context.Context, request RemoteStepRequ
 		!strings.HasPrefix(execution.ReturnedBranch, "no-mistakes/azure-results/") {
 		return errors.New("remote repair is missing a new exact head or controller-owned result branch")
 	}
-	if err := exactCleanRemoteHead(ctx, request.WorkDir, request.DesiredHeadSHA); err != nil {
+	worktreeHead, err := gitx.Run(ctx, request.WorkDir, "rev-parse", "HEAD")
+	if err != nil {
 		return err
 	}
-	branchHead, err := gitx.Run(ctx, request.WorkDir, "rev-parse", execution.ReturnedBranch+"^{commit}")
-	if err != nil || branchHead != execution.OutputHeadSHA {
-		return errors.New("remote repair branch does not resolve to its declared output head")
+	if worktreeHead != request.DesiredHeadSHA && worktreeHead != execution.OutputHeadSHA {
+		return errors.New("remote repair worktree is at neither the input nor output head")
+	}
+	if *runHead != request.DesiredHeadSHA && *runHead != execution.OutputHeadSHA {
+		return errors.New("remote repair run is at neither the input nor output head")
+	}
+	if err := exactCleanRemoteHead(ctx, request.WorkDir, worktreeHead); err != nil {
+		return err
 	}
 	if _, err := gitx.Run(ctx, request.WorkDir, "merge-base", "--is-ancestor", request.DesiredHeadSHA, execution.OutputHeadSHA); err != nil {
 		return errors.New("remote repair output is not a descendant of the exact input head")
 	}
-	if _, err := gitx.Run(ctx, request.WorkDir, "merge", "--ff-only", "--no-edit", execution.ReturnedBranch); err != nil {
-		return fmt.Errorf("fast-forward remote repair: %w", err)
+	if worktreeHead != execution.OutputHeadSHA {
+		branchHead, err := gitx.Run(ctx, request.WorkDir, "rev-parse", execution.ReturnedBranch+"^{commit}")
+		if err != nil || branchHead != execution.OutputHeadSHA {
+			return errors.New("remote repair branch does not resolve to its declared output head")
+		}
+		if _, err := gitx.Run(ctx, request.WorkDir, "merge", "--ff-only", "--no-edit", execution.ReturnedBranch); err != nil {
+			return fmt.Errorf("fast-forward remote repair: %w", err)
+		}
 	}
 	if err := exactCleanRemoteHead(ctx, request.WorkDir, execution.OutputHeadSHA); err != nil {
 		return fmt.Errorf("verify adopted remote repair; retained forward custody without reverse worktree mutation: %w", err)
 	}
-	updated, err := e.db.AdvanceRunHeadSHA(request.RunID, request.DesiredHeadSHA, execution.OutputHeadSHA)
-	if err != nil || !updated {
-		if err != nil {
-			return fmt.Errorf("record adopted remote repair; retained forward custody without reverse worktree mutation: %w", err)
+	if *runHead != execution.OutputHeadSHA {
+		updated, err := e.db.AdvanceRunHeadSHA(request.RunID, request.DesiredHeadSHA, execution.OutputHeadSHA)
+		if err != nil || !updated {
+			if err != nil {
+				return fmt.Errorf("record adopted remote repair; retained forward custody without reverse worktree mutation: %w", err)
+			}
+			return errors.New("record adopted remote repair: run head binding is stale; retained forward custody without reverse worktree mutation")
 		}
-		return errors.New("record adopted remote repair: run head binding is stale; retained forward custody without reverse worktree mutation")
+		*runHead = execution.OutputHeadSHA
 	}
-	*runHead = execution.OutputHeadSHA
 	_, _ = gitx.Run(context.Background(), request.WorkDir, "update-ref", "-d", "refs/heads/"+execution.ReturnedBranch, execution.OutputHeadSHA)
 	return nil
 }

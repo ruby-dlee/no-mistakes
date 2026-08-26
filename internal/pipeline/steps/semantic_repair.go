@@ -279,6 +279,10 @@ func validateGeneratedArtifactDiff(ctx context.Context, workDir, startingHead, f
 		return fmt.Errorf("inspect generated-artifact diff: %w", err)
 	}
 	changed := strings.Split(strings.TrimSuffix(out, "\x00"), "\x00")
+	declaredGenerated, err := declaredGeneratedArtifactPaths(ctx, workDir, startingHead, fixedHead, changed)
+	if err != nil {
+		return fmt.Errorf("inspect generated-artifact ownership: %w", err)
+	}
 	generated := 0
 	sources := 0
 	for _, path := range changed {
@@ -286,9 +290,9 @@ func validateGeneratedArtifactDiff(ctx context.Context, workDir, startingHead, f
 		if path == "" {
 			continue
 		}
-		if isGeneratedArtifactPath(path) {
+		if isGeneratedArtifactPath(path) || declaredGenerated[path] {
 			generated++
-		} else {
+		} else if path != ".gitattributes" && !strings.HasSuffix(path, "/.gitattributes") {
 			sources++
 		}
 	}
@@ -307,6 +311,42 @@ func validateGeneratedArtifactDiff(ctx context.Context, workDir, startingHead, f
 		return fmt.Errorf("generated artifacts changed without any changed authoritative source path")
 	}
 	return nil
+}
+
+func declaredGeneratedArtifactPaths(ctx context.Context, workDir, startingHead, fixedHead string, paths []string) (map[string]bool, error) {
+	declared := make(map[string]bool)
+	normalized := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if path = normalizeSemanticPath(path); path != "" {
+			normalized = append(normalized, path)
+		}
+	}
+	const batchSize = 128
+	for _, tree := range []string{startingHead, fixedHead} {
+		for start := 0; start < len(normalized); start += batchSize {
+			end := min(start+batchSize, len(normalized))
+			args := []string{"check-attr", "-z", "--source=" + tree, "linguist-generated", "linguist-vendored", "generated", "vendored", "--"}
+			args = append(args, normalized[start:end]...)
+			out, err := git.Run(ctx, workDir, args...)
+			if err != nil {
+				return nil, err
+			}
+			fields := strings.Split(strings.TrimSuffix(out, "\x00"), "\x00")
+			if len(fields) == 1 && fields[0] == "" {
+				continue
+			}
+			if len(fields)%3 != 0 {
+				return nil, fmt.Errorf("git check-attr returned a malformed record")
+			}
+			for i := 0; i < len(fields); i += 3 {
+				value := strings.ToLower(strings.TrimSpace(fields[i+2]))
+				if value == "set" || value == "true" || value == "yes" || value == "1" {
+					declared[normalizeSemanticPath(fields[i])] = true
+				}
+			}
+		}
+	}
+	return declared, nil
 }
 
 func isGeneratedArtifactPath(path string) bool {

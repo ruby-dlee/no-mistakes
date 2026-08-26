@@ -171,6 +171,9 @@ type StepOutcome struct {
 	// round. The executor durably records it only when the review step actually
 	// completes, never while that outcome is parked or after a failed round.
 	ReviewApprovedHeadSHA string
+	// RemoteJobID is controller-supplied replay identity for a remotely
+	// executed round. Guest outcomes cannot set it.
+	RemoteJobID string
 
 	// DurationOverrideMS, when positive, replaces the wall-clock duration
 	// reported for this step. Used by demo mode to show realistic durations
