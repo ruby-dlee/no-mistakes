@@ -118,6 +118,34 @@ func TestRunSessions_RoleReusesOneSession(t *testing.T) {
 	}
 }
 
+func TestRunSessions_ResetDropsPersistedIdentityAndStartsFresh(t *testing.T) {
+	d, run := sessionTestDB(t)
+	fake := newFakeSessionAgent()
+	rs := NewRunSessions(d, run.ID, fake, true)
+
+	if _, err := rs.Run(context.Background(), fake, SessionRoleFixer, agent.RunOpts{Prompt: "first repair"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	rs.Reset(SessionRoleFixer)
+	stored, err := d.GetRunAgentSessions(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 0 {
+		t.Fatalf("reset retained persisted session identity: %+v", stored)
+	}
+	if _, err := rs.Run(context.Background(), fake, SessionRoleFixer, agent.RunOpts{Prompt: "fresh repair"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	last := fake.calls[len(fake.calls)-1]
+	if last.session == nil || last.session.ID != "" {
+		t.Fatalf("post-reset repair resumed stale identity: %+v", last.session)
+	}
+	if fake.nextID != 2 {
+		t.Fatalf("post-reset repair did not mint a fresh identity; nextID=%d", fake.nextID)
+	}
+}
+
 // TestRunSessions_RolesKeepDistinctSessions proves two roles interleaved on
 // one RunSessions never exchange identities, in both directions. Legacy
 // "reviewer" rows can still coexist with fixer rows on recovered runs, so

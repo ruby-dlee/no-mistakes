@@ -26,6 +26,9 @@ type fixExecutionOptions struct {
 	FallbackSummary         string
 	AfterAgentRun           func(*agent.Result) error
 	AgentContext            context.Context
+	// JSONSchema overrides the summary-only response contract for a repair role
+	// that needs additional structured evidence. Empty keeps the shared default.
+	JSONSchema json.RawMessage
 	// SessionRole, when set, runs the fix turn in that durable review-loop
 	// session (the review step's fixer role). Steps outside the review loop
 	// leave it empty and stay session-isolated.
@@ -264,10 +267,14 @@ func executeFixMode(sctx *pipeline.StepContext, stepName types.StepName, opts fi
 	if purpose == "" {
 		purpose = string(stepName) + "-fix"
 	}
+	responseSchema := opts.JSONSchema
+	if len(responseSchema) == 0 {
+		responseSchema = commitSummarySchema
+	}
 	runOpts := agent.RunOpts{
 		Prompt:     opts.Prompt,
 		CWD:        sctx.WorkDir,
-		JSONSchema: commitSummarySchema,
+		JSONSchema: responseSchema,
 		OnChunk:    sctx.LogChunk,
 		Purpose:    purpose,
 		Workload:   opts.Workload,

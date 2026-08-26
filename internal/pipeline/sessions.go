@@ -138,6 +138,17 @@ func (rs *RunSessions) remember(role SessionRole, sessionID, provider string) {
 	}
 }
 
+// Reset removes a role's in-memory and persisted session identity so its next
+// turn starts independently. Review uses this before a second semantic repair:
+// continuing the fixer context that failed rereview would preserve the failed
+// diagnosis instead of escalating it.
+func (rs *RunSessions) Reset(role SessionRole) {
+	if rs == nil {
+		return
+	}
+	rs.forget(role)
+}
+
 func sessionProvider(a agent.Agent, result *agent.Result) string {
 	if result != nil && result.Provider != "" {
 		return result.Provider

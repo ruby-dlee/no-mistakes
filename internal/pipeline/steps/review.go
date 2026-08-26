@@ -10,7 +10,6 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
-	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/testguidance"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -63,6 +62,12 @@ func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 	// review/fix efficiency can be normalized without external git archaeology.
 	// Best-effort: a diff-stat failure leaves the workload unknown.
 	workload := reviewWorkload(ctx, sctx.WorkDir, baseSHA, sctx.Run.HeadSHA)
+	repairAttempt := 0
+	if sctx.Fixing {
+		repairAttempt = reviewRepairAttempt(sctx)
+	}
+	var repairEvidence semanticRepairEvidence
+	repairExecuted := false
 
 	// In fix mode, ask the agent to fix issues first.
 	//
@@ -84,8 +89,19 @@ func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 	var fixSummary string
 	if sctx.Fixing && !sctx.SkipFixExecution {
 		startReviewTimeout()
+		if repairAttempt > 1 && sctx.Sessions != nil {
+			sctx.Sessions.Reset(pipeline.SessionRoleFixer)
+			sctx.Log(fmt.Sprintf("reset fixer session before semantic repair attempt %d", repairAttempt))
+		}
+		fixerChanged, err := reviewChangedPaths(ctx, sctx, baseSHA)
+		if err != nil {
+			return nil, err
+		}
+		fixerPathInstructionMatches := matchPathInstructions(fixerChanged, sctx.Config.Review.PathInstructions)
+		logPathInstructions(sctx.Log, fixerPathInstructionMatches)
+		fixerPathInstructions := reviewPathInstructionsSection(fixerPathInstructionMatches)
 		previousFindings := sanitizedPreviousFindingsForPrompt(sctx.PreviousFindings)
-		historySection := executionContextPromptSection() + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx) + testguidance.Rule
+		historySection := executionContextPromptSection() + roundHistoryPromptSection(sctx) + uncertifiedRoundHistoryPromptSection(sctx) + userIntentPromptSection(sctx) + testguidance.Rule + semanticRepairContract + semanticRepairEscalationSection(repairAttempt) + fixerPathInstructions
 		fixPrompt := fmt.Sprintf(
 			`Investigate previous review findings and address legitimate ones.
 
@@ -106,9 +122,9 @@ Rules:
 - Avoid resolving a finding by removing or reverting the author's intentional code in their original 1st commit. If the original change introduced something on purpose, fix it forward (e.g. add validation, handle edge cases, tighten logic) rather than deleting it. Similarly, if the original change intentionally deleted or simplified code, do not restore or re-add the removed code unless the finding is a legitimate correctness, reliability, or security issue and the smallest reasonable fix happens to reintroduce a small amount of previously deleted logic. When in doubt about whether code is intentional, leave it and report the finding as unresolved.
 - Do not add code comments explaining your fixes.
 - Apply all the fixes you intend to make first; do not run any verification in between individual fixes.
-- After all fixes are applied, run one focused verification limited to the changed area (the specific package, file, or test you touched) at the end of the fix round to confirm the fixes hold.
+- After all fixes are applied, run one bounded verification set limited to the changed area at the end of the fix round: the public/executable regression plus the relevant integration or consumer compatibility check.
 - Do NOT run the complete repository test suite or lint suite during this fix round. The pipeline has dedicated test and lint steps after review that are the authoritative test and lint gates; their coverage may itself be focused on the changed area when the repository has no configured test or lint commands.
-- Return JSON with a single "summary" field when you are done.
+- Return the structured semantic-repair proof required below when you are done.
 - The summary must be one concise sentence fragment suitable for a git commit subject.
 - Keep the summary under 10 words.%s
 
@@ -123,6 +139,7 @@ Previous review findings to address:
 			historySection,
 			previousFindings,
 		)
+		var evidence semanticRepairEvidence
 		summary, err := executeFixMode(sctx, s.Name(), fixExecutionOptions{
 			RequirePreviousFindings: true,
 			MissingFindingsError:    "review fix requires previous review findings",
@@ -130,14 +147,25 @@ Previous review findings to address:
 			Prompt:                  fixPrompt,
 			ErrorPrefix:             "agent fix",
 			FallbackSummary:         "address review findings",
-			SessionRole:             pipeline.SessionRoleFixer,
-			Purpose:                 "review-fix",
-			Workload:                workload,
+			JSONSchema:              semanticRepairSchema,
+			AfterAgentRun: func(result *agent.Result) error {
+				parsed, parseErr := parseSemanticRepairEvidence(result)
+				if parseErr != nil {
+					return parseErr
+				}
+				evidence = parsed
+				return nil
+			},
+			SessionRole: pipeline.SessionRoleFixer,
+			Purpose:     "review-fix",
+			Workload:    workload,
 		})
 		if err != nil {
 			return nil, reviewAgentError(ctx, timeout, "agent fix", err)
 		}
 		fixSummary = summary
+		repairEvidence = evidence
+		repairExecuted = true
 	}
 	reviewTargetSHA := sctx.Run.HeadSHA
 
@@ -145,17 +173,10 @@ Previous review findings to address:
 	// ignore-filtered subset decides whether there is anything to review, while
 	// trusted path instructions are selected against the complete set (see
 	// matchPathInstructions).
-	var args []string
-	if sctx.Fixing {
-		args = []string{"diff", "--name-only", "-z", "--no-renames", baseSHA}
-	} else {
-		args = []string{"diff", "--name-only", "-z", "--no-renames", baseSHA + ".." + sctx.Run.HeadSHA}
-	}
-	changedFiles, err := git.Run(ctx, sctx.WorkDir, args...)
+	changed, err := reviewChangedPaths(ctx, sctx, baseSHA)
 	if err != nil {
-		return nil, fmt.Errorf("get changed files: %w", err)
+		return nil, err
 	}
-	changed := changedPathList(changedFiles)
 
 	if len(reviewablePaths(changed, sctx.Config.IgnorePatterns)) == 0 {
 		sctx.Log("no changes to review")
@@ -191,7 +212,10 @@ Previous review findings to address:
 	// net-deleted-author-lines git-diff backstop for the removal-of-required
 	// class - a fixer round that net-deletes author-added lines parks
 	// regardless of intent source. Held pending a scope decision.
-	historySection := executionContextPromptSection() + roundHistoryPromptSection(sctx) + uncertifiedRoundHistoryPromptSection(sctx) + fixRoundProvenanceClause(sctx) + userIntentPromptSection(sctx) + intentConformanceReviewClause(sctx) + pipelineDeliveryPhaseClause() + testguidance.Rule + testguidance.ReviewerAction
+	historySection := executionContextPromptSection() + roundHistoryPromptSection(sctx) + uncertifiedRoundHistoryPromptSection(sctx) + fixRoundProvenanceClause(sctx) + userIntentPromptSection(sctx) + intentConformanceReviewClause(sctx) + pipelineDeliveryPhaseClause() + testguidance.Rule + testguidance.ReviewerAction + semanticRepairReviewerContract
+	if repairExecuted {
+		historySection += semanticRepairEvidenceSection(repairEvidence)
+	}
 
 	// Path-scoped repository review guidance, taken from the trusted
 	// default-branch config copy (regardless of allow_repo_commands) so a pushed
@@ -240,18 +264,22 @@ Rules:
 - If the change is clean, return an empty findings array.
 - For each finding, set the action field to one of:
   - "ask-user": the finding is about functional requirements or product behavior, or otherwise challenges the author's deliberate intent. Even if it seems obviously wrong, we should ask the user for review. Examples: "this feature seems unnecessary", "this hardcoded value should be configurable", "this deletion looks wrong". When in doubt, default to "ask-user".
-  - "auto-fix": the finding is a non-functional, non user-visible issue (correctness, error handling, security, performance, mechanical code quality) that can be safely fixed without any discussion about the author's intent.
+  - "auto-fix": the finding is strictly local-mechanical work that can be safely fixed without changing a contract, parser/serialization behavior, authorization or permissions, security or safety boundary, deploy/routing behavior, generated artifact, product behavior, or integration/consumer compatibility.
   - "no-op": the finding is informational and does not require any action (e.g. noting a pattern, acknowledging a tradeoff).
 - For each finding, set review_scope to exactly one of:
   - "source": every source-verifiable finding, including any finding that mixes a source defect with a delivery claim.
   - "pipeline-owned-delivery": only a finding whose sole claim is that this run's remote branch, push, PR, or CI output is not present yet.
   - "external-delivery": a pre-existing or external PR, third-party artifact, or other lifecycle requirement not owned by this run.
+- For each finding, set semantic_family to exactly one of: "local-mechanical", "contract-schema", "parser-serialization", "auth-permission", "security-safety", "deploy-routing", "generated-artifact", "product-behavior", or "integration-compatibility".
+- Set semantic_root to a short stable identifier for the violated invariant or public behavior. Keep it stable when the same behavior appears at a different file or call-path layer.
+- The contract/schema, parser/serialization, auth/permission, security/safety, deploy/routing, generated-artifact, product-behavior, and integration/compatibility families are semantic-risk work. They must use ask-user, never auto-fix, even when the overall risk score is low or medium. An owner-selected fix still enters the structured semantic-repair path.
 
 Risk assessment (after listing all findings):
 - Assess source code, source-verifiable criteria, and enforceable external lifecycle requirements normally, while excluding findings scoped "pipeline-owned-delivery" from risk.
 - Set risk_level to "low" if the change is well-bounded, mostly cosmetic, or straightforward with little ambiguity.
 - Set risk_level to "medium" if the change has room to improve but is safe to merge first with concerns addressed as follow-ups.
 - Set risk_level to "high" if the change should not be merged without explicit human approval - it is fundamental, risky, ambiguous, or has strong negative signals.
+- A high-risk review must never classify a finding as auto-fix. Every actionable high-risk finding must be ask-user so the run parks for an owner decision.
 - Provide a one-sentence risk_rationale explaining why you chose that risk level.
 - Set risk_scope to "source-or-external" when the assessment reflects source risk or enforceable external state, and to "pipeline-owned-delivery" only when it is based solely on a deferred outcome this run owns.%s%s`,
 		branch,
@@ -305,6 +333,8 @@ Risk assessment (after listing all findings):
 		sctx.Log(fmt.Sprintf("dropped %d deferred pipeline-owned delivery finding(s) (owned by later push/PR/CI steps)", n))
 		findings = stripped
 	}
+	findings = enforceSemanticRepairHandoff(findings, sctx.PreviousFindings, repairAttempt, repairEvidence, repairExecuted)
+	findings = normalizeSemanticRiskReviewActions(findings)
 
 	needsApproval := hasBlockingFindings(findings.Items)
 	findingsJSON, _ := json.Marshal(findings)
@@ -376,6 +406,8 @@ func sanitizedPreviousFindingsForPrompt(raw string) string {
 		findings.Items[i].Source = sanitizePromptText(findings.Items[i].Source)
 		findings.Items[i].UserInstructions = sanitizePromptMultilineText(findings.Items[i].UserInstructions)
 		findings.Items[i].ReviewScope = sanitizePromptText(findings.Items[i].ReviewScope)
+		findings.Items[i].SemanticFamily = sanitizePromptText(findings.Items[i].SemanticFamily)
+		findings.Items[i].SemanticRoot = sanitizePromptText(findings.Items[i].SemanticRoot)
 	}
 	findings.Summary = sanitizePromptMultilineText(findings.Summary)
 	findings.RiskLevel = sanitizePromptText(findings.RiskLevel)

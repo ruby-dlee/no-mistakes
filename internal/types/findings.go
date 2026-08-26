@@ -100,6 +100,12 @@ type Finding struct {
 	Source           string `json:"source,omitempty"`
 	UserInstructions string `json:"user_instructions,omitempty"`
 	ReviewScope      string `json:"review_scope,omitempty"`
+	// SemanticFamily is the reviewer's stable class for behavioral-risk policy
+	// and repeat-repair detection (for example parser-serialization or auth-permission).
+	SemanticFamily string `json:"semantic_family,omitempty"`
+	// SemanticRoot identifies the invariant or public behavior implicated by the
+	// finding even when a later review anchors it in a different file.
+	SemanticRoot string `json:"semantic_root,omitempty"`
 	// Category separates the combined document+lint housekeeping pass's
 	// findings into their owning gates. Empty everywhere else.
 	Category string `json:"category,omitempty"`
@@ -124,6 +130,8 @@ type findingWire struct {
 	Source              string `json:"source,omitempty"`
 	UserInstructions    string `json:"user_instructions,omitempty"`
 	ReviewScope         string `json:"review_scope,omitempty"`
+	SemanticFamily      string `json:"semantic_family,omitempty"`
+	SemanticRoot        string `json:"semantic_root,omitempty"`
 	Category            string `json:"category,omitempty"`
 	RequiresHumanReview *bool  `json:"requires_human_review,omitempty"`
 }
@@ -387,6 +395,8 @@ func (f *Finding) UnmarshalJSON(data []byte) error {
 	f.Source = wire.Source
 	f.UserInstructions = wire.UserInstructions
 	f.ReviewScope = wire.ReviewScope
+	f.SemanticFamily = wire.SemanticFamily
+	f.SemanticRoot = wire.SemanticRoot
 	f.Category = wire.Category
 	if f.Action == "" && wire.RequiresHumanReview != nil {
 		if *wire.RequiresHumanReview {
