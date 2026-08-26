@@ -218,6 +218,7 @@ func TestSuccessfulReadRequestsDoNotLogAtInfo(t *testing.T) {
 		ipc.MethodGetRuns,
 		ipc.MethodGetRunsForHead,
 		ipc.MethodGetActiveRun,
+		ipc.MethodGetExecutingRuns,
 	}
 	for _, method := range readMethods {
 		srv.Handle(method, func(_ context.Context, _ json.RawMessage) (interface{}, error) {

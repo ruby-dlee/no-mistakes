@@ -310,12 +310,12 @@ func TestUpdaterRunRefusesWithActiveRunsAndListsThem(t *testing.T) {
 	}
 	transcript := stderr.String()
 	for _, want := range []string{
-		"1 active pipeline worker lease",
+		"1 active pipeline execution",
 		lease.ID,
 		runningRun.ID,
 		"head=bbbbbbbb",
 		"owner=test-worker",
-		"continuing can cause these workers to fail",
+		"continuing can cause this work to fail",
 	} {
 		if !strings.Contains(transcript, want) {
 			t.Fatalf("stderr should contain %q, got %q", want, transcript)

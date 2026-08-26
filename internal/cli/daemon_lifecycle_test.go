@@ -34,7 +34,7 @@ func TestDaemonStopRefusesWithActiveRunsAndListsThem(t *testing.T) {
 	}
 	for _, want := range []string{
 		"refusing daemon stop",
-		"2 active pipeline worker leases",
+		"2 active pipeline executions",
 		"head=aaaaaaaa",
 		"head=bbbbbbbb",
 		"owner=test-worker",

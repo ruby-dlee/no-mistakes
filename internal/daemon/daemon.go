@@ -1193,6 +1193,10 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		return &ipc.GetActiveRunResult{Run: runToInfo(d, run, steps)}, nil
 	})
 
+	srv.Handle(ipc.MethodGetExecutingRuns, func(_ context.Context, _ json.RawMessage) (interface{}, error) {
+		return &ipc.GetExecutingRunsResult{RunIDs: mgr.ActiveExecutionRunIDs()}, nil
+	})
+
 	srv.Handle(ipc.MethodGateContext, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
 		var p ipc.GateContextParams
 		if err := json.Unmarshal(params, &p); err != nil {

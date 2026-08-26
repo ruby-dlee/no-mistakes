@@ -55,7 +55,7 @@ no-mistakes update
 
 `no-mistakes update` stops and starts the daemon when it is running, or when stale daemon artifacts exist, so the new executable is used.
 It prefers the managed service path and falls back to a detached daemon if service startup is unavailable or fails.
-If exact, unexpired review, repair, or test worker leases exist, `update`, `daemon stop`, and `daemon restart` refuse by default and print each worker's job, run, role, head, and lease owner. Historical pending/running rows and durable CI waits are not executing workers and do not block lifecycle operations. Pass `--force` to proceed despite a real lease; `-y`/`--yes` does not bypass this guard.
+If the daemon owns a current run goroutine or an exact, unexpired review, repair, or test worker lease exists, `update`, `daemon stop`, and `daemon restart` refuse by default and print the affected run or worker identity. Historical pending/running rows and durable CI waits are not executing work and do not block lifecycle operations. A recorded daemon that cannot answer the bounded liveness query fails closed. Pass `--force` to proceed despite real work; `-y`/`--yes` does not bypass this guard.
 If the daemon is already running from a different executable path, update still prompts before replacing it; `-y`/`--yes` answers that prompt non-interactively.
 If the daemon executable path cannot be determined, the update aborts before replacing anything.
 

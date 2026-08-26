@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -97,6 +98,20 @@ func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *Ru
 		stateRevs:        make(map[string]int64),
 		completedRuns:    make(map[string]bool),
 	}
+}
+
+// ActiveExecutionRunIDs returns the exact run goroutines this daemon process
+// can cancel. Durable pending/running rows are recovery state and are not
+// evidence that a worker is executing.
+func (m *RunManager) ActiveExecutionRunIDs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := make([]string, 0, len(m.cancels))
+	for id := range m.cancels {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 type recoveredRunPlan struct {

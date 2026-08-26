@@ -16,6 +16,7 @@ const (
 	MethodGetRuns                 = "get_runs"
 	MethodGetRunsForHead          = "get_runs_for_head"
 	MethodGetActiveRun            = "get_active_run"
+	MethodGetExecutingRuns        = "get_executing_runs"
 	MethodRerun                   = "rerun"
 	MethodSubscribe               = "subscribe"
 	MethodRespond                 = "respond"
@@ -90,6 +91,12 @@ type OwnerDecisionRunConfig struct {
 // GetRunParams requests a single run by ID.
 type GetRunParams struct {
 	RunID string `json:"run_id"`
+}
+
+// GetExecutingRunsResult reports only run goroutines currently owned by this
+// daemon process. It is process liveness, not a projection of runs.status.
+type GetExecutingRunsResult struct {
+	RunIDs []string `json:"run_ids"`
 }
 
 // GetStepDiffParams requests the working-tree diff for a run parked at a

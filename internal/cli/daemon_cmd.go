@@ -348,7 +348,7 @@ func newDaemonStopCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "stop the daemon even when pipeline worker leases are active")
+	cmd.Flags().BoolVar(&force, "force", false, "stop the daemon even when pipeline executions are active")
 	return cmd
 }
 
@@ -381,24 +381,24 @@ func newDaemonRestartCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "restart the daemon even when pipeline worker leases are active")
+	cmd.Flags().BoolVar(&force, "force", false, "restart the daemon even when pipeline executions are active")
 	return cmd
 }
 
 func guardDestructiveDaemonLifecycle(p *paths.Paths, stderr io.Writer, action string, force bool) error {
-	leases, err := lifecycle.ActiveWorkerLeases(p, time.Now())
+	work, err := lifecycle.ActiveWork(p, time.Now())
 	if err != nil {
-		return fmt.Errorf("check active pipeline worker leases: %w", err)
+		return fmt.Errorf("check active pipeline execution: %w", err)
 	}
-	if len(leases) == 0 {
+	if work.Count() == 0 {
 		return nil
 	}
 	if force {
-		fmt.Fprintf(stderr, "FORCE: %s will stop/restart the daemon while %d active pipeline worker leases are in progress\n", action, len(leases))
-		fmt.Fprint(stderr, lifecycle.WorkerLeaseList(leases))
+		fmt.Fprintf(stderr, "FORCE: %s will stop/restart the daemon while %d active pipeline executions are in progress\n", action, work.Count())
+		fmt.Fprint(stderr, lifecycle.WorkList(work))
 		return nil
 	}
-	return fmt.Errorf("refusing %s because %d active pipeline worker leases are in progress; pass --force to stop/restart the daemon anyway\n%s", action, len(leases), lifecycle.WorkerLeaseList(leases))
+	return fmt.Errorf("refusing %s because %d active pipeline executions are in progress; pass --force to stop/restart the daemon anyway\n%s", action, work.Count(), lifecycle.WorkList(work))
 }
 
 func newDaemonStatusCmd() *cobra.Command {
