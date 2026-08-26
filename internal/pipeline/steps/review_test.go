@@ -79,7 +79,7 @@ func TestReviewStep_EachRoundGetsItsOwnAgentBudget(t *testing.T) {
 			isFix := strings.Contains(opts.Prompt, "Investigate previous review findings")
 			calls = append(calls, call{fixTurn: isFix, deadline: dl})
 			if isFix {
-				return &agent.Result{Output: json.RawMessage("fixed it")}, nil
+				return &agent.Result{Output: completeSemanticRepairResult("fix the issue")}, nil
 			}
 			// Round 1 raises an auto-fixable finding; later rounds are clean.
 			if len(calls) == 1 {
@@ -135,7 +135,7 @@ func TestReviewStep_FixMode(t *testing.T) {
 			callCount++
 			if callCount == 1 {
 				os.WriteFile(filepath.Join(dir, "review-fix.txt"), []byte("fixed"), 0o644)
-				return &agent.Result{Output: json.RawMessage(`{"summary":"  'address review findings.'  "}`)}, nil
+				return &agent.Result{Output: completeSemanticRepairResult("  'address review findings.'  ")}, nil
 			}
 			// Review call — return clean findings
 			findings := Findings{Items: nil, Summary: "all clear"}
@@ -158,6 +158,12 @@ func TestReviewStep_FixMode(t *testing.T) {
 	}
 	if callCount != 2 {
 		t.Errorf("expected 2 agent calls (fix + review), got %d", callCount)
+	}
+	if ag.calls[0].PromptVersion != reviewFixPromptVersion {
+		t.Errorf("fix prompt version = %q, want %q", ag.calls[0].PromptVersion, reviewFixPromptVersion)
+	}
+	if ag.calls[1].PromptVersion != reviewPromptVersion {
+		t.Errorf("review prompt version = %q, want %q", ag.calls[1].PromptVersion, reviewPromptVersion)
 	}
 	if !strings.Contains(ag.calls[0].Prompt, baseSHA) {
 		t.Error("expected fix prompt to contain base SHA")
@@ -256,7 +262,7 @@ func TestReviewStep_SourceContentFindingFollowsNormalFixFlow(t *testing.T) {
 				if err := os.WriteFile(filepath.Join(dir, "semantic_test.go"), []byte("package app\n"), 0o644); err != nil {
 					return nil, err
 				}
-				return &agent.Result{Output: json.RawMessage(`{"summary":"replace source test"}`)}, nil
+				return &agent.Result{Output: completeSemanticRepairResult("replace source test")}, nil
 			case 3:
 				assertTestQualityRulePrompt(t, opts.Prompt)
 				assertTestQualityReviewerAction(t, opts.Prompt)
@@ -340,7 +346,7 @@ func TestReviewStep_FixMode_FocusedVerificationContract(t *testing.T) {
 			callCount++
 			if callCount == 1 {
 				os.WriteFile(filepath.Join(dir, "review-fix.txt"), []byte("fixed"), 0o644)
-				return &agent.Result{Output: json.RawMessage(`{"summary":"address findings"}`)}, nil
+				return &agent.Result{Output: completeSemanticRepairResult("address findings")}, nil
 			}
 			j, _ := json.Marshal(Findings{Summary: "clean"})
 			return &agent.Result{Output: j}, nil
@@ -362,7 +368,7 @@ func TestReviewStep_FixMode_FocusedVerificationContract(t *testing.T) {
 
 	for _, want := range []string{
 		"Apply all the fixes you intend to make first; do not run any verification in between individual fixes.",
-		"After all fixes are applied, run one focused verification limited to the changed area (the specific package, file, or test you touched) at the end of the fix round to confirm the fixes hold.",
+		"After all fixes are applied, run one bounded verification set limited to the changed area at the end of the fix round: the public/executable regression plus the relevant integration or consumer compatibility check.",
 		"Do NOT run the complete repository test suite or lint suite during this fix round. The pipeline has dedicated test and lint steps after review that are the authoritative test and lint gates; their coverage may itself be focused on the changed area when the repository has no configured test or lint commands.",
 	} {
 		if !strings.Contains(fixPrompt, want) {
@@ -507,7 +513,7 @@ func TestReviewStep_RereviewTreatsFixRoundsAsPipelineAuthoredCode(t *testing.T) 
 				callCount++
 				if callCount == 1 {
 					os.WriteFile(filepath.Join(dir, "review-fix.txt"), []byte("fixed"), 0o644)
-					return &agent.Result{Output: json.RawMessage(`{"summary":"address findings"}`)}, nil
+					return &agent.Result{Output: completeSemanticRepairResult("address findings")}, nil
 				}
 				j, _ := json.Marshal(Findings{Summary: "clean"})
 				return &agent.Result{Output: j}, nil
@@ -830,7 +836,7 @@ func TestReviewStep_RereviewFlagsIntentContradictionAsAskUser(t *testing.T) {
 				// Fixer turn: "resolve" the race finding by deleting the
 				// required guarded removal (retry-only).
 				os.WriteFile(filepath.Join(dir, "fleet-sync.txt"), []byte("retry-only\n"), 0o644)
-				return &agent.Result{Output: json.RawMessage(`{"summary":"leave persistent refs locks intact"}`)}, nil
+				return &agent.Result{Output: completeSemanticRepairResult("leave persistent refs locks intact")}, nil
 			}
 			// Rereview: the change now contradicts the authoritative criteria,
 			// so the reviewer emits an ask-user finding even though retry-only

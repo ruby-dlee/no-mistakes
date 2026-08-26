@@ -153,14 +153,23 @@ func newTestContext(t *testing.T, ag agent.Agent, workDir, baseSHA, headSHA stri
 		// The executor resolves this from the app root in production. Tests get
 		// a per-test directory so a step under test can never write evidence
 		// into a shared location the next test would then observe.
-		EvidenceDir: filepath.Join(t.TempDir(), "evidence", "run-1"),
-		WorkDir:     workDir,
-		Agent:       ag,
-		Config:      &config.Config{Agent: types.AgentClaude, Commands: cmds},
-		DB:          database,
-		Log:         func(s string) {},
-		LogChunk:    func(s string) {},
-		LogFile:     func(s string) {},
+		EvidenceDir:         filepath.Join(t.TempDir(), "evidence", "run-1"),
+		WorkDir:             workDir,
+		Agent:               ag,
+		Config:              &config.Config{Agent: types.AgentClaude, Commands: cmds},
+		DB:                  database,
+		SemanticProofRunner: successfulSemanticProofRunner,
+		Log:                 func(s string) {},
+		LogChunk:            func(s string) {},
+		LogFile:             func(s string) {},
+	}
+}
+
+func successfulSemanticProofRunner(context.Context, pipeline.SemanticProofRequest) pipeline.SemanticProofResult {
+	digest := semanticProofOutputDigest("")
+	return pipeline.SemanticProofResult{
+		BeforeExit: 1, AfterExit: 0, IntegrationExit: 0,
+		BeforeOutputDigest: digest, AfterOutputDigest: digest, IntegrationOutputDigest: digest,
 	}
 }
 

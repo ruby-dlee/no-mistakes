@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS step_rounds (
     selected_finding_ids TEXT,
     selection_source     TEXT,
     fix_summary          TEXT,
+    remote_job_id        TEXT,
     duration_ms          INTEGER NOT NULL,
     created_at           INTEGER NOT NULL
 );
@@ -88,7 +89,17 @@ CREATE TABLE IF NOT EXISTS agent_invocations (
     purpose               TEXT NOT NULL,
     agent                 TEXT NOT NULL,
     model                 TEXT,
+    requested_model       TEXT,
+    served_model          TEXT,
+    requested_reasoning   TEXT,
+    effective_reasoning   TEXT,
     model_provider        TEXT,
+    prompt_version        TEXT,
+    prompt_digest         TEXT,
+    no_mistakes_version   TEXT,
+    no_mistakes_build_sha TEXT,
+    harness_name          TEXT,
+    harness_version       TEXT,
     session_mode          TEXT NOT NULL,
     session_key           TEXT,
     fallback_reason       TEXT,
@@ -123,6 +134,44 @@ CREATE TABLE IF NOT EXISTS agent_invocations (
 CREATE INDEX IF NOT EXISTS idx_agent_invocations_run_started_id
     ON agent_invocations (run_id, started_at, id);
 
+-- Local-only, append-only quality labels. A later observation supersedes an
+-- earlier row by reference; it never edits the evidence that was observed at
+-- the time. Digests and bounded provenance labels identify evidence without
+-- retaining prompt, output, diff, or transcript bytes.
+CREATE TABLE IF NOT EXISTS quality_outcomes (
+    id                  TEXT PRIMARY KEY,
+    run_id              TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    job_id              TEXT,
+    fix_attempt_id      TEXT,
+    root_id             TEXT,
+    classification      TEXT NOT NULL CHECK (classification IN (
+        'clean_fix', 'same_root_followup', 'introduced_regression',
+        'overridden', 'reverted', 'primary_handoff'
+    )),
+    fixed_head_sha      TEXT NOT NULL,
+    observed_head_sha   TEXT NOT NULL,
+    evidence_digest     TEXT NOT NULL,
+    evidence_provenance TEXT NOT NULL,
+    supersedes_id       TEXT REFERENCES quality_outcomes(id) ON DELETE CASCADE,
+    created_at          INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_quality_outcomes_run_created_id
+    ON quality_outcomes (run_id, created_at, id);
+
+CREATE TRIGGER IF NOT EXISTS quality_outcomes_no_update
+BEFORE UPDATE ON quality_outcomes
+BEGIN
+    SELECT RAISE(ABORT, 'quality outcomes are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS quality_outcomes_no_delete
+BEFORE DELETE ON quality_outcomes
+WHEN EXISTS (SELECT 1 FROM runs WHERE id = OLD.run_id)
+BEGIN
+    SELECT RAISE(ABORT, 'quality outcomes are append-only');
+END;
+
 CREATE TABLE IF NOT EXISTS run_agent_sessions (
     run_id     TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     role       TEXT NOT NULL,
@@ -154,13 +203,194 @@ CREATE TABLE IF NOT EXISTS uncertified_pipeline_ranges (
     created_at    INTEGER NOT NULL,
     PRIMARY KEY (repo_id, branch)
 );
+
+-- Protected runs bind every owner decision to an immutable Ed25519 public
+-- key. Historical runs have no row and retain the legacy protocol.
+CREATE TABLE IF NOT EXISTS owner_decision_authorities (
+    run_id           TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    public_key       BLOB NOT NULL,
+    key_id           TEXT NOT NULL,
+    repo_id          TEXT NOT NULL,
+    branch           TEXT NOT NULL,
+    initial_head_sha TEXT NOT NULL,
+    genesis_head     TEXT NOT NULL,
+    created_at       INTEGER NOT NULL
+);
+
+-- Append-only signed authorization journal. The externally retained history
+-- head chains signed envelopes; this local record digest also covers the exact
+-- deterministic round projection so direct edits are detected and refused.
+CREATE TABLE IF NOT EXISTS owner_decision_events (
+    run_id                    TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    sequence                  INTEGER NOT NULL,
+    gate_id                   TEXT NOT NULL,
+    previous_head             TEXT NOT NULL,
+    record_digest             TEXT NOT NULL,
+    history_head              TEXT NOT NULL,
+    envelope_json             TEXT NOT NULL,
+    projection_round_id       TEXT,
+    selected_finding_ids      TEXT,
+    selection_source          TEXT,
+    user_findings_json        TEXT,
+    created_at                INTEGER NOT NULL,
+    PRIMARY KEY (run_id, sequence),
+    UNIQUE (run_id, gate_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_owner_decision_events_run_gate
+    ON owner_decision_events (run_id, gate_id);
+
+-- Pipeline jobs are execution records, never a second source of truth for a
+-- run or step. Their semantic key binds one exact unit of work to the run,
+-- step, round, Git head, input digest, and externally retained owner-decision
+-- head that authorized it. Empty owner_decision_head means the run is
+-- unprotected; protected runs require their exact verified journal head.
+CREATE TABLE IF NOT EXISTS pipeline_jobs (
+    id                    TEXT PRIMARY KEY,
+    run_id                TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    step_result_id        TEXT NOT NULL REFERENCES step_results(id) ON DELETE CASCADE,
+    kind                  TEXT NOT NULL CHECK (kind IN ('review', 'repair', 'test', 'ci_monitor')),
+    round                 INTEGER NOT NULL CHECK (round >= 0),
+    desired_head_sha      TEXT NOT NULL,
+    input_digest          TEXT NOT NULL,
+    owner_decision_head   TEXT NOT NULL DEFAULT '',
+    desired_generation    INTEGER NOT NULL DEFAULT 0 CHECK (desired_generation >= 0),
+    idempotency_key       TEXT NOT NULL UNIQUE,
+    status                TEXT NOT NULL CHECK (status IN ('queued', 'leased', 'completed', 'failed', 'superseded')),
+    max_attempts          INTEGER NOT NULL CHECK (max_attempts > 0),
+    attempts_started      INTEGER NOT NULL DEFAULT 0 CHECK (attempts_started >= 0),
+    lease_fence           INTEGER NOT NULL DEFAULT 0 CHECK (lease_fence >= 0),
+    lease_owner           TEXT,
+    lease_expires_at      INTEGER,
+    heartbeat_at          INTEGER,
+    result_digest         TEXT,
+    output_head_sha       TEXT,
+    error_category        TEXT,
+    superseded_at         INTEGER,
+    completed_at          INTEGER,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL,
+    UNIQUE (run_id, step_result_id, kind, round, desired_head_sha, input_digest, owner_decision_head, desired_generation)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_claim
+    ON pipeline_jobs (kind, status, created_at, id);
+
+-- The event stream is append-only through the DB API. It records only bounded
+-- execution metadata and digests: never prompts, model output, diffs, command
+-- arguments, or result payloads.
+CREATE TABLE IF NOT EXISTS pipeline_job_events (
+    id               TEXT PRIMARY KEY,
+    job_id           TEXT NOT NULL REFERENCES pipeline_jobs(id) ON DELETE CASCADE,
+    event_type       TEXT NOT NULL CHECK (event_type IN ('created', 'leased', 'heartbeat', 'expired_requeued', 'expired_failed', 'completed', 'superseded')),
+    status           TEXT NOT NULL,
+    attempt          INTEGER NOT NULL CHECK (attempt >= 0),
+    lease_fence      INTEGER NOT NULL CHECK (lease_fence >= 0),
+    lease_owner      TEXT,
+    result_digest    TEXT,
+    output_head_sha  TEXT,
+    created_at       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_job_events_job_created
+    ON pipeline_job_events (job_id, created_at, id);
+
+-- Explicit worker failures are a separate append-only attempt stream so an
+-- immediate bounded retry is distinguishable from lease expiry. Categories
+-- are bounded machine labels only; raw process output never enters SQLite.
+CREATE TABLE IF NOT EXISTS pipeline_job_attempt_failures (
+    id                TEXT PRIMARY KEY,
+    job_id            TEXT NOT NULL REFERENCES pipeline_jobs(id) ON DELETE CASCADE,
+    attempt           INTEGER NOT NULL CHECK (attempt > 0),
+    lease_fence       INTEGER NOT NULL CHECK (lease_fence > 0),
+    lease_owner       TEXT NOT NULL,
+    error_category    TEXT NOT NULL,
+    retryable         INTEGER NOT NULL CHECK (retryable IN (0, 1)),
+    created_at        INTEGER NOT NULL,
+    UNIQUE (job_id, lease_fence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_job_attempt_failures_job
+    ON pipeline_job_attempt_failures (job_id, attempt);
+
+CREATE TABLE IF NOT EXISTS branch_desired_state (
+    repo_id         TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    branch          TEXT NOT NULL,
+    revision        INTEGER NOT NULL CHECK (revision > 0),
+    head_sha        TEXT NOT NULL,
+    input_digest    TEXT NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, branch)
+);
+
+-- Worker execution and CI custody advance independently. Keeping their
+-- generations in separate tables prevents a CI wait from invalidating an
+-- exact review/test lease (and vice versa) on the same branch.
+CREATE TABLE IF NOT EXISTS worker_desired_state (
+    repo_id         TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    branch          TEXT NOT NULL,
+    revision        INTEGER NOT NULL CHECK (revision > 0),
+    head_sha        TEXT NOT NULL,
+    input_digest    TEXT NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, branch)
+);
+
+CREATE TABLE IF NOT EXISTS github_deliveries (
+    delivery_id     TEXT PRIMARY KEY,
+    payload_digest  TEXT NOT NULL,
+    repo_id         TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    pr_number       INTEGER NOT NULL CHECK (pr_number > 0),
+    head_sha        TEXT NOT NULL,
+    event_type      TEXT NOT NULL,
+    received_at     INTEGER NOT NULL,
+    confirmed_at    INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ci_waits (
+    id                  TEXT PRIMARY KEY,
+    run_id              TEXT NOT NULL UNIQUE REFERENCES runs(id) ON DELETE CASCADE,
+    repo_id             TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    branch              TEXT NOT NULL,
+    pr_number           INTEGER NOT NULL CHECK (pr_number > 0),
+    head_sha            TEXT NOT NULL,
+    input_digest        TEXT NOT NULL,
+    desired_generation  INTEGER NOT NULL CHECK (desired_generation > 0),
+    declared_no_ci      INTEGER NOT NULL DEFAULT 0 CHECK (declared_no_ci IN (0, 1)),
+    evidence_local_root TEXT NOT NULL DEFAULT '',
+    trusted_config_bound INTEGER NOT NULL DEFAULT 0 CHECK (trusted_config_bound IN (0, 1)),
+    status              TEXT NOT NULL CHECK (status IN ('waiting', 'ready', 'failed', 'closed')),
+    check_state         TEXT NOT NULL,
+    next_reconcile_at   INTEGER NOT NULL,
+    interval_seconds    INTEGER NOT NULL CHECK (interval_seconds > 0),
+    last_delivery_id    TEXT,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ci_waits_due
+    ON ci_waits (status, next_reconcile_at, id);
+
+CREATE TABLE IF NOT EXISTS ci_reconciliations (
+    wait_id          TEXT PRIMARY KEY REFERENCES ci_waits(id) ON DELETE CASCADE,
+    reason           TEXT NOT NULL CHECK (reason IN ('delivery', 'periodic')),
+    delivery_id      TEXT,
+    requested_at     INTEGER NOT NULL
+);
 `
 
 // migrationStatements hold additive schema changes applied to databases that
 // were created before the referenced columns existed. Each statement must be
 // idempotent via its error being tolerated when the column already exists.
 var migrationStatements = []string{
+	`ALTER TABLE pipeline_jobs ADD COLUMN desired_generation INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE ci_waits ADD COLUMN declared_no_ci INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE ci_waits ADD COLUMN evidence_local_root TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE ci_waits ADD COLUMN trusted_config_bound INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE repos ADD COLUMN fork_url TEXT`,
+	`ALTER TABLE owner_decision_authorities ADD COLUMN repo_id TEXT`,
+	`ALTER TABLE owner_decision_authorities ADD COLUMN branch TEXT`,
+	`ALTER TABLE owner_decision_authorities ADD COLUMN initial_head_sha TEXT`,
 	`ALTER TABLE step_rounds ADD COLUMN selected_finding_ids TEXT`,
 	`ALTER TABLE step_rounds ADD COLUMN selection_source TEXT`,
 	`ALTER TABLE step_rounds ADD COLUMN fix_summary TEXT`,
@@ -172,6 +402,10 @@ var migrationStatements = []string{
 	`ALTER TABLE step_rounds ADD COLUMN trusted_config_sha TEXT`,
 	`ALTER TABLE step_rounds ADD COLUMN global_config_yaml BLOB`,
 	`ALTER TABLE step_rounds ADD COLUMN repo_config_yaml BLOB`,
+	`ALTER TABLE step_rounds ADD COLUMN remote_job_id TEXT`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_step_rounds_remote_job ON step_rounds(remote_job_id) WHERE remote_job_id IS NOT NULL`,
+	`DROP INDEX IF EXISTS idx_quality_outcomes_job`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_quality_outcomes_semantic_job ON quality_outcomes(job_id) WHERE job_id IS NOT NULL AND evidence_provenance = 'semantic_rereview'`,
 	`ALTER TABLE runs ADD COLUMN intent TEXT`,
 	`ALTER TABLE runs ADD COLUMN intent_source TEXT`,
 	`ALTER TABLE runs ADD COLUMN intent_session_id TEXT`,
@@ -245,4 +479,17 @@ var migrationStatements = []string{
 	`ALTER TABLE agent_invocations ADD COLUMN workload_files INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN workload_lines INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN finding_count INTEGER`,
+	// Quality identity is local-only and content-free. Every new field remains
+	// nullable so historical rows and harnesses that cannot report a datum stay
+	// unknown rather than acquiring a fabricated default.
+	`ALTER TABLE agent_invocations ADD COLUMN requested_model TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN served_model TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN requested_reasoning TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN effective_reasoning TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN prompt_version TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN prompt_digest TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN no_mistakes_version TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN no_mistakes_build_sha TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN harness_name TEXT`,
+	`ALTER TABLE agent_invocations ADD COLUMN harness_version TEXT`,
 }

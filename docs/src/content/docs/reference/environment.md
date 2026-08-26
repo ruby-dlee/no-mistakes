@@ -35,6 +35,17 @@ Override how long a CLI client waits for an existing daemon socket to accept a c
 
 Takes precedence over `daemon_connect_timeout` in `config.yaml`. An empty, unparsable, or non-positive value is ignored and the config value (or its default) is used instead.
 
+## `NO_MISTAKES_GITHUB_WEBHOOK_SECRET`
+
+GitHub webhook HMAC secret read only when the trusted global [`coordinator`](/no-mistakes/reference/global-config/#coordinator) setting is explicitly enabled.
+
+|         |                                             |
+| ------- | ------------------------------------------- |
+| Type    | `string`                                    |
+| Default | (none; enabled coordinator startup refuses) |
+
+The global config may name a different environment key. The value must be 16 through 4096 bytes. It is held only in daemon memory and is never persisted or logged. Put it in the environment visible to the managed daemon, then restart the daemon. Do not write the value into `config.yaml`.
+
 ## `FORGEJO_BASE_URL`
 
 Canonical Forgejo web base URL used for provider discovery and forgejo-axi commands.
@@ -252,9 +263,11 @@ It never sends a SHA, run ID, path, branch name, URL, remote name, or command ar
 Everything sent remotely is low-cardinality: command names, statuses, durations, counts, flag booleans, agent and step names, and - on the single terminal `run finished` event - the bounded performance rollup `agent_invocations`, `resumed_invocations`, and `fallback_invocations` (small counts only).
 Run IDs, repository paths, branch names, session identities, prompts, model outputs, diffs, and per-invocation performance records are never sent.
 
-Detailed performance evidence stays on the machine in the local state database (`<NM_HOME>/state.sqlite`): one `agent_invocations` row per agent invocation, plus each run's accumulated parked-at-gate time.
-Each row records run and step identity, purpose (such as review/review-fix/housekeeping), the reported model and its provider, the cold/started/resumed/fallback session mode, a truncated session-identity hash, timestamps, duration, exit status, and failure category, alongside the session-fidelity metrics below.
-It never stores prompts, model outputs, diffs, raw command arguments, secret values, or credentials - only bounded counts, low-cardinality categories, and durations.
+Detailed performance evidence stays on the machine in the local state database (`<NM_HOME>/state.sqlite`): one `agent_invocations` row per agent invocation, append-only `quality_outcomes` observations, plus each run's accumulated parked-at-gate time.
+Each invocation row records run and step identity, purpose (such as review/review-fix/housekeeping), requested and provider-reported served model, requested reasoning and provider-reported effective reasoning, no-mistakes version/build SHA, harness name/version, the cold/started/resumed/fallback session mode, a truncated session-identity hash, timestamps, duration, exit status, and failure category, alongside the session-fidelity metrics below. Unknown served identity, effective reasoning, harness versions, and unavailable build values remain `NULL`; a configured request or linker sentinel is never copied into an unknown effective field.
+Versioned templates record a stable, bounded `prompt_version` separately from the task-specific `sha256:<hex>` digest of the prompt at the pipeline's harness boundary. Review and semantic repair currently use `review.v1` and `review-fix.v1`; unversioned prompts leave the revision `NULL`. Telemetry never stores prompt or model-output bytes, diffs, raw command arguments, secret values, or credentials - only revisions, digests, bounded counts, low-cardinality categories, and durations.
+
+Quality observations use the fixed classifications `clean_fix`, `same_root_followup`, `introduced_regression`, `overridden`, `reverted`, and `primary_handoff`. Each row binds the fixed and observed Git heads to a SHA-256 evidence digest and bounded provenance category, with optional job, fix-attempt, and root-cause identifiers. A later classification appends a row whose `supersedes_id` points at the prior observation; individual updates and deletes are refused, so later knowledge never rewrites history. Deleting an entire repository from local no-mistakes state still cascades through its quality telemetry for privacy.
 
 The additive session-fidelity fields are nullable and read back as unknown (rendered `-`) rather than a fabricated zero when the adapter did not report them, so rows written before a field existed, and adapters that do not surface a datum, stay honest.
 The legacy raw input, output, and cache-read token counters render numerically; use the nullable per-round and derived fields to determine whether the adapter reported comparable usage:

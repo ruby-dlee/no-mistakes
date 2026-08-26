@@ -22,10 +22,14 @@ type fixExecutionOptions struct {
 	MissingFindingsError    string
 	LogMessage              string
 	Prompt                  string
+	PromptVersion           string
 	ErrorPrefix             string
 	FallbackSummary         string
 	AfterAgentRun           func(*agent.Result) error
 	AgentContext            context.Context
+	// JSONSchema overrides the summary-only response contract for a repair role
+	// that needs additional structured evidence. Empty keeps the shared default.
+	JSONSchema json.RawMessage
 	// SessionRole, when set, runs the fix turn in that durable review-loop
 	// session (the review step's fixer role). Steps outside the review loop
 	// leave it empty and stay session-isolated.
@@ -176,6 +180,9 @@ func commitPipelineCorrectionWithCleanup(
 }
 
 func commitAgentFixes(sctx *pipeline.StepContext, stepName types.StepName, summary, fallbackSummary string) error {
+	if sctx.CommitFixes != nil {
+		return sctx.CommitFixes(stepName, summary, fallbackSummary)
+	}
 	ctx := sctx.Ctx
 	if err := assertPipelineHeadContinuity(sctx, stepName); err != nil {
 		return err
@@ -227,6 +234,54 @@ func commitAgentFixes(sctx *pipeline.StepContext, stepName types.StepName, summa
 	return nil
 }
 
+// CommitIsolatedWorkerFixes commits guest-agent changes without touching the
+// daemon database. The caller supplies an exact recorded head in sctx.Run and
+// must validate the final descendant before returning it to the controller.
+func CommitIsolatedWorkerFixes(sctx *pipeline.StepContext, stepName types.StepName, summary, fallbackSummary string) error {
+	ctx := sctx.Ctx
+	if err := assertPipelineHeadContinuity(sctx, stepName); err != nil {
+		return err
+	}
+	status, err := git.Run(ctx, sctx.WorkDir, "status", "--porcelain=v1", "--untracked-files=all")
+	if err != nil {
+		return fmt.Errorf("inspect %s agent changes: %w", stepName, err)
+	}
+	if strings.TrimSpace(status) == "" {
+		return errors.New("isolated repair produced no changes")
+	}
+	if summary == "" {
+		summary = fallbackSummary
+	}
+	if summary == "" {
+		summary = "apply fixes"
+	}
+	message, err := sctx.Config.Commit.RenderFixMessage(stepName, summary)
+	if err != nil {
+		return fmt.Errorf("render %s fix commit message: %w", stepName, err)
+	}
+	if _, err := git.Run(ctx, sctx.WorkDir, "add", "-A"); err != nil {
+		return fmt.Errorf("stage %s changes: %w", stepName, err)
+	}
+	if err := commitPipelineCorrection(ctx, sctx.WorkDir, message, sctx.Log); err != nil {
+		return fmt.Errorf("commit %s changes: %w", stepName, err)
+	}
+	head, err := git.HeadSHA(ctx, sctx.WorkDir)
+	if err != nil {
+		return fmt.Errorf("resolve head after %s commit: %w", stepName, err)
+	}
+	if _, err := git.Run(ctx, sctx.WorkDir, "merge-base", "--is-ancestor", sctx.Run.HeadSHA, head); err != nil {
+		return fmt.Errorf("isolated %s repair is not a descendant of its input head", stepName)
+	}
+	if _, err := git.Run(ctx, sctx.WorkDir, "update-ref", normalizedBranchRef(sctx.Run.Branch), head); err != nil {
+		return fmt.Errorf("update isolated repair branch: %w", err)
+	}
+	sctx.Run.HeadSHA = head
+	if sctx.Log != nil {
+		sctx.Log(fmt.Sprintf("committed agent fixes: %s", message))
+	}
+	return nil
+}
+
 func extractCommitSummary(result *agent.Result) (string, error) {
 	var summary commitSummary
 	if result.Output == nil {
@@ -264,13 +319,18 @@ func executeFixMode(sctx *pipeline.StepContext, stepName types.StepName, opts fi
 	if purpose == "" {
 		purpose = string(stepName) + "-fix"
 	}
+	responseSchema := opts.JSONSchema
+	if len(responseSchema) == 0 {
+		responseSchema = commitSummarySchema
+	}
 	runOpts := agent.RunOpts{
-		Prompt:     opts.Prompt,
-		CWD:        sctx.WorkDir,
-		JSONSchema: commitSummarySchema,
-		OnChunk:    sctx.LogChunk,
-		Purpose:    purpose,
-		Workload:   opts.Workload,
+		Prompt:        opts.Prompt,
+		PromptVersion: opts.PromptVersion,
+		CWD:           sctx.WorkDir,
+		JSONSchema:    responseSchema,
+		OnChunk:       sctx.LogChunk,
+		Purpose:       purpose,
+		Workload:      opts.Workload,
 	}
 	agentCtx := sctx.Ctx
 	if opts.AgentContext != nil {

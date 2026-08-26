@@ -20,6 +20,27 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
+func TestDriveRunProtectedYoloRefusesToLoadPrivateKeyBesideWorkload(t *testing.T) {
+	events := make(chan ipc.Event, 1)
+	source := &scriptedRunStateSource{
+		subscriptions: []scriptedSubscription{{events: events}},
+		runs: []*ipc.RunInfo{
+			{ID: "run-protected", RepoID: "repo-1", Branch: "feature/x", HeadSHA: "head-1", Status: types.RunRunning, OwnerDecisionProtected: true,
+				Steps: []ipc.StepResultInfo{{ID: "step-1", StepName: types.StepReview, Status: types.StepStatusAwaitingApproval, FindingsJSON: ownerTestStringPtr(`{"findings":[]}`)}},
+			},
+			{ID: "run-protected", RepoID: "repo-1", Branch: "feature/x", HeadSHA: "head-1", Status: types.RunCompleted, OwnerDecisionProtected: true},
+		},
+	}
+	reconciler := newRunReconciler(source, "run-protected")
+	defer reconciler.Close()
+	_, _, err := driveRunWithReconciler(context.Background(), io.Discard, nil, reconciler, "run-protected", true)
+	if err == nil || !strings.Contains(err.Error(), "externally signed decision") {
+		t.Fatalf("protected yolo error = %v", err)
+	}
+}
+
+func ownerTestStringPtr(value string) *string { return &value }
+
 func ciRunView(ciStatus types.StepStatus) runView {
 	return runView{
 		ID:     "run-1",
@@ -546,6 +567,26 @@ func TestRenderDriveResult_DeclaredNoCIChecksPassed(t *testing.T) {
 	}
 	if strings.Contains(got, "CI checks passed - the PR is ready") {
 		t.Errorf("declared no_ci path must not silently equate empty results with green:\n%s", got)
+	}
+}
+
+func TestRenderDriveResult_CoordinatorFailureOffersRerunPrimaryAction(t *testing.T) {
+	reason := "coordinator stopped: the PR head moved; rerun no-mistakes against the new exact head"
+	run := &ipc.RunInfo{
+		ID: "run-1", Branch: "feature/x", Status: types.RunFailed, HeadSHA: "abcdef1234567890",
+		Error: &reason,
+		Steps: []ipc.StepResultInfo{{StepName: types.StepCI, Status: types.StepStatusFailed}},
+	}
+	var out bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&out)
+	err := renderDriveResult(cmd, run, false)
+	if err == nil {
+		t.Fatal("failed coordinator result must remain blocked")
+	}
+	got := out.String()
+	if !strings.Contains(got, "no-mistakes axi rerun") || !strings.Contains(got, "exact-head custody") {
+		t.Fatalf("coordinator rerun guidance missing:\n%s", got)
 	}
 }
 

@@ -612,6 +612,20 @@ func (d *DB) UpdateRunHeadSHA(id, headSHA string) error {
 	return nil
 }
 
+// AdvanceRunHeadSHA is the exact-CAS form used when adopting a returned worker
+// branch. It never overwrites a head advanced by another custody owner.
+func (d *DB) AdvanceRunHeadSHA(id, expectedHeadSHA, nextHeadSHA string) (bool, error) {
+	result, err := d.sql.Exec(`UPDATE runs SET head_sha = ?, updated_at = ? WHERE id = ? AND head_sha = ?`, nextHeadSHA, now(), id, expectedHeadSHA)
+	if err != nil {
+		return false, fmt.Errorf("advance run head sha: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("advance run head sha rows affected: %w", err)
+	}
+	return changed == 1, nil
+}
+
 // UpdateRunError sets the error message on a run.
 func (d *DB) UpdateRunError(id, errMsg string) error {
 	return d.UpdateRunErrorStatus(id, errMsg, types.RunFailed)

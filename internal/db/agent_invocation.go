@@ -1,6 +1,11 @@
 package db
 
-import "fmt"
+import (
+	"fmt"
+	"regexp"
+)
+
+var promptVersionPattern = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,63}$`)
 
 // Agent invocation session modes recorded for local performance telemetry.
 const (
@@ -43,10 +48,28 @@ type AgentInvocation struct {
 	// step-derived default.
 	Purpose string
 	Agent   string
-	Model   string
+	// Model is the legacy served-model projection retained for existing stats
+	// and eval readers. New rows also populate ServedModel explicitly.
+	Model string
+	// RequestedModel and RequestedReasoning are the harness-neutral profile the
+	// operator selected. ServedModel is provider-reported. EffectiveReasoning is
+	// nil unless the harness reports the level it actually used.
+	RequestedModel     *string
+	ServedModel        *string
+	RequestedReasoning *string
+	EffectiveReasoning *string
 	// ModelProvider is the provider that served the model (openai, anthropic,
 	// ...). Nil when the adapter cannot report it.
 	ModelProvider *string
+	// PromptDigest is sha256:<hex> over the prompt at the pipeline's harness
+	// boundary. The prompt itself is never retained. Tool and harness identity
+	// make quality records reproducible without storing model input or output.
+	PromptVersion      *string
+	PromptDigest       *string
+	NoMistakesVersion  *string
+	NoMistakesBuildSHA *string
+	HarnessName        *string
+	HarnessVersion     *string
 	// SessionMode is one of the InvocationMode constants.
 	SessionMode string
 	// SessionKey is a privacy-safe fingerprint (truncated SHA-256) of the
@@ -113,6 +136,8 @@ type AgentInvocation struct {
 // agentInvocationColumns is the canonical column order shared by insert and
 // select so the placeholder list and scan destinations cannot drift apart.
 const agentInvocationColumns = `id, run_id, step_name, round, purpose, agent, model, model_provider,
+	requested_model, served_model, requested_reasoning, effective_reasoning,
+	prompt_version, prompt_digest, no_mistakes_version, no_mistakes_build_sha, harness_name, harness_version,
 	session_mode, session_key, fallback_reason,
 	started_at, completed_at, duration_ms, subprocess_wait_ms, exit_status, failure_category,
 	input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
@@ -124,6 +149,8 @@ const agentInvocationColumns = `id, run_id, step_name, round, purpose, agent, mo
 
 // agentInvocationInsertPlaceholders has one '?' per agentInvocationColumns entry.
 const agentInvocationInsertPlaceholders = `?, ?, ?, ?, ?, ?, ?, ?,
+	?, ?, ?, ?,
+	?, ?, ?, ?, ?, ?,
 	?, ?, ?,
 	?, ?, ?, ?, ?, ?,
 	?, ?, ?, ?,
@@ -136,11 +163,28 @@ const agentInvocationInsertPlaceholders = `?, ?, ?, ?, ?, ?, ?, ?,
 // InsertAgentInvocation records one completed agent invocation. Nil pointer
 // fields are stored as SQL NULL (database/sql dereferences non-nil pointers).
 func (d *DB) InsertAgentInvocation(inv AgentInvocation) (*AgentInvocation, error) {
+	if inv.PromptDigest != nil && !qualityDigestPattern.MatchString(*inv.PromptDigest) {
+		return nil, fmt.Errorf("insert agent invocation: prompt digest must be sha256:<64 lowercase hex>")
+	}
+	if inv.PromptVersion != nil && !promptVersionPattern.MatchString(*inv.PromptVersion) {
+		return nil, fmt.Errorf("insert agent invocation: prompt version must be a bounded template revision")
+	}
+	// Keep the historical Model projection usable while every new populated row
+	// also carries the unambiguous requested/served split.
+	if inv.ServedModel == nil && inv.Model != "" {
+		served := inv.Model
+		inv.ServedModel = &served
+	}
+	if inv.Model == "" && inv.ServedModel != nil {
+		inv.Model = *inv.ServedModel
+	}
 	inv.ID = newID()
 	_, err := d.sql.Exec(
 		`INSERT INTO agent_invocations (`+agentInvocationColumns+`)
 		 VALUES (`+agentInvocationInsertPlaceholders+`)`,
 		inv.ID, inv.RunID, inv.StepName, inv.Round, inv.Purpose, inv.Agent, inv.Model, inv.ModelProvider,
+		inv.RequestedModel, inv.ServedModel, inv.RequestedReasoning, inv.EffectiveReasoning,
+		inv.PromptVersion, inv.PromptDigest, inv.NoMistakesVersion, inv.NoMistakesBuildSHA, inv.HarnessName, inv.HarnessVersion,
 		inv.SessionMode, inv.SessionKey, inv.FallbackReason,
 		inv.StartedAt, inv.CompletedAt, inv.DurationMS, inv.SubprocessWaitMS, inv.ExitStatus, inv.FailureCategory,
 		inv.InputTokens, inv.OutputTokens, inv.CacheReadTokens, inv.CacheCreationTokens,
@@ -186,6 +230,8 @@ func scanAgentInvocation(row scanner) (AgentInvocation, error) {
 	var inv AgentInvocation
 	if err := row.Scan(
 		&inv.ID, &inv.RunID, &inv.StepName, &inv.Round, &inv.Purpose, &inv.Agent, &inv.Model, &inv.ModelProvider,
+		&inv.RequestedModel, &inv.ServedModel, &inv.RequestedReasoning, &inv.EffectiveReasoning,
+		&inv.PromptVersion, &inv.PromptDigest, &inv.NoMistakesVersion, &inv.NoMistakesBuildSHA, &inv.HarnessName, &inv.HarnessVersion,
 		&inv.SessionMode, &inv.SessionKey, &inv.FallbackReason,
 		&inv.StartedAt, &inv.CompletedAt, &inv.DurationMS, &inv.SubprocessWaitMS, &inv.ExitStatus, &inv.FailureCategory,
 		&inv.InputTokens, &inv.OutputTokens, &inv.CacheReadTokens, &inv.CacheCreationTokens,

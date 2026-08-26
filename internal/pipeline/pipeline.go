@@ -10,17 +10,32 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
-var ErrFatalGateReconciliation = errors.New("fatal gate reconciliation")
+var (
+	ErrFatalGateReconciliation = errors.New("fatal gate reconciliation")
+	// ErrPipelineDeferred is the non-terminal result of a durable external
+	// coordinator handoff. Callers must release local execution capacity while
+	// leaving the run and current step active.
+	ErrPipelineDeferred = errors.New("pipeline custody deferred to coordinator")
+)
 
 // StepContext provides shared resources to pipeline steps during execution.
 type StepContext struct {
-	Ctx                   context.Context
-	Run                   *db.Run
-	Repo                  *db.Repo
-	WorkDir               string
-	Agent                 agent.Agent
-	Config                *config.Config
-	DB                    *db.DB
+	Ctx     context.Context
+	Run     *db.Run
+	Repo    *db.Repo
+	WorkDir string
+	Agent   agent.Agent
+	Config  *config.Config
+	DB      *db.DB
+	// QualityOutcomes is explicitly enabled by the executor for durable runs.
+	// Embeddings may leave it nil; once enabled, write failures are gate errors,
+	// not best-effort telemetry loss.
+	QualityOutcomes QualityOutcomeWriter
+	// SemanticProofRunner is the executor-owned targeted-check seam used by a
+	// review repair. Production leaves it nil and the review step runs the
+	// repository checks itself; focused tests may inject exact exit/digest
+	// observations without invoking a repository suite.
+	SemanticProofRunner   SemanticProofRunner
 	Log                   func(string) // discrete log line (newline-terminated, user-visible + file)
 	LogChunk              func(string) // raw streaming chunk (user-visible + file)
 	LogFile               func(string) // file-only log callback (not shown to user)
@@ -80,6 +95,48 @@ type StepContext struct {
 	// OnPRMerged is a best-effort hook after a merged PR state is persisted.
 	// Eval uses it to relabel auto-fix/shipped-unfixed gold; nil is a no-op.
 	OnPRMerged func(ctx context.Context, runID string)
+	// CommitFixes replaces the durable daemon commit bookkeeping for isolated
+	// guest workers. Nil preserves the canonical local DB-backed behavior.
+	CommitFixes func(step types.StepName, summary, fallbackSummary string) error
+	// Remote history is already sanitized and bounded by the controller. It is
+	// used only by an isolated guest that intentionally has no local database.
+	RemotePriorRoundHistory       string
+	RemoteUncertifiedRoundHistory string
+	RemoteRepairAttempt           int
+}
+
+// SemanticProofRequest binds one semantic repair's checks to the exact
+// before/after commits. Commands are proposed by the fixer but admitted and
+// executed by the pipeline, never trusted as agent-authored result prose.
+type SemanticProofRequest struct {
+	WorkDir            string
+	StartingHeadSHA    string
+	FixedHeadSHA       string
+	PublicCommand      string
+	IntegrationCommand string
+	Env                []string
+}
+
+// SemanticProofResult is content-free executor evidence. Output bytes never
+// enter pipeline state or quality telemetry; their digests distinguish exact
+// observations while exit codes carry the fail-before/pass-after contract.
+type SemanticProofResult struct {
+	BeforeExit              int
+	AfterExit               int
+	IntegrationExit         int
+	BeforeOutputDigest      string
+	AfterOutputDigest       string
+	IntegrationOutputDigest string
+	FailureCategory         string
+}
+
+type SemanticProofRunner func(context.Context, SemanticProofRequest) SemanticProofResult
+
+// QualityOutcomeWriter is the narrow append-only quality evidence boundary.
+// *db.DB implements it; the interface also keeps failure behavior executable
+// in focused pipeline tests.
+type QualityOutcomeWriter interface {
+	InsertQualityOutcome(db.QualityOutcome) (*db.QualityOutcome, error)
 }
 
 // RunAgentSession executes one turn of a durable review-loop role session,
@@ -101,6 +158,10 @@ type StepOutcome struct {
 	PRURL         string // PR/MR URL if this step created or found one
 	Skipped       bool   // mark the step as skipped without failing the run
 	SkipRemaining bool   // skip all subsequent steps (e.g. empty diff after rebase)
+	// Deferred means this step durably transferred custody to an external
+	// coordinator. The executor leaves the run and step active while releasing
+	// its local goroutine and agent.
+	Deferred bool
 	// FixSummary, when non-empty, is the agent's one-line commit summary for
 	// the fix attempt performed during this round. Steps populate it in fix
 	// mode so the executor can persist it on the round record and later
@@ -110,6 +171,9 @@ type StepOutcome struct {
 	// round. The executor durably records it only when the review step actually
 	// completes, never while that outcome is parked or after a failed round.
 	ReviewApprovedHeadSHA string
+	// RemoteJobID is controller-supplied replay identity for a remotely
+	// executed round. Guest outcomes cannot set it.
+	RemoteJobID string
 
 	// DurationOverrideMS, when positive, replaces the wall-clock duration
 	// reported for this step. Used by demo mode to show realistic durations

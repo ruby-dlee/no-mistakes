@@ -84,6 +84,11 @@ func reviewSessionHarness(t *testing.T, mock *sessionMockAgent, steps []pipeline
 		AutoFix:      config.AutoFix{Review: 3},
 		SessionReuse: true,
 	}
+	for _, step := range steps {
+		if review, ok := step.(*ReviewStep); ok {
+			review.semanticProofRunner = successfulSemanticProofRunner
+		}
+	}
 	exec := pipeline.NewExecutor(database, paths.WithRoot(t.TempDir()), cfg, mock, steps, nil)
 	return exec, database, run, repo, workDir
 }
@@ -108,10 +113,10 @@ func fixCalls(calls []agent.RunOpts) []agent.RunOpts {
 	return out
 }
 
-// TestReviewLoop_IndependentReviewTurnsOneFixerSession drives the real review
+// TestReviewLoop_IndependentReviewTurnsFreshSecondFixerSession drives the real review
 // step through the executor's auto-fix loop for multiple rounds and proves:
 // every review turn (the initial review and every post-fix rereview) runs
-// session-free, N fix rounds share ONE durable fixer session, the review
+// session-free, a second semantic repair starts a fresh fixer session, the review
 // turns never receive the fixer's identity, and every review round still asks
 // for a full review pass of the branch.
 //
@@ -120,7 +125,7 @@ func fixCalls(calls []agent.RunOpts) []agent.RunOpts {
 // seat the prescriber of those fixes as their certifier. The cross-round
 // context a rereview legitimately needs travels in the explicit sanitized
 // round-history prompt section instead.
-func TestReviewLoop_IndependentReviewTurnsOneFixerSession(t *testing.T) {
+func TestReviewLoop_IndependentReviewTurnsFreshSecondFixerSession(t *testing.T) {
 	reviewRound := 0
 	mock := &sessionMockAgent{}
 	mock.respond = func(opts agent.RunOpts) *agent.Result {
@@ -129,13 +134,13 @@ func TestReviewLoop_IndependentReviewTurnsOneFixerSession(t *testing.T) {
 			reviewRound++
 			if reviewRound <= 2 {
 				return &agent.Result{Output: []byte(fmt.Sprintf(
-					`{"findings":[{"id":"f-%d","severity":"error","description":"bug %d","action":"auto-fix"}],"summary":"issues","risk_level":"medium","risk_rationale":"bugs"}`,
+					`{"findings":[{"id":"f-%d","severity":"error","file":"feature.txt","description":"bug %d","action":"auto-fix","review_scope":"source"}],"summary":"issues","risk_level":"medium","risk_rationale":"bugs","risk_scope":"source-or-external"}`,
 					reviewRound, reviewRound,
 				))}
 			}
-			return &agent.Result{Output: []byte(`{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"clean"}`)}
+			return &agent.Result{Output: []byte(`{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"clean","risk_scope":"source-or-external"}`)}
 		case "review-fix":
-			return &agent.Result{Output: []byte(`{"summary":"fix the bug"}`)}
+			return &agent.Result{Output: completeSemanticRepairResult("fix the bug")}
 		default:
 			t.Errorf("unexpected agent purpose %q", opts.Purpose)
 			return &agent.Result{Output: []byte(`{}`)}
@@ -164,14 +169,16 @@ func TestReviewLoop_IndependentReviewTurnsOneFixerSession(t *testing.T) {
 		}
 	}
 
-	// One durable fixer session: started on the first fix turn, resumed on
-	// the second.
+	// The first repair starts a fixer session. The second repair starts fresh
+	// instead of resuming the context that already failed to clear review.
 	if fixes[0].Session == nil || fixes[0].Session.ID != "" {
 		t.Fatalf("first fix must start the fixer session, got %+v", fixes[0].Session)
 	}
-	fixerID := "sess-1"
-	if fixes[1].Session == nil || fixes[1].Session.ID != fixerID {
-		t.Fatalf("second fix must resume %s, got %+v", fixerID, fixes[1].Session)
+	if fixes[1].Session == nil || fixes[1].Session.ID != "" {
+		t.Fatalf("second fix must start a fresh fixer session, got %+v", fixes[1].Session)
+	}
+	if !strings.Contains(fixes[1].Prompt, "Fresh semantic-repair escalation") {
+		t.Fatalf("second fix prompt missing fresh escalation context:\n%s", fixes[1].Prompt)
 	}
 
 	// Every review round, including rereviews inside the resumed session,
@@ -194,8 +201,56 @@ func TestReviewLoop_IndependentReviewTurnsOneFixerSession(t *testing.T) {
 	if len(sessions) != 1 {
 		t.Fatalf("expected 1 persisted role session (fixer), got %d", len(sessions))
 	}
-	if sessions[0].Role != string(pipeline.SessionRoleFixer) || sessions[0].SessionID == "" || sessions[0].Agent != "session-mock" {
+	if sessions[0].Role != string(pipeline.SessionRoleFixer) || sessions[0].SessionID != "sess-2" || sessions[0].Agent != "session-mock" {
 		t.Fatalf("unexpected persisted session: %+v", sessions[0])
+	}
+}
+
+func TestReviewLoop_SameFileRecurrenceAfterFreshRepairParks(t *testing.T) {
+	reviewRound := 0
+	mock := &sessionMockAgent{}
+	mock.respond = func(opts agent.RunOpts) *agent.Result {
+		switch opts.Purpose {
+		case "review":
+			reviewRound++
+			return &agent.Result{Output: []byte(fmt.Sprintf(
+				`{"findings":[{"id":"f-%d","severity":"error","file":"feature.txt","description":"same semantic failure remains","action":"auto-fix","review_scope":"source"}],"summary":"still broken","risk_level":"medium","risk_rationale":"public behavior remains wrong","risk_scope":"source-or-external"}`,
+				reviewRound,
+			))}
+		case "review-fix":
+			return &agent.Result{Output: completeSemanticRepairResult("repair the public behavior")}
+		default:
+			t.Errorf("unexpected agent purpose %q", opts.Purpose)
+			return &agent.Result{Output: []byte(`{}`)}
+		}
+	}
+
+	exec, database, run, repo, workDir := reviewSessionHarness(t, mock, []pipeline.Step{&ReviewStep{}})
+	done := make(chan error, 1)
+	go func() {
+		done <- exec.Execute(context.Background(), run, repo, workDir)
+	}()
+
+	waitForReviewStatus(t, database, run.ID, types.StepStatusFixReview)
+	if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("executor timed out")
+	}
+
+	reviews := reviewCalls(mock.snapshot())
+	fixes := fixCalls(mock.snapshot())
+	if len(reviews) != 3 || len(fixes) != 2 {
+		t.Fatalf("same-file recurrence should park after 3 reviews and 2 fixes, got %d reviews and %d fixes", len(reviews), len(fixes))
+	}
+	if fixes[1].Session == nil || fixes[1].Session.ID != "" {
+		t.Fatalf("second repair did not start fresh: %+v", fixes[1].Session)
 	}
 }
 
@@ -222,7 +277,7 @@ func TestReviewLoop_RereviewNeverResumesTheSessionThatPrescribedItsFixes(t *test
 			}
 			return &agent.Result{Output: []byte(`{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"clean"}`)}
 		case "review-fix":
-			return &agent.Result{Output: []byte(`{"summary":"implement the prescription"}`)}
+			return &agent.Result{Output: completeSemanticRepairResult("implement the prescription")}
 		default:
 			t.Errorf("unexpected agent purpose %q", opts.Purpose)
 			return &agent.Result{Output: []byte(`{}`)}
@@ -261,7 +316,7 @@ func TestReviewLoop_ParkRespondFixKeepsRoleSessions(t *testing.T) {
 			}
 			return &agent.Result{Output: []byte(`{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"clean"}`)}
 		default:
-			return &agent.Result{Output: []byte(`{"summary":"apply decision"}`)}
+			return &agent.Result{Output: completeSemanticRepairResult("apply decision")}
 		}
 	}
 

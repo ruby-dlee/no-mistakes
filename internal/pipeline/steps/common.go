@@ -104,9 +104,11 @@ var reviewFindingsSchema = json.RawMessage(`{
 					"line": {"type": "integer"},
 					"description": {"type": "string"},
 					"action": {"type": "string", "enum": ["no-op", "auto-fix", "ask-user"]},
-					"review_scope": {"type": "string", "enum": ["source", "pipeline-owned-delivery", "external-delivery"]}
+					"review_scope": {"type": "string", "enum": ["source", "pipeline-owned-delivery", "external-delivery"]},
+					"semantic_family": {"type": "string", "enum": ["local-mechanical", "contract-schema", "parser-serialization", "auth-permission", "security-safety", "deploy-routing", "generated-artifact", "product-behavior", "integration-compatibility"]},
+					"semantic_root": {"type": "string", "minLength": 1}
 				},
-				"required": ["severity", "description", "action", "review_scope"]
+				"required": ["severity", "description", "action", "review_scope", "semantic_family", "semantic_root"]
 			}
 		},
 		"tested": {

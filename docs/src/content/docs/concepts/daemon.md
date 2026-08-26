@@ -55,7 +55,7 @@ no-mistakes update
 
 `no-mistakes update` stops and starts the daemon when it is running, or when stale daemon artifacts exist, so the new executable is used.
 It prefers the managed service path and falls back to a detached daemon if service startup is unavailable or fails.
-If pending or running pipeline runs exist, `update` refuses to restart the daemon by default and prints each active run's ID, status, branch, and short head SHA. Pass `--force` to restart the daemon anyway and accept that those runs may fail; `-y`/`--yes` does not bypass this guard.
+If the daemon owns a current run goroutine or an exact, unexpired review, repair, or test worker lease exists, `update`, `daemon stop`, and `daemon restart` refuse by default and print the affected run or worker identity. Historical pending/running rows and durable CI waits are not executing work and do not block lifecycle operations. A recorded daemon that cannot answer the bounded liveness query fails closed. Pass `--force` to proceed despite real work; `-y`/`--yes` does not bypass this guard.
 If the daemon is already running from a different executable path, update still prompts before replacing it; `-y`/`--yes` answers that prompt non-interactively.
 If the daemon executable path cannot be determined, the update aborts before replacing anything.
 
@@ -77,6 +77,12 @@ At startup - before crash recovery runs and before the socket is bound - the dae
 A second daemon started against the same root fails with "a no-mistakes daemon is already running for this NM_HOME" (with the holder's PID and start time when available) instead of stealing the first daemon's socket and running crash recovery against its live runs.
 The OS releases the lock automatically when the owning process exits or crashes, even on SIGKILL, so unlike the PID file the lock can never go stale.
 As an independent safety layer, the daemon also refuses to bind the Unix socket while something is still answering on it; only a provably stale socket file (nothing listening) is removed and rebound.
+
+### Optional GitHub coordinator
+
+The daemon can also own a bounded GitHub webhook listener and one shared durable CI reconciler. This is off by default and does not change the local-only installation path. An operator must explicitly enable the trusted global [`coordinator`](/no-mistakes/reference/global-config/#coordinator) block and provide its HMAC secret through the configured environment key.
+
+When enabled, webhook payloads are signature-checked and reduced to bounded delivery metadata. They are never treated as CI truth: the same GitHub SCM authority used by pipeline CI refetches the current PR head, lifecycle, and exact-head checks before the reducer updates the durable wait, run, and CI step. A process-wide ticker recovers missed webhooks and resumes persisted waits immediately after restart. Startup refuses a missing secret or failed listener bind, and daemon shutdown cancels reconciliation and drains the HTTP server before exit.
 
 ## What it does
 
@@ -115,7 +121,9 @@ reason about in one long-lived process than inside independent hook invocations.
 On startup, the daemon checks for runs that were left in `pending` or `running` status (which means the daemon crashed while they were active):
 
 - Completes legacy active rows whose persisted PR state is already `merged` or `closed`, including their CI step, before active-run recovery and parked-run planning
-- Resumes only fully recorded parked approval gates whose worktree and step history can be validated; incomplete or ambiguous active runs fail closed
+- Fails a protected `pending` row left between durable run protection and executor registration before any provider setup, restoring its sealed repository, branch, and submitted head so it cannot wedge a later run; likewise anchors the exact managed-worktree head before projecting an already-journaled signed cancellation without recreating an executor
+- Keeps a public-key-bound protected gate compute-idle until a fresh controller-signed checkpoint verifies the externally retained decision-history head, then resumes only if its worktree and step history also validate
+- Fails an unbound legacy parked gate closed while retaining its verified custody head; after restart, a missing local authority row cannot safely distinguish a real legacy run from a protected run whose same-UID workload deleted all protection rows
 - Before resuming a parked CI gate, re-checks its persisted PR URL through the configured provider; a currently merged or closed PR completes the stale gate, while an open, unknown, or unreachable PR remains parked
 - Preserves a run that was actively monitoring CI for an already-created PR as `ci_monitor_interrupted` rather than failing it: the PR is still open, so a restart mid-monitor is not a pipeline failure. That run is terminal and never resumed
 - Before failing any other stale active run, verifies its managed worktree head and pins an unpublished descendant under the run-specific recovery ref so later rerun or guarded custody recovery does not fall back to a stale gate branch

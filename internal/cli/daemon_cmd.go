@@ -1,12 +1,15 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/daemon"
 	"github.com/kunchenguid/no-mistakes/internal/gatecontext"
@@ -106,6 +109,10 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			ownerConfig, err := parseOwnerDecisionPushOptions(pushOptions)
+			if err != nil {
+				return err
+			}
 			gatePath, err := normalizeNotifyGatePath(gate)
 			if err != nil {
 				return err
@@ -124,12 +131,13 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 
 			var result ipc.PushReceivedResult
 			return client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
-				Gate:      gatePath,
-				Ref:       ref,
-				Old:       oldSHA,
-				New:       newSHA,
-				SkipSteps: skipSteps,
-				Intent:    intent,
+				Gate:          gatePath,
+				Ref:           ref,
+				Old:           oldSHA,
+				New:           newSHA,
+				SkipSteps:     skipSteps,
+				Intent:        intent,
+				OwnerDecision: ownerConfig,
 			}, &result)
 		},
 	}
@@ -193,6 +201,7 @@ func parseSkipSteps(value string) ([]types.StepName, error) {
 // The value is base64-encoded so multi-line or special-character intents
 // survive the push-option transport (which is line-oriented).
 const intentPushOptionPrefix = "no-mistakes.intent="
+const ownerDecisionPushOptionPrefix = "no-mistakes.owner-decision="
 
 // formatIntentPushOption encodes intent as a single push option, or returns ""
 // when there is no intent to carry.
@@ -219,6 +228,45 @@ func parseIntentPushOptions(options []string) (string, error) {
 		intent = string(decoded)
 	}
 	return intent, nil
+}
+
+func formatOwnerDecisionPushOption(config *ipc.OwnerDecisionRunConfig) (string, error) {
+	if config == nil {
+		return "", nil
+	}
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		return "", err
+	}
+	return ownerDecisionPushOptionPrefix + base64.StdEncoding.EncodeToString(encoded), nil
+}
+
+func parseOwnerDecisionPushOptions(options []string) (*ipc.OwnerDecisionRunConfig, error) {
+	var config *ipc.OwnerDecisionRunConfig
+	for _, option := range options {
+		encoded, ok := strings.CutPrefix(option, ownerDecisionPushOptionPrefix)
+		if !ok {
+			continue
+		}
+		if config != nil {
+			return nil, fmt.Errorf("duplicate owner-decision push option")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("decode owner-decision push option: %w", err)
+		}
+		var next ipc.OwnerDecisionRunConfig
+		decoder := json.NewDecoder(bytes.NewReader(decoded))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&next); err != nil {
+			return nil, fmt.Errorf("decode owner-decision push option: %w", err)
+		}
+		if err := requireJSONEOF(decoder); err != nil {
+			return nil, fmt.Errorf("decode owner-decision push option: %w", err)
+		}
+		config = &next
+	}
+	return config, nil
 }
 
 func formatSkipPushOptions(steps []types.StepName) []string {
@@ -300,7 +348,7 @@ func newDaemonStopCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "stop the daemon even when pipeline runs are active")
+	cmd.Flags().BoolVar(&force, "force", false, "stop the daemon even when pipeline executions are active")
 	return cmd
 }
 
@@ -333,24 +381,24 @@ func newDaemonRestartCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "restart the daemon even when pipeline runs are active")
+	cmd.Flags().BoolVar(&force, "force", false, "restart the daemon even when pipeline executions are active")
 	return cmd
 }
 
 func guardDestructiveDaemonLifecycle(p *paths.Paths, stderr io.Writer, action string, force bool) error {
-	runs, err := lifecycle.ActiveRuns(p)
+	work, err := lifecycle.ActiveWork(p, time.Now())
 	if err != nil {
-		return fmt.Errorf("check active pipeline runs: %w", err)
+		return fmt.Errorf("check active pipeline execution: %w", err)
 	}
-	if len(runs) == 0 {
+	if work.Count() == 0 {
 		return nil
 	}
 	if force {
-		fmt.Fprintf(stderr, "FORCE: %s will stop/restart the daemon while %d active pipeline runs are in progress\n", action, len(runs))
-		fmt.Fprint(stderr, lifecycle.RunList(runs))
+		fmt.Fprintf(stderr, "FORCE: %s will stop/restart the daemon while %d active pipeline executions are in progress\n", action, work.Count())
+		fmt.Fprint(stderr, lifecycle.WorkList(work))
 		return nil
 	}
-	return fmt.Errorf("refusing %s because %d active pipeline runs are in progress; pass --force to stop/restart the daemon anyway\n%s", action, len(runs), lifecycle.RunList(runs))
+	return fmt.Errorf("refusing %s because %d active pipeline executions are in progress; pass --force to stop/restart the daemon anyway\n%s", action, work.Count(), lifecycle.WorkList(work))
 }
 
 func newDaemonStatusCmd() *cobra.Command {

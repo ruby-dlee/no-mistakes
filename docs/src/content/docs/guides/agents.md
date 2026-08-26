@@ -203,7 +203,7 @@ Six global config fields tune resolution and invocation, and the [Global Config 
 
 ## Review session reuse
 
-With the default `session_reuse: true`, Claude, Codex, Grok, Pi, and Antigravity keep one durable review-fixer session per run, and resume failures fall back to a fresh fixer session instead of skipping the fix turn. Pi stores its native fixer transcript in Pi's session directory; no-mistakes persists only the minimum session identity needed to resume it.
+With the default `session_reuse: true`, Claude, Codex, Grok, Pi, and Antigravity may retain the fixer session for the first semantic repair. Before a second repair, no-mistakes drops that identity and starts a fresh fixer from explicit round history; a same-file recurrence after the fresh repair parks for primary-agent handoff. Resume failures likewise fall back to a fresh fixer session instead of skipping the turn. Pi stores its native fixer transcript in Pi's session directory; no-mistakes persists only the minimum session identity needed to resume it.
 Review turns always run in fresh, session-free invocations: a rereview certifies fixes that implement the previous review turn's findings, so it must never resume the session that prescribed them.
 The [`session_reuse` field reference](/no-mistakes/reference/global-config/#session_reuse) owns the exact reuse, fallback, privacy, and restart-recovery semantics.
 
@@ -290,7 +290,7 @@ Starts a persistent HTTP server (`opencode serve`) on first use and reuses it ac
 
 ## Pi
 
-Spawns a `pi` subprocess for each invocation with `--mode json`. Cold invocations add `--no-session`; with `session_reuse: true`, review-fixer turns instead create and resume one Pi session per run via `--session <UUID>`.
+Spawns a `pi` subprocess for each invocation with `--mode json`. Cold invocations add `--no-session`; with `session_reuse: true`, the first review-fixer turn creates a Pi session via `--session <UUID>`. A later semantic repair discards that identity and creates a fresh Pi session instead of resuming the failed repair context.
 Model and reasoning effort come from [`agent_config.pi`](/no-mistakes/reference/global-config/#agent_config), rendered as `--model` and `--thinking`. See [`agent_args_override`](/no-mistakes/reference/global-config/#agent_args_override) for Pi override precedence.
 Reads JSONL events from stdout and streams incremental text deltas to the TUI.
 When structured output is requested, no-mistakes injects the JSON schema into the prompt and validates the final text response.

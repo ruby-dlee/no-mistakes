@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,6 +60,9 @@ const (
 	DefaultDaemonConnectTimeout = 3 * time.Second
 	// DefaultBranchSyncRemoteTimeout bounds each remote Git operation (ls-remote, fetch) in internal/branchsync. Global-config-only; a pushed branch cannot change it. Timeout still fails closed.
 	DefaultBranchSyncRemoteTimeout = 60 * time.Second
+	// DefaultCoordinatorReconcileInterval is the durable CI wait polling floor
+	// when the explicitly enabled daemon coordinator receives no webhook.
+	DefaultCoordinatorReconcileInterval = time.Minute
 	// CITimeoutUnlimited is the sentinel meaning "monitor until the PR is
 	// merged, closed, or the run is aborted - never self-terminate".
 	// Any non-positive ci_timeout, or the keywords "unlimited", "none",
@@ -135,9 +140,10 @@ type GlobalConfig struct {
 	BranchSyncRemoteTimeout time.Duration     `yaml:"-"`
 	LogLevel                string            `yaml:"log_level"`
 	// SessionReuse controls per-run agent session reuse in the review loop:
-	// one durable fixer session across review-fix turns. Review turns always
-	// run session-free so the rereview never resumes the session whose
-	// findings prescribed the fixes it certifies. Default true; set
+	// the first semantic repair may keep its fixer context, but a second repair
+	// resets that identity and starts fresh. Review turns always run session-free
+	// so the rereview never resumes the session whose findings prescribed the
+	// fixes it certifies. Default true; set
 	// session_reuse: false to force every invocation cold.
 	SessionReuse bool `yaml:"-"`
 	AutoFix      AutoFixRaw
@@ -154,6 +160,60 @@ type GlobalConfig struct {
 	// record replay provenance), never a repository policy. Keeping it out of
 	// RepoConfig means no pushed branch can enable, disable, or resize it.
 	Eval Eval
+	// Coordinator is global-only daemon infrastructure. Repository config can
+	// neither expose its listener nor select the environment variable carrying
+	// its webhook secret.
+	Coordinator Coordinator
+	// AzureWorker is a global-only opt-in transport to a trusted Firstmate
+	// wrapper. Repository config can never select executable or fleet config
+	// paths. Disabled is the default, preserving the local pipeline.
+	AzureWorker AzureWorkerConfig
+}
+
+// Coordinator configures the optional process-local webhook and CI reconciler.
+// The secret value itself is never configuration; only its environment key is.
+type Coordinator struct {
+	Enabled                bool
+	ListenAddress          string
+	GitHubWebhookSecretEnv string
+	ReconcileInterval      time.Duration
+	BatchSize              int
+	MaxConcurrency         int
+}
+
+type coordinatorRaw struct {
+	Enabled                *bool  `yaml:"enabled"`
+	ListenAddress          string `yaml:"listen_address"`
+	GitHubWebhookSecretEnv string `yaml:"github_webhook_secret_env"`
+	ReconcileInterval      string `yaml:"reconcile_interval"`
+	BatchSize              *int   `yaml:"batch_size"`
+	MaxConcurrency         *int   `yaml:"max_concurrency"`
+}
+
+// AzureWorkerConfig contains only controller-side transport policy. The
+// wrapper's own config owns Firstmate account, assignment, and Azure details.
+type AzureWorkerConfig struct {
+	Enabled           bool
+	RunnerPath        string
+	ConfigPath        string
+	ReviewConcurrency int
+	RepairConcurrency int
+	TestConcurrency   int
+	LeaseDuration     time.Duration
+	HeartbeatInterval time.Duration
+	Timeout           time.Duration
+}
+
+type azureWorkerRaw struct {
+	Enabled           bool   `yaml:"enabled"`
+	RunnerPath        string `yaml:"runner_path"`
+	ConfigPath        string `yaml:"config_path"`
+	ReviewConcurrency *int   `yaml:"review_concurrency"`
+	RepairConcurrency *int   `yaml:"repair_concurrency"`
+	TestConcurrency   *int   `yaml:"test_concurrency"`
+	LeaseDuration     string `yaml:"lease_duration"`
+	HeartbeatInterval string `yaml:"heartbeat_interval"`
+	Timeout           string `yaml:"timeout"`
 }
 
 // globalConfigRaw is the on-disk YAML representation with duration as string.
@@ -182,6 +242,8 @@ type globalConfigRaw struct {
 	Intent                  IntentRaw                  `yaml:"intent"`
 	Test                    TestRaw                    `yaml:"test"`
 	Eval                    EvalRaw                    `yaml:"eval"`
+	Coordinator             coordinatorRaw             `yaml:"coordinator"`
+	AzureWorker             azureWorkerRaw             `yaml:"azure_worker"`
 }
 
 // RepoConfig represents .no-mistakes.yaml in a repo root.
@@ -484,6 +546,8 @@ type Config struct {
 	LogLevel              string
 	SessionReuse          bool
 	Eval                  Eval
+	Coordinator           Coordinator
+	AzureWorker           AzureWorkerConfig
 	Commands              Commands
 	IgnorePatterns        []string
 	AutoFix               AutoFix
@@ -763,9 +827,35 @@ daemon_connect_timeout: "3s"
 # (ls-remote or fetch) before treating the target as offline. Global-only.
 branch_sync_remote_timeout: "60s"
 
-# Reuse one durable fixer session per run across review-fix turns. Review turns
-# always run session-free so a rereview never resumes the session that prescribed
-# its fixes. Supported for claude, codex, grok, and pi; other agents run cold.
+# Optional daemon coordinator. Disabled by default, so no TCP listener exists
+# unless the operator explicitly enables this trusted global setting. The
+# webhook secret value is read only from the named process environment variable.
+coordinator:
+  enabled: false
+  listen_address: "127.0.0.1:9783"
+  github_webhook_secret_env: "NO_MISTAKES_GITHUB_WEBHOOK_SECRET"
+  reconcile_interval: "60s"
+  batch_size: 100
+  max_concurrency: 4
+
+# Optional Firstmate-owned Azure worker transport. Disabled by default, so the
+# existing local review/repair/test path is unchanged. Both paths are trusted,
+# absolute machine configuration and cannot be supplied by a repository.
+# azure_worker:
+#   enabled: true
+#   runner_path: /opt/firstmate/bin/fm-no-mistakes-worker
+#   config_path: /etc/firstmate/no-mistakes-worker.yaml
+#   review_concurrency: 1
+#   repair_concurrency: 1
+#   test_concurrency: 1
+#   lease_duration: 2m
+#   heartbeat_interval: 30s
+#   timeout: 30m
+
+# Reuse a fixer session for the first semantic repair; a second repair resets the
+# persisted identity and starts fresh. Review turns always run session-free so a
+# rereview never resumes the session that prescribed its fixes. Supported for
+# claude, codex, grok, and pi; other agents run cold.
 # Set false to force every agent invocation cold.
 session_reuse: true
 
@@ -1553,6 +1643,24 @@ func DefaultGlobalConfig() *GlobalConfig {
 		LogLevel:                "info",
 		SessionReuse:            true,
 		Eval:                    evalDefaults(),
+		Coordinator:             coordinatorDefaults(),
+		AzureWorker: AzureWorkerConfig{
+			ReviewConcurrency: 1,
+			RepairConcurrency: 1,
+			TestConcurrency:   1,
+			LeaseDuration:     2 * time.Minute,
+			HeartbeatInterval: 30 * time.Second,
+			Timeout:           30 * time.Minute,
+		},
+	}
+}
+
+func coordinatorDefaults() Coordinator {
+	return Coordinator{
+		Enabled: false, ListenAddress: "127.0.0.1:9783",
+		GitHubWebhookSecretEnv: "NO_MISTAKES_GITHUB_WEBHOOK_SECRET",
+		ReconcileInterval:      DefaultCoordinatorReconcileInterval,
+		BatchSize:              100, MaxConcurrency: 4,
 	}
 }
 
@@ -1722,6 +1830,9 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	if err := validateEvalRaw(raw.Eval); err != nil {
 		return nil, fmt.Errorf("parse global config: %w", err)
 	}
+	if err := validateCoordinatorRaw(raw.Coordinator); err != nil {
+		return nil, fmt.Errorf("parse global config: %w", err)
+	}
 
 	if len(raw.Agent) > 0 {
 		cfg.Agents = copyAgents(raw.Agent)
@@ -1828,7 +1939,143 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	cfg.Intent = raw.Intent
 	cfg.Test = raw.Test
 	applyEvalOverrides(&cfg.Eval, &raw.Eval)
+	applyCoordinatorOverrides(&cfg.Coordinator, raw.Coordinator)
+	azureWorker, err := parseAzureWorker(raw.AzureWorker, cfg.AzureWorker)
+	if err != nil {
+		return nil, err
+	}
+	cfg.AzureWorker = azureWorker
 
+	return cfg, nil
+}
+
+func validateCoordinatorRaw(raw coordinatorRaw) error {
+	resolved := coordinatorDefaults()
+	applyCoordinatorOverrides(&resolved, raw)
+	if _, port, err := net.SplitHostPort(resolved.ListenAddress); err != nil {
+		return fmt.Errorf("coordinator.listen_address %q must be host:port", resolved.ListenAddress)
+	} else if numeric, err := strconv.Atoi(port); err != nil || numeric < 1 || numeric > 65535 {
+		return fmt.Errorf("coordinator.listen_address %q must use port 1..65535", resolved.ListenAddress)
+	}
+	if !validEnvironmentKey(resolved.GitHubWebhookSecretEnv) || len(resolved.GitHubWebhookSecretEnv) > 64 {
+		return fmt.Errorf("coordinator.github_webhook_secret_env must be a bounded environment key")
+	}
+	if resolved.ReconcileInterval < time.Second || resolved.ReconcileInterval > 24*time.Hour {
+		return fmt.Errorf("coordinator.reconcile_interval must be 1s..24h")
+	}
+	if resolved.BatchSize < 1 || resolved.BatchSize > 100 {
+		return fmt.Errorf("coordinator.batch_size must be 1..100")
+	}
+	if resolved.MaxConcurrency < 1 || resolved.MaxConcurrency > 16 {
+		return fmt.Errorf("coordinator.max_concurrency must be 1..16")
+	}
+	return nil
+}
+
+func applyCoordinatorOverrides(dst *Coordinator, raw coordinatorRaw) {
+	if raw.Enabled != nil {
+		dst.Enabled = *raw.Enabled
+	}
+	if strings.TrimSpace(raw.ListenAddress) != "" {
+		dst.ListenAddress = strings.TrimSpace(raw.ListenAddress)
+	}
+	if strings.TrimSpace(raw.GitHubWebhookSecretEnv) != "" {
+		dst.GitHubWebhookSecretEnv = strings.TrimSpace(raw.GitHubWebhookSecretEnv)
+	}
+	if strings.TrimSpace(raw.ReconcileInterval) != "" {
+		if duration, err := time.ParseDuration(raw.ReconcileInterval); err == nil {
+			dst.ReconcileInterval = duration
+		} else {
+			dst.ReconcileInterval = 0
+		}
+	}
+	if raw.BatchSize != nil {
+		dst.BatchSize = *raw.BatchSize
+	}
+	if raw.MaxConcurrency != nil {
+		dst.MaxConcurrency = *raw.MaxConcurrency
+	}
+}
+
+func validEnvironmentKey(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index, char := range value {
+		if index == 0 {
+			if char != '_' && (char < 'A' || char > 'Z') {
+				return false
+			}
+			continue
+		}
+		if char != '_' && (char < 'A' || char > 'Z') && (char < '0' || char > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func parseAzureWorker(raw azureWorkerRaw, defaults AzureWorkerConfig) (AzureWorkerConfig, error) {
+	cfg := defaults
+	cfg.Enabled = raw.Enabled
+	cfg.RunnerPath = strings.TrimSpace(raw.RunnerPath)
+	cfg.ConfigPath = strings.TrimSpace(raw.ConfigPath)
+	if raw.ReviewConcurrency != nil {
+		cfg.ReviewConcurrency = *raw.ReviewConcurrency
+	}
+	if raw.RepairConcurrency != nil {
+		cfg.RepairConcurrency = *raw.RepairConcurrency
+	}
+	if raw.TestConcurrency != nil {
+		cfg.TestConcurrency = *raw.TestConcurrency
+	}
+	parse := func(name, value string, current *time.Duration) error {
+		if value == "" {
+			return nil
+		}
+		d, err := parsePositiveDuration("azure_worker."+name, value)
+		if err != nil {
+			return err
+		}
+		*current = d
+		return nil
+	}
+	if err := parse("lease_duration", raw.LeaseDuration, &cfg.LeaseDuration); err != nil {
+		return AzureWorkerConfig{}, err
+	}
+	if err := parse("heartbeat_interval", raw.HeartbeatInterval, &cfg.HeartbeatInterval); err != nil {
+		return AzureWorkerConfig{}, err
+	}
+	if err := parse("timeout", raw.Timeout, &cfg.Timeout); err != nil {
+		return AzureWorkerConfig{}, err
+	}
+	if !cfg.Enabled {
+		return cfg, nil
+	}
+	if !filepath.IsAbs(cfg.RunnerPath) || !filepath.IsAbs(cfg.ConfigPath) {
+		return AzureWorkerConfig{}, errors.New("parse azure_worker: enabled runner_path and config_path must be absolute")
+	}
+	for name, value := range map[string]int{
+		"review_concurrency": cfg.ReviewConcurrency,
+		"repair_concurrency": cfg.RepairConcurrency,
+		"test_concurrency":   cfg.TestConcurrency,
+	} {
+		if value < 1 || value > 16 {
+			return AzureWorkerConfig{}, fmt.Errorf("parse azure_worker.%s: must be between 1 and 16", name)
+		}
+	}
+	if cfg.ReviewConcurrency+cfg.RepairConcurrency+cfg.TestConcurrency > 16 {
+		return AzureWorkerConfig{}, errors.New("parse azure_worker: aggregate worker concurrency must not exceed 16")
+	}
+	if cfg.LeaseDuration < time.Minute || cfg.LeaseDuration > 24*time.Hour || cfg.LeaseDuration%time.Second != 0 {
+		return AzureWorkerConfig{}, errors.New("parse azure_worker.lease_duration: must be whole seconds between one minute and 24 hours")
+	}
+	if cfg.HeartbeatInterval < time.Second || cfg.HeartbeatInterval >= cfg.LeaseDuration/2 {
+		return AzureWorkerConfig{}, errors.New("parse azure_worker.heartbeat_interval: must be at least one second and less than half the lease duration")
+	}
+	if cfg.Timeout < time.Minute || cfg.Timeout > 24*time.Hour {
+		return AzureWorkerConfig{}, errors.New("parse azure_worker.timeout: must be between one minute and 24 hours")
+	}
 	return cfg, nil
 }
 
@@ -2423,6 +2670,8 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		// Eval is global-only by design (see GlobalConfig.Eval), so it is
 		// copied straight through with no repository override step.
 		Eval:           global.Eval,
+		Coordinator:    global.Coordinator,
+		AzureWorker:    global.AzureWorker,
 		Commands:       repo.Commands,
 		IgnorePatterns: repo.IgnorePatterns,
 		AutoFix:        af,

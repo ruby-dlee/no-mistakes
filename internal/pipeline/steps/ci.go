@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/cimonitor"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -207,6 +209,16 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	}
 	if strings.TrimSpace(pr.BaseBranch) != "" {
 		baseBranch = strings.TrimSpace(pr.BaseBranch)
+	}
+	if sctx.Config.Coordinator.Enabled && provider == scm.ProviderGitHub {
+		deferred, err := registerCoordinatorCIWait(sctx, prNumber)
+		if err != nil {
+			return nil, err
+		}
+		if deferred {
+			sctx.Log(fmt.Sprintf("CI monitoring for PR #%s transferred to the durable coordinator", prNumber))
+			return &pipeline.StepOutcome{Deferred: true}, nil
+		}
 	}
 
 	// CITimeout semantics: <0 (or "unlimited" in config) means never
@@ -604,6 +616,54 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 			return nil, err
 		}
 	}
+}
+
+func registerCoordinatorCIWait(sctx *pipeline.StepContext, prNumber string) (bool, error) {
+	parsedPR, err := strconv.ParseInt(prNumber, 10, 64)
+	if err != nil || parsedPR <= 0 {
+		return false, fmt.Errorf("register coordinator CI wait: invalid PR number")
+	}
+	head := strings.ToLower(strings.TrimSpace(sctx.Run.HeadSHA))
+	input := db.CIWaitInputDigest(sctx.Repo.ID, sctx.Run.Branch, parsedPR, head)
+	if existing, err := sctx.DB.GetCIWaitForRun(sctx.Run.ID); err != nil {
+		return false, fmt.Errorf("load coordinator CI wait: %w", err)
+	} else if existing != nil {
+		if existing.RepoID == sctx.Repo.ID && existing.Branch == sctx.Run.Branch &&
+			existing.PRNumber == parsedPR && existing.HeadSHA == head && existing.InputDigest == input &&
+			existing.DeclaredNoCI == sctx.Config.NoCI && existing.TrustedConfigBound &&
+			existing.EvidenceLocalRoot == sctx.Config.Test.Evidence.LocalRoot &&
+			(existing.Status == db.CIWaitWaiting || existing.Status == db.CIWaitReady) {
+			return true, nil
+		}
+		return false, fmt.Errorf("register coordinator CI wait: existing run wait changed exact binding or custody")
+	}
+	now := time.Now()
+	desired, _, _, err := sctx.DB.AdvanceBranchDesiredState(db.BranchDesiredUpdate{
+		RepoID: sctx.Repo.ID, Branch: sctx.Run.Branch, HeadSHA: head,
+		InputDigest: input, UpdatedAt: now,
+	})
+	if err != nil {
+		return false, fmt.Errorf("advance coordinator desired state: %w", err)
+	}
+	if _, err := sctx.DB.RegisterCIWait(db.CIWaitSpec{
+		RunID: sctx.Run.ID, RepoID: sctx.Repo.ID, Branch: sctx.Run.Branch,
+		PRNumber: parsedPR, HeadSHA: head, InputDigest: input,
+		DesiredGeneration: desired.Revision, RegisteredAt: now,
+		ReconcileInterval:  coordinatorCIWaitInterval(sctx.Config.Coordinator.ReconcileInterval),
+		DeclaredNoCI:       sctx.Config.NoCI,
+		EvidenceLocalRoot:  sctx.Config.Test.Evidence.LocalRoot,
+		TrustedConfigBound: true,
+	}); err != nil {
+		return false, fmt.Errorf("register coordinator CI wait: %w", err)
+	}
+	return true, nil
+}
+
+func coordinatorCIWaitInterval(interval time.Duration) time.Duration {
+	if interval < time.Minute {
+		return time.Minute
+	}
+	return interval
 }
 
 func logCIMonitorStatus(sctx *pipeline.StepContext, message, previous string) string {

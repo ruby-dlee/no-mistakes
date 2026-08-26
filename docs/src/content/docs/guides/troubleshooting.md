@@ -86,9 +86,9 @@ If you have multiple installs with different `NM_HOME` roots, each gets its own 
 
 ## `no-mistakes update` refuses or aborts
 
-Symptom: `update` refuses because active pipeline runs are in progress, prompts because the daemon is running from a different executable path, or aborts because the daemon executable path cannot be determined.
+Symptom: `update` refuses because the daemon reports active execution, a worker lease is live, or a recorded daemon cannot answer the bounded liveness query; prompts because the daemon is running from a different executable path; or aborts because the daemon executable path cannot be determined.
 
-`update`, `daemon stop`, and `daemon restart` all refuse by default while pipeline runs are active and list the affected runs; [Daemon & Worktrees](/no-mistakes/concepts/daemon/#starting-and-stopping) owns the guard's exact rules, including why `-y`/`--yes` does not bypass it.
+`update`, `daemon stop`, and `daemon restart` all refuse by default while the daemon owns a current run goroutine or an exact, unexpired review, repair, or test worker lease exists; historical run rows and CI waits do not count. [Daemon & Worktrees](/no-mistakes/concepts/daemon/#starting-and-stopping) owns the guard's exact rules, including why `-y`/`--yes` does not bypass it.
 
 First inspect each listed run with `no-mistakes axi status --run <id>`.
 A parked CI gate can clear itself after its PR becomes terminal, including after a daemon restart.
