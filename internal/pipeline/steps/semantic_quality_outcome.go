@@ -13,13 +13,14 @@ import (
 )
 
 type semanticQualityObservation struct {
-	PreviousFindings string
-	Findings         Findings
-	Evidence         semanticRepairEvidence
-	RepairAttempt    int
-	FixedHeadSHA     string
-	ObservedHeadSHA  string
-	StructuredReview bool
+	PreviousFindings  string
+	Findings          Findings
+	Evidence          semanticRepairEvidence
+	RepairAttempt     int
+	FixedHeadSHA      string
+	ObservedHeadSHA   string
+	StructuredReview  bool
+	FixerChangedPaths []string
 }
 
 type semanticQualityIdentity struct {
@@ -62,6 +63,8 @@ func recordSemanticRepairQualityOutcome(sctx *pipeline.StepContext, observation 
 		PreviousEvidence    string                   `json:"previous_evidence_digest"`
 		ObservedEvidence    string                   `json:"observed_evidence_digest"`
 		RepairProofEvidence string                   `json:"repair_proof_evidence_digest"`
+		ExecutorProof       *semanticExecutorProof   `json:"executor_proof,omitempty"`
+		FixerChangedPaths   []string                 `json:"fixer_changed_paths,omitempty"`
 		PreviousIdentity    semanticQualityIdentity  `json:"previous_identity"`
 		ObservedIdentity    semanticQualityIdentity  `json:"observed_identity"`
 	}{
@@ -72,6 +75,8 @@ func recordSemanticRepairQualityOutcome(sctx *pipeline.StepContext, observation 
 		PreviousEvidence:    previousDigest,
 		ObservedEvidence:    observedDigest,
 		RepairProofEvidence: repairProofDigest,
+		ExecutorProof:       observation.Evidence.executorProof,
+		FixerChangedPaths:   normalizedSemanticPaths(observation.FixerChangedPaths),
 		PreviousIdentity:    semanticQualityIdentityFromRaw(observation.PreviousFindings),
 		ObservedIdentity:    semanticQualityIdentityFromFindings(observation.Findings),
 	})
@@ -120,9 +125,60 @@ func classifySemanticRepairQuality(observation semanticQualityObservation) (db.Q
 		return db.QualitySameRootFollowup, firstNonEmpty(repeatedRoot, evidenceRoot)
 	}
 	if root := firstNewMaterialRoot(material, previous); root != "" {
-		return db.QualityIntroducedRegression, root
+		if provenRoot := firstProvenFixerIntroducedRoot(material, previous, observation.FixerChangedPaths); provenRoot != "" {
+			return db.QualityIntroducedRegression, provenRoot
+		}
+		return db.QualityPrimaryHandoff, root
 	}
 	return db.QualityPrimaryHandoff, evidenceRoot
+}
+
+func firstProvenFixerIntroducedRoot(items []Finding, previous semanticIdentitySet, changedPaths []string) string {
+	changed := make(map[string]bool, len(changedPaths))
+	for _, path := range normalizedSemanticPaths(changedPaths) {
+		changed[path] = true
+	}
+	for _, item := range items {
+		path := normalizeSemanticPath(item.File)
+		if path == "" || !changed[path] {
+			continue
+		}
+		if root := boundedSemanticRoot(item.SemanticRoot); root != "" && !previous.roots[root] {
+			return root
+		}
+		if family := boundedSemanticRoot(item.SemanticFamily); family != "" && !previous.families[family] {
+			return boundedSemanticRoot("family-" + family)
+		}
+		if !previous.files[strings.TrimSpace(item.File)] {
+			return fileIdentity(item.File)
+		}
+	}
+	return ""
+}
+
+func normalizedSemanticPaths(paths []string) []string {
+	seen := make(map[string]bool, len(paths))
+	var normalized []string
+	for _, path := range paths {
+		path = normalizeSemanticPath(path)
+		if path != "" && !seen[path] {
+			seen[path] = true
+			normalized = append(normalized, path)
+		}
+	}
+	sort.Strings(normalized)
+	return normalized
+}
+
+func normalizeSemanticPath(path string) string {
+	path = strings.TrimSpace(strings.ReplaceAll(path, "\\", "/"))
+	for strings.HasPrefix(path, "./") {
+		path = strings.TrimPrefix(path, "./")
+	}
+	if path == "." || strings.HasPrefix(path, "/") || strings.HasPrefix(path, "../") {
+		return ""
+	}
+	return path
 }
 
 func materialReviewFindings(items []Finding) []Finding {

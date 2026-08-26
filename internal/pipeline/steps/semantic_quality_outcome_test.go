@@ -59,13 +59,15 @@ func TestSemanticQualityOutcomeClassificationsAndBindings(t *testing.T) {
 		evidence   semanticRepairEvidence
 		findings   Findings
 		structured bool
+		changed    []string
 		want       db.QualityClassification
 		wantRoot   string
 	}{
 		{name: "clean rereview", attempt: 1, evidence: evidence, findings: Findings{}, structured: true, want: db.QualityCleanFix, wantRoot: "effective-audience"},
 		{name: "same root different file", attempt: 1, evidence: evidence, findings: Findings{Items: []Finding{materialSemanticFinding("api/audience.go", "parser-serialization", "effective-audience")}}, structured: true, want: db.QualitySameRootFollowup, wantRoot: "effective-audience"},
 		{name: "fix proof supplies missing prior identity", previous: `{"findings":[{"id":"old","severity":"error","description":"legacy finding without semantic fields"}]}`, attempt: 1, evidence: evidence, findings: Findings{Items: []Finding{materialSemanticFinding("api/audience.go", "parser-serialization", "effective-audience")}}, structured: true, want: db.QualitySameRootFollowup, wantRoot: "effective-audience"},
-		{name: "new material root", attempt: 1, evidence: evidence, findings: Findings{Items: []Finding{materialSemanticFinding("api/auth.go", "auth-permission", "tenant-isolation")}}, structured: true, want: db.QualityIntroducedRegression, wantRoot: "tenant-isolation"},
+		{name: "new material root without fixer path proof", attempt: 1, evidence: evidence, findings: Findings{Items: []Finding{materialSemanticFinding("api/auth.go", "auth-permission", "tenant-isolation")}}, structured: true, want: db.QualityPrimaryHandoff, wantRoot: "tenant-isolation"},
+		{name: "new material root on fixer changed path", attempt: 1, evidence: evidence, findings: Findings{Items: []Finding{materialSemanticFinding("api/auth.go", "auth-permission", "tenant-isolation")}}, structured: true, changed: []string{"api/auth.go"}, want: db.QualityIntroducedRegression, wantRoot: "tenant-isolation"},
 		{name: "incomplete proof", attempt: 1, evidence: semanticRepairEvidence{RepairComplete: false, SemanticRoot: "effective-audience"}, findings: Findings{}, structured: true, want: db.QualityPrimaryHandoff, wantRoot: "effective-audience"},
 		{name: "second same-root escalation", attempt: 2, evidence: evidence, findings: Findings{Items: []Finding{materialSemanticFinding("api/audience.go", "parser-serialization", "effective-audience")}}, structured: true, want: db.QualityPrimaryHandoff, wantRoot: "effective-audience"},
 		{name: "unstructured rereview", attempt: 1, evidence: evidence, findings: Findings{}, structured: false, want: db.QualityPrimaryHandoff, wantRoot: "effective-audience"},
@@ -80,13 +82,14 @@ func TestSemanticQualityOutcomeClassificationsAndBindings(t *testing.T) {
 				previousFindings = tt.previous
 			}
 			err := recordSemanticRepairQualityOutcome(sctx, semanticQualityObservation{
-				PreviousFindings: previousFindings,
-				Findings:         tt.findings,
-				Evidence:         tt.evidence,
-				RepairAttempt:    tt.attempt,
-				FixedHeadSHA:     strings.Repeat("1", 40),
-				ObservedHeadSHA:  strings.Repeat("2", 40),
-				StructuredReview: tt.structured,
+				PreviousFindings:  previousFindings,
+				Findings:          tt.findings,
+				Evidence:          tt.evidence,
+				RepairAttempt:     tt.attempt,
+				FixedHeadSHA:      strings.Repeat("1", 40),
+				ObservedHeadSHA:   strings.Repeat("2", 40),
+				StructuredReview:  tt.structured,
+				FixerChangedPaths: tt.changed,
 			})
 			if err != nil {
 				t.Fatal(err)

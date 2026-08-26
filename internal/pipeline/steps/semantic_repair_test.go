@@ -17,14 +17,12 @@ import (
 
 func completeSemanticRepairResult(summary string) json.RawMessage {
 	payload, _ := json.Marshal(map[string]any{
-		"summary":                            summary,
-		"repair_complete":                    true,
-		"semantic_family":                    "product-behavior",
-		"semantic_root":                      "public-regression",
-		"public_executable_check":            "go test ./internal/widget -run TestPublicRegression",
-		"fail_before":                        "TestPublicRegression failed against the pre-fix implementation",
-		"pass_after":                         "TestPublicRegression passed after the repair",
-		"integration_consumer_compatibility": "go test ./internal/consumer passed",
+		"summary":                    summary,
+		"repair_complete":            true,
+		"semantic_family":            "product-behavior",
+		"semantic_root":              "public-regression",
+		"public_executable_check":    "go test ./internal/widget -run TestPublicRegression",
+		"integration_consumer_check": "go test ./internal/consumer -run TestCompatibility",
 		"generated_artifacts": map[string]any{
 			"touched":           false,
 			"source_updated":    false,
@@ -38,14 +36,12 @@ func completeSemanticRepairResult(summary string) json.RawMessage {
 
 func incompleteSemanticRepairResult(summary string) json.RawMessage {
 	payload, _ := json.Marshal(map[string]any{
-		"summary":                            summary,
-		"repair_complete":                    false,
-		"semantic_family":                    "generated-artifact",
-		"semantic_root":                      "generated-client-contract",
-		"public_executable_check":            "not established",
-		"fail_before":                        "not established",
-		"pass_after":                         "not established",
-		"integration_consumer_compatibility": "not established",
+		"summary":                    summary,
+		"repair_complete":            false,
+		"semantic_family":            "generated-artifact",
+		"semantic_root":              "generated-client-contract",
+		"public_executable_check":    "not established",
+		"integration_consumer_check": "not established",
 		"generated_artifacts": map[string]any{
 			"touched":           false,
 			"source_updated":    false,
@@ -199,7 +195,7 @@ func TestReviewStep_FixerGetsCompleteSemanticContextAndProofContract(t *testing.
 		"trace the affected public interface through contract owners, callers, consumers, and integration boundaries",
 		"Do not hand-edit generated output",
 		"If its emitter is unavailable, leave the generated artifact untouched",
-		"fail against the pre-fix behavior and pass after the repair",
+		"pipeline will execute that command against both the pre-fix commit and repaired commit",
 	} {
 		if !strings.Contains(fixPrompt, want) {
 			t.Errorf("fixer prompt missing semantic context %q:\n%s", want, fixPrompt)
@@ -210,9 +206,7 @@ func TestReviewStep_FixerGetsCompleteSemanticContextAndProofContract(t *testing.
 		"semantic_root",
 		"repair_complete",
 		"public_executable_check",
-		"fail_before",
-		"pass_after",
-		"integration_consumer_compatibility",
+		"integration_consumer_check",
 		"generated_artifacts",
 	} {
 		if !strings.Contains(string(ag.calls[0].JSONSchema), field) {
@@ -221,10 +215,12 @@ func TestReviewStep_FixerGetsCompleteSemanticContextAndProofContract(t *testing.
 	}
 	rereviewPrompt := ag.calls[1].Prompt
 	for _, want := range []string{
-		"Semantic-repair proof (fixer claims, not independent evidence)",
-		"TestPublicRegression failed against the pre-fix implementation",
-		"go test ./internal/consumer passed",
-		"Compare these claims against the current diff and executable regression",
+		"Semantic-repair proof (executor-owned targeted evidence)",
+		"proof_status: verified",
+		"fail_before: head=",
+		"pass_after: head=",
+		"integration_after: head=",
+		"The pipeline executed these exact targeted checks outside the fixer session",
 	} {
 		if !strings.Contains(rereviewPrompt, want) {
 			t.Errorf("rereview prompt missing repair proof %q:\n%s", want, rereviewPrompt)
@@ -298,6 +294,91 @@ func TestReviewStep_IncompleteSemanticRepairProofParksEvenIfReviewerReturnsClean
 	}
 }
 
+func TestReviewStep_RevertedRepairStillGetsColdRereviewAndIntentGate(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", headSHA)
+
+	call := 0
+	ag := &mockAgent{
+		name: "reverting-semantic-fixer",
+		runFn: func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			call++
+			if call == 1 {
+				if err := os.Remove(filepath.Join(dir, "feature.txt")); err != nil {
+					return nil, err
+				}
+				return &agent.Result{Output: completeSemanticRepairResult("remove required behavior")}, nil
+			}
+			if opts.Session != nil {
+				t.Fatalf("independent rereview resumed a fixer session: %+v", opts.Session)
+			}
+			if !strings.Contains(opts.Prompt, "Intent conformance (required)") {
+				t.Fatalf("reverted repair rereview lost intent conformance:\n%s", opts.Prompt)
+			}
+			return &agent.Result{Output: json.RawMessage(`{
+				"findings":[{"id":"required-behavior-removed","severity":"error","file":"feature.txt","description":"the repair removed intent-required behavior","action":"ask-user","review_scope":"source","semantic_family":"product-behavior","semantic_root":"required-feature"}],
+				"risk_level":"high","risk_rationale":"required behavior was removed","risk_scope":"source-or-external"
+			}`)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.SemanticProofRunner = nil
+	sctx.Fixing = true
+	sctx.UserIntent = "REQUIRED: preserve feature.txt behavior."
+	sctx.IntentSource = db.RunIntentSourceAgent
+	sctx.PreviousFindings = `{"findings":[{"id":"repair","severity":"error","file":"feature.txt","description":"repair behavior","action":"ask-user","review_scope":"source","semantic_family":"product-behavior","semantic_root":"required-feature"}]}`
+
+	outcome, err := (&ReviewStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if call != 2 {
+		t.Fatalf("agent calls = %d, want fixer plus cold rereview after empty diff", call)
+	}
+	if !outcome.NeedsApproval || !hasAskUserFindings(t, outcome.Findings) {
+		t.Fatalf("reverted repair bypassed intent gate: %+v", outcome)
+	}
+}
+
+func TestReviewStep_SemanticProofRequiresExecutorEvidence(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", headSHA)
+
+	call := 0
+	ag := &mockAgent{
+		name: "unverified-semantic-fixer",
+		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+			call++
+			if call == 1 {
+				if err := os.WriteFile(filepath.Join(dir, "semantic-repair.txt"), []byte("claimed\n"), 0o644); err != nil {
+					return nil, err
+				}
+				// The shared fixture names commands that do not exist in this repo.
+				// Agent-authored prose must not turn those claims into proof.
+				return &agent.Result{Output: completeSemanticRepairResult("claim unexecuted proof")}, nil
+			}
+			return &agent.Result{Output: json.RawMessage(`{"findings":[],"risk_level":"low","risk_rationale":"agent claims look plausible","risk_scope":"source-or-external"}`)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.SemanticProofRunner = nil
+	sctx.Fixing = true
+	sctx.PreviousFindings = `{"findings":[{"id":"repair","severity":"error","file":"feature.txt","description":"public behavior regressed","action":"ask-user","review_scope":"source","semantic_family":"product-behavior","semantic_root":"public-regression"}]}`
+
+	outcome, err := (&ReviewStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if call != 2 {
+		t.Fatalf("agent calls = %d, want fixer plus independent rereview", call)
+	}
+	if !outcome.NeedsApproval || !hasAskUserFindings(t, outcome.Findings) {
+		t.Fatalf("unexecuted semantic proof was accepted: %+v", outcome)
+	}
+}
+
 func TestReviewStep_QualityOutcomeWriteFailureBlocksCleanRepair(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
@@ -327,14 +408,12 @@ func TestReviewStep_QualityOutcomeWriteFailureBlocksCleanRepair(t *testing.T) {
 
 func TestSemanticRepairGeneratedDispositionRejectsHandEditWithoutEmitter(t *testing.T) {
 	evidence := semanticRepairEvidence{
-		Summary:                          "repair generated artifact",
-		RepairComplete:                   true,
-		SemanticFamily:                   "generated-artifact",
-		SemanticRoot:                     "generated-client-contract",
-		PublicExecutableCheck:            "public test",
-		FailBefore:                       "failed before",
-		PassAfter:                        "passed after",
-		IntegrationConsumerCompatibility: "consumer passed",
+		Summary:                  "repair generated artifact",
+		RepairComplete:           true,
+		SemanticFamily:           "generated-artifact",
+		SemanticRoot:             "generated-client-contract",
+		PublicExecutableCheck:    "public test",
+		IntegrationConsumerCheck: "consumer test",
 		GeneratedArtifacts: generatedArtifactDisposition{
 			Touched:          true,
 			SourceUpdated:    false,
@@ -350,19 +429,17 @@ func TestSemanticRepairGeneratedDispositionRejectsHandEditWithoutEmitter(t *test
 
 func TestSemanticRepairCompleteProofRejectsUnobservedPlaceholders(t *testing.T) {
 	evidence := semanticRepairEvidence{
-		Summary:                          "claim an unproven repair",
-		RepairComplete:                   true,
-		SemanticFamily:                   "product-behavior",
-		SemanticRoot:                     "public-contract",
-		PublicExecutableCheck:            "go test ./public -run TestContract",
-		FailBefore:                       "not run",
-		PassAfter:                        "TestContract passed",
-		IntegrationConsumerCompatibility: "consumer passed",
+		Summary:                  "claim an unproven repair",
+		RepairComplete:           true,
+		SemanticFamily:           "product-behavior",
+		SemanticRoot:             "public-contract",
+		PublicExecutableCheck:    "go test ./public -run TestContract",
+		IntegrationConsumerCheck: "not run",
 		GeneratedArtifacts: generatedArtifactDisposition{
 			Disposition: "not applicable; no generated artifacts changed",
 		},
 	}
-	if err := evidence.validate(); err == nil || !strings.Contains(err.Error(), "observed result") {
-		t.Fatalf("placeholder proof validation error = %v, want observed-result rejection", err)
+	if err := evidence.validate(); err == nil || !strings.Contains(err.Error(), "executable check") {
+		t.Fatalf("placeholder proof validation error = %v, want executable-check rejection", err)
 	}
 }

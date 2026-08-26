@@ -22,15 +22,14 @@ type generatedArtifactDisposition struct {
 }
 
 type semanticRepairEvidence struct {
-	Summary                          string                       `json:"summary"`
-	RepairComplete                   bool                         `json:"repair_complete"`
-	SemanticFamily                   string                       `json:"semantic_family"`
-	SemanticRoot                     string                       `json:"semantic_root"`
-	PublicExecutableCheck            string                       `json:"public_executable_check"`
-	FailBefore                       string                       `json:"fail_before"`
-	PassAfter                        string                       `json:"pass_after"`
-	IntegrationConsumerCompatibility string                       `json:"integration_consumer_compatibility"`
-	GeneratedArtifacts               generatedArtifactDisposition `json:"generated_artifacts"`
+	Summary                  string                       `json:"summary"`
+	RepairComplete           bool                         `json:"repair_complete"`
+	SemanticFamily           string                       `json:"semantic_family"`
+	SemanticRoot             string                       `json:"semantic_root"`
+	PublicExecutableCheck    string                       `json:"public_executable_check"`
+	IntegrationConsumerCheck string                       `json:"integration_consumer_check"`
+	GeneratedArtifacts       generatedArtifactDisposition `json:"generated_artifacts"`
+	executorProof            *semanticExecutorProof
 }
 
 var semanticRepairSchema = json.RawMessage(fmt.Sprintf(`{
@@ -41,9 +40,7 @@ var semanticRepairSchema = json.RawMessage(fmt.Sprintf(`{
 		"semantic_family": {"type": "string", "enum": ["local-mechanical", "contract-schema", "parser-serialization", "auth-permission", "security-safety", "deploy-routing", "generated-artifact", "product-behavior", "integration-compatibility"]},
 		"semantic_root": {"type": "string", "minLength": 1},
 		"public_executable_check": {"type": "string", "minLength": 1},
-		"fail_before": {"type": "string", "minLength": 1},
-		"pass_after": {"type": "string", "minLength": 1},
-		"integration_consumer_compatibility": {"type": "string", "minLength": 1},
+		"integration_consumer_check": {"type": "string", "minLength": 1},
 		"generated_artifacts": {
 			"type": "object",
 			"properties": {
@@ -56,7 +53,7 @@ var semanticRepairSchema = json.RawMessage(fmt.Sprintf(`{
 			"required": ["touched", "source_updated", "emitter_available", "emitter_run", "disposition"]
 		}
 	},
-	"required": ["summary", "repair_complete", "semantic_family", "semantic_root", "public_executable_check", "fail_before", "pass_after", "integration_consumer_compatibility", "generated_artifacts"]
+	"required": ["summary", "repair_complete", "semantic_family", "semantic_root", "public_executable_check", "integration_consumer_check", "generated_artifacts"]
 }`, config.MaxFixMessageSummaryBytes))
 
 const semanticRepairContract = `
@@ -64,10 +61,10 @@ const semanticRepairContract = `
 ## Semantic-repair contract
 
 - Before editing, trace the affected public interface through contract owners, callers, consumers, and integration boundaries. Inspect authoritative intent, repository rules, prior rejected approaches, generated-code ownership, and the relevant call paths; do not treat the reported line as the whole system.
-- Add or strengthen a public/executable regression that reproduces the reported behavior. It must fail against the pre-fix behavior and pass after the repair. Source-text matching is not proof.
-- At the end, run one bounded verification set covering that regression plus the relevant integration or consumer compatibility boundary. Do not substitute a broad repository suite.
+- Add or strengthen a public/executable regression that reproduces the reported behavior. Return its one exact targeted command; the pipeline will execute that command against both the pre-fix commit and repaired commit. Source-text matching and agent-authored pass/fail prose are not proof.
+- Return one exact targeted integration or consumer compatibility command. The pipeline executes it after the repair. Do not return a broad repository suite, a compound shell command, or a command list.
 - Identify generated artifacts and their authoritative source and emitter before editing. Do not hand-edit generated output. Update the source and run the emitter. If its emitter is unavailable, leave the generated artifact untouched, set repair_complete=false, and hand the issue back rather than fabricating generated output.
-- Return the required structured proof. Set repair_complete=false when any required public/executable fail-before/pass-after or integration/consumer proof is unavailable. Evidence strings must name the exact check and observed result, not a plan or a vague assertion.
+- Return the required structured proof proposal. Set repair_complete=false when either targeted command is unavailable. The pipeline, not this response, owns the fail-before/pass-after and integration results.
 `
 
 const semanticRepairReviewerContract = `
@@ -94,14 +91,12 @@ func parseSemanticRepairEvidence(result *agent.Result) (semanticRepairEvidence, 
 
 func (e semanticRepairEvidence) validate() error {
 	required := map[string]string{
-		"summary":                            e.Summary,
-		"semantic_family":                    e.SemanticFamily,
-		"semantic_root":                      e.SemanticRoot,
-		"public_executable_check":            e.PublicExecutableCheck,
-		"fail_before":                        e.FailBefore,
-		"pass_after":                         e.PassAfter,
-		"integration_consumer_compatibility": e.IntegrationConsumerCompatibility,
-		"generated_artifacts.disposition":    e.GeneratedArtifacts.Disposition,
+		"summary":                         e.Summary,
+		"semantic_family":                 e.SemanticFamily,
+		"semantic_root":                   e.SemanticRoot,
+		"public_executable_check":         e.PublicExecutableCheck,
+		"integration_consumer_check":      e.IntegrationConsumerCheck,
+		"generated_artifacts.disposition": e.GeneratedArtifacts.Disposition,
 	}
 	for field, value := range required {
 		if strings.TrimSpace(value) == "" {
@@ -114,17 +109,12 @@ func (e semanticRepairEvidence) validate() error {
 	}
 	if e.RepairComplete {
 		for field, value := range map[string]string{
-			"public_executable_check":            e.PublicExecutableCheck,
-			"fail_before":                        e.FailBefore,
-			"pass_after":                         e.PassAfter,
-			"integration_consumer_compatibility": e.IntegrationConsumerCompatibility,
+			"public_executable_check":    e.PublicExecutableCheck,
+			"integration_consumer_check": e.IntegrationConsumerCheck,
 		} {
 			if semanticProofPlaceholder(value) {
-				return fmt.Errorf("semantic-repair proof field %s does not report an observed result", field)
+				return fmt.Errorf("semantic-repair proof field %s does not name an executable check", field)
 			}
-		}
-		if strings.EqualFold(strings.TrimSpace(e.FailBefore), strings.TrimSpace(e.PassAfter)) {
-			return fmt.Errorf("semantic-repair fail-before and pass-after evidence must report distinct observed results")
 		}
 	}
 	generated := e.GeneratedArtifacts
@@ -146,25 +136,47 @@ func semanticProofPlaceholder(value string) bool {
 
 func semanticRepairEvidenceSection(e semanticRepairEvidence) string {
 	generated := e.GeneratedArtifacts
+	proofStatus := "unverified"
+	proofReason := "executor evidence unavailable"
+	beforeExit, afterExit, integrationExit := -1, -1, -1
+	beforeDigest, afterDigest, integrationDigest := "none", "none", "none"
+	startingHead, fixedHead := "unknown", "unknown"
+	if e.executorProof != nil {
+		beforeExit, afterExit, integrationExit = e.executorProof.BeforeExit, e.executorProof.AfterExit, e.executorProof.IntegrationExit
+		beforeDigest, afterDigest = e.executorProof.BeforeOutputDigest, e.executorProof.AfterOutputDigest
+		integrationDigest = e.executorProof.IntegrationOutputDigest
+		startingHead, fixedHead = e.executorProof.StartingHeadSHA, e.executorProof.FixedHeadSHA
+		proofReason = e.executorProof.FailureCategory
+		if e.executorProof.verified() {
+			proofStatus = "verified"
+			proofReason = "none"
+		}
+	}
 	return fmt.Sprintf(`
 
-Semantic-repair proof (fixer claims, not independent evidence):
+Semantic-repair proof (executor-owned targeted evidence):
 - repair_complete: %t
 - semantic_family: %s
 - semantic_root: %s
 - public_executable_check: %s
-- fail_before: %s
-- pass_after: %s
-- integration_consumer_compatibility: %s
+- integration_consumer_check: %s
+- proof_status: %s
+- proof_failure_category: %s
+- fail_before: head=%s exit=%d output_digest=%s
+- pass_after: head=%s exit=%d output_digest=%s
+- integration_after: head=%s exit=%d output_digest=%s
 - generated_artifacts: touched=%t source_updated=%t emitter_available=%t emitter_run=%t disposition=%s
-Compare these claims against the current diff and executable regression; do not accept the summary as proof.`,
+The pipeline executed these exact targeted checks outside the fixer session. Independently compare the regression and current diff; do not treat an exit code alone as proof that the asserted behavior is correct.`,
 		e.RepairComplete,
 		sanitizePromptText(e.SemanticFamily),
 		sanitizePromptText(e.SemanticRoot),
 		sanitizePromptText(e.PublicExecutableCheck),
-		sanitizePromptMultilineText(e.FailBefore),
-		sanitizePromptMultilineText(e.PassAfter),
-		sanitizePromptMultilineText(e.IntegrationConsumerCompatibility),
+		sanitizePromptText(e.IntegrationConsumerCheck),
+		proofStatus,
+		proofReason,
+		startingHead, beforeExit, beforeDigest,
+		fixedHead, afterExit, afterDigest,
+		fixedHead, integrationExit, integrationDigest,
 		generated.Touched,
 		generated.SourceUpdated,
 		generated.EmitterAvailable,
@@ -343,6 +355,17 @@ func reviewChangedPaths(ctx context.Context, sctx *pipeline.StepContext, baseSHA
 	changedFiles, err := git.Run(ctx, sctx.WorkDir, args...)
 	if err != nil {
 		return nil, fmt.Errorf("get changed files: %w", err)
+	}
+	return changedPathList(changedFiles), nil
+}
+
+func reviewChangedPathsBetween(ctx context.Context, workDir, fromSHA, toSHA string) ([]string, error) {
+	if strings.TrimSpace(fromSHA) == "" || strings.TrimSpace(toSHA) == "" || fromSHA == toSHA {
+		return nil, nil
+	}
+	changedFiles, err := git.Run(ctx, workDir, "diff", "--name-only", "-z", "--no-renames", fromSHA+".."+toSHA)
+	if err != nil {
+		return nil, fmt.Errorf("get semantic repair changed files: %w", err)
 	}
 	return changedPathList(changedFiles), nil
 }

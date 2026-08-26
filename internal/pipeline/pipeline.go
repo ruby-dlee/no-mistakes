@@ -24,7 +24,12 @@ type StepContext struct {
 	// QualityOutcomes is explicitly enabled by the executor for durable runs.
 	// Embeddings may leave it nil; once enabled, write failures are gate errors,
 	// not best-effort telemetry loss.
-	QualityOutcomes       QualityOutcomeWriter
+	QualityOutcomes QualityOutcomeWriter
+	// SemanticProofRunner is the executor-owned targeted-check seam used by a
+	// review repair. Production leaves it nil and the review step runs the
+	// repository checks itself; focused tests may inject exact exit/digest
+	// observations without invoking a repository suite.
+	SemanticProofRunner   SemanticProofRunner
 	Log                   func(string) // discrete log line (newline-terminated, user-visible + file)
 	LogChunk              func(string) // raw streaming chunk (user-visible + file)
 	LogFile               func(string) // file-only log callback (not shown to user)
@@ -85,6 +90,33 @@ type StepContext struct {
 	// Eval uses it to relabel auto-fix/shipped-unfixed gold; nil is a no-op.
 	OnPRMerged func(ctx context.Context, runID string)
 }
+
+// SemanticProofRequest binds one semantic repair's checks to the exact
+// before/after commits. Commands are proposed by the fixer but admitted and
+// executed by the pipeline, never trusted as agent-authored result prose.
+type SemanticProofRequest struct {
+	WorkDir            string
+	StartingHeadSHA    string
+	FixedHeadSHA       string
+	PublicCommand      string
+	IntegrationCommand string
+	Env                []string
+}
+
+// SemanticProofResult is content-free executor evidence. Output bytes never
+// enter pipeline state or quality telemetry; their digests distinguish exact
+// observations while exit codes carry the fail-before/pass-after contract.
+type SemanticProofResult struct {
+	BeforeExit              int
+	AfterExit               int
+	IntegrationExit         int
+	BeforeOutputDigest      string
+	AfterOutputDigest       string
+	IntegrationOutputDigest string
+	FailureCategory         string
+}
+
+type SemanticProofRunner func(context.Context, SemanticProofRequest) SemanticProofResult
 
 // QualityOutcomeWriter is the narrow append-only quality evidence boundary.
 // *db.DB implements it; the interface also keeps failure behavior executable

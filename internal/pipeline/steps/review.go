@@ -16,7 +16,9 @@ import (
 )
 
 // ReviewStep reviews the diff for bugs, security issues, and doc gaps.
-type ReviewStep struct{}
+type ReviewStep struct {
+	semanticProofRunner pipeline.SemanticProofRunner
+}
 
 // Prompt revisions are bumped whenever the corresponding stable template
 // changes materially. Task-specific context is tracked separately by digest.
@@ -75,6 +77,8 @@ func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 	}
 	var repairEvidence semanticRepairEvidence
 	repairExecuted := false
+	repairStartingHeadSHA := ""
+	var repairChangedPaths []string
 
 	// In fix mode, ask the agent to fix issues first.
 	//
@@ -96,6 +100,10 @@ func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 	var fixSummary string
 	if sctx.Fixing && !sctx.SkipFixExecution {
 		startReviewTimeout()
+		repairStartingHeadSHA = strings.TrimSpace(sctx.ReviewStartingHeadSHA)
+		if repairStartingHeadSHA == "" {
+			repairStartingHeadSHA = sctx.Run.HeadSHA
+		}
 		if repairAttempt > 1 && sctx.Sessions != nil {
 			sctx.Sessions.Reset(pipeline.SessionRoleFixer)
 			sctx.Log(fmt.Sprintf("reset fixer session before semantic repair attempt %d", repairAttempt))
@@ -172,8 +180,12 @@ Previous review findings to address:
 			return nil, reviewAgentError(ctx, timeout, "agent fix", err)
 		}
 		fixSummary = summary
-		repairEvidence = evidence
 		repairExecuted = true
+		repairEvidence = bindSemanticExecutorProof(sctx, repairStartingHeadSHA, evidence, s.semanticProofRunner)
+		repairChangedPaths, err = reviewChangedPathsBetween(ctx, sctx.WorkDir, repairStartingHeadSHA, sctx.Run.HeadSHA)
+		if err != nil {
+			return nil, err
+		}
 	}
 	reviewTargetSHA := sctx.Run.HeadSHA
 
@@ -186,7 +198,7 @@ Previous review findings to address:
 		return nil, err
 	}
 
-	if len(reviewablePaths(changed, sctx.Config.IgnorePatterns)) == 0 {
+	if !sctx.Fixing && len(reviewablePaths(changed, sctx.Config.IgnorePatterns)) == 0 {
 		sctx.Log("no changes to review")
 		noChangeFindings := Findings{
 			RiskLevel:     "low",
@@ -358,13 +370,14 @@ Risk assessment (after listing all findings):
 	findings = normalizeSemanticRiskReviewActions(findings)
 	if repairExecuted {
 		if err := recordSemanticRepairQualityOutcome(sctx, semanticQualityObservation{
-			PreviousFindings: sctx.PreviousFindings,
-			Findings:         findings,
-			Evidence:         repairEvidence,
-			RepairAttempt:    repairAttempt,
-			FixedHeadSHA:     reviewTargetSHA,
-			ObservedHeadSHA:  reviewTargetSHA,
-			StructuredReview: structuredReview,
+			PreviousFindings:  sctx.PreviousFindings,
+			Findings:          findings,
+			Evidence:          repairEvidence,
+			RepairAttempt:     repairAttempt,
+			FixedHeadSHA:      reviewTargetSHA,
+			ObservedHeadSHA:   reviewTargetSHA,
+			StructuredReview:  structuredReview,
+			FixerChangedPaths: repairChangedPaths,
 		}); err != nil {
 			return nil, err
 		}

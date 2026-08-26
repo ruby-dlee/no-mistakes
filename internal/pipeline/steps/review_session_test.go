@@ -84,6 +84,11 @@ func reviewSessionHarness(t *testing.T, mock *sessionMockAgent, steps []pipeline
 		AutoFix:      config.AutoFix{Review: 3},
 		SessionReuse: true,
 	}
+	for _, step := range steps {
+		if review, ok := step.(*ReviewStep); ok {
+			review.semanticProofRunner = successfulSemanticProofRunner
+		}
+	}
 	exec := pipeline.NewExecutor(database, paths.WithRoot(t.TempDir()), cfg, mock, steps, nil)
 	return exec, database, run, repo, workDir
 }
