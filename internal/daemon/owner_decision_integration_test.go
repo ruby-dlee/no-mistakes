@@ -536,7 +536,7 @@ func TestStartupFailsIncompleteProtectedPendingBeforeProviderAndAllowsFreshRun(t
 		providerSetupCalls++
 		return nil
 	})
-	recoverOnStartup(database, p, mgr, worktrees.New(p, nil))
+	recoverOnStartup(database, p, mgr, worktrees.New(p, nil), nil)
 	after, err := database.GetRun(run.ID)
 	if err != nil {
 		t.Fatal(err)

@@ -78,6 +78,12 @@ A second daemon started against the same root fails with "a no-mistakes daemon i
 The OS releases the lock automatically when the owning process exits or crashes, even on SIGKILL, so unlike the PID file the lock can never go stale.
 As an independent safety layer, the daemon also refuses to bind the Unix socket while something is still answering on it; only a provably stale socket file (nothing listening) is removed and rebound.
 
+### Optional GitHub coordinator
+
+The daemon can also own a bounded GitHub webhook listener and one shared durable CI reconciler. This is off by default and does not change the local-only installation path. An operator must explicitly enable the trusted global [`coordinator`](/no-mistakes/reference/global-config/#coordinator) block and provide its HMAC secret through the configured environment key.
+
+When enabled, webhook payloads are signature-checked and reduced to bounded delivery metadata. They are never treated as CI truth: the same GitHub SCM authority used by pipeline CI refetches the current PR head, lifecycle, and exact-head checks before the reducer updates the durable wait, run, and CI step. A process-wide ticker recovers missed webhooks and resumes persisted waits immediately after restart. Startup refuses a missing secret or failed listener bind, and daemon shutdown cancels reconciliation and drains the HTTP server before exit.
+
 ## What it does
 
 When a push arrives via the post-receive hook:

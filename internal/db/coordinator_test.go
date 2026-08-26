@@ -138,7 +138,7 @@ func TestPeriodicCIReconciliationSurvivesRestartAndLegacyRowsUseZeroCapacity(t *
 		t.Fatal(err)
 	}
 	start := time.Unix(1_800_000_000, 0)
-	for i := 0; i < 39; i++ {
+	for i := 0; i < 56; i++ {
 		repo, err := database.InsertRepo(t.TempDir(), "https://example.invalid/wait.git", "main")
 		if err != nil {
 			t.Fatal(err)
@@ -157,6 +157,9 @@ func TestPeriodicCIReconciliationSurvivesRestartAndLegacyRowsUseZeroCapacity(t *
 		}
 		if err := database.UpdateStepStatus(step.ID, types.StepStatusRunning); err != nil {
 			t.Fatal(err)
+		}
+		if i >= 39 {
+			continue
 		}
 		input := strings.Repeat("f", 64)
 		state, _, _, err := database.AdvanceBranchDesiredState(BranchDesiredUpdate{RepoID: repo.ID, Branch: run.Branch, HeadSHA: head, InputDigest: input, UpdatedAt: start})
@@ -185,6 +188,10 @@ func TestPeriodicCIReconciliationSurvivesRestartAndLegacyRowsUseZeroCapacity(t *
 	if count, err := database.ScheduleDueCIReconciliations(start, 100); err != nil || count != 39 {
 		t.Fatalf("scheduled=%d err=%v", count, err)
 	}
+	recoverable, err := database.RecoverableCIWaitRunIDs()
+	if err != nil || len(recoverable) != 39 {
+		t.Fatalf("recoverable coordinator waits=%d err=%v", len(recoverable), err)
+	}
 	pending, err := database.PendingCIReconciliations(100)
 	if err != nil || len(pending) != 39 {
 		t.Fatalf("pending=%d err=%v", len(pending), err)
@@ -193,7 +200,7 @@ func TestPeriodicCIReconciliationSurvivesRestartAndLegacyRowsUseZeroCapacity(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(liveness.ActiveWorkerLeases) != 0 || liveness.LegacyActiveRowsIgnored != 39 {
+	if len(liveness.ActiveWorkerLeases) != 0 || liveness.LegacyActiveRowsIgnored != 56 {
 		t.Fatalf("liveness=%+v", liveness)
 	}
 }

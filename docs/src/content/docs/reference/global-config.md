@@ -50,6 +50,14 @@ daemon_connect_timeout: "3s"
 
 branch_sync_remote_timeout: "60s"
 
+coordinator:
+  enabled: false
+  listen_address: "127.0.0.1:9783"
+  github_webhook_secret_env: "NO_MISTAKES_GITHUB_WEBHOOK_SECRET"
+  reconcile_interval: "60s"
+  batch_size: 100
+  max_concurrency: 4
+
 log_level: info
 
 session_reuse: true
@@ -407,6 +415,21 @@ Maximum time a CLI client waits for an existing daemon socket to accept a connec
 | Default | `3s`                   |
 
 Accepts any positive Go `time.ParseDuration` string. Overridable per-invocation with the `NM_DAEMON_CONNECT_TIMEOUT` environment variable; see [Environment Variables](/no-mistakes/reference/environment/#nm_daemon_connect_timeout).
+
+### coordinator
+
+Optional daemon-owned GitHub webhook ingress and durable CI reconciliation. It is disabled by default, so ordinary local installs bind no additional TCP listener. This setting is global-only and cannot be enabled or changed by repository configuration.
+
+| Field | Default | Bounds |
+| ----- | ------- | ------ |
+| `enabled` | `false` | boolean |
+| `listen_address` | `127.0.0.1:9783` | explicit host and port |
+| `github_webhook_secret_env` | `NO_MISTAKES_GITHUB_WEBHOOK_SECRET` | uppercase environment key, maximum 64 characters |
+| `reconcile_interval` | `60s` | `1s` through `24h` |
+| `batch_size` | `100` | `1` through `100` |
+| `max_concurrency` | `4` | `1` through `16` |
+
+When enabled, daemon startup fails closed unless the named environment variable contains a bounded webhook secret and the listener can bind. The secret value is not stored in config, SQLite, webhook metadata, or logs. The endpoint is `POST /github`; signed deliveries are admitted as bounded metadata, then the daemon refetches the exact PR head and checks through the GitHub SCM authority before changing a CI wait. The periodic reconciler uses the same authority and resumes durable waits after restart.
 
 ### branch_sync_remote_timeout
 

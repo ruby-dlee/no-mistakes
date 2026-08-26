@@ -246,13 +246,32 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, globalCfg *config.GlobalConf
 	}()
 	slog.Info("daemon process launched", "pid", pidRecord.PID)
 
-	// Recovery remains exclusive and completes before IPC is bound.
-	recoverOnStartup(d, p, mgr, layout)
+	// Recovery remains exclusive and completes before IPC is bound. When the
+	// coordinator is explicitly enabled, exact durable CI waits remain owned by
+	// its restart reconciler instead of the generic stale-run terminalizer.
+	var coordinatorCIWaitRuns []string
+	if globalCfg.Coordinator.Enabled {
+		coordinatorCIWaitRuns, err = d.RecoverableCIWaitRunIDs()
+		if err != nil {
+			return fmt.Errorf("load coordinator CI restart custody: %w", err)
+		}
+	}
+	recoverOnStartup(d, p, mgr, layout, coordinatorCIWaitRuns)
 
 	srv := ipc.NewServer()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	coordinatorRuntime, err := startCoordinatorRuntime(ctx, coordinatorRuntimeOptions{
+		Config: globalCfg.Coordinator, DB: d, Paths: p,
+	})
+	if err != nil {
+		return fmt.Errorf("start coordinator: %w", err)
+	}
+	if coordinatorRuntime != nil {
+		defer coordinatorRuntime.Close()
+	}
 
 	var shutdownOnce sync.Once
 	doShutdown := func(reason string) {
@@ -261,6 +280,11 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, globalCfg *config.GlobalConf
 			mgr.Shutdown()
 			cancel()
 			srv.Close()
+			if coordinatorRuntime != nil {
+				if err := coordinatorRuntime.Close(); err != nil {
+					slog.Warn("coordinator shutdown incomplete", "error", err)
+				}
+			}
 		})
 	}
 
@@ -296,8 +320,20 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, globalCfg *config.GlobalConf
 	logStartupPhase("ipc_health", healthStarted)
 	slog.Info("daemon ready", "socket", socketPath, "pid", os.Getpid(), "startup_ms", time.Since(startupStarted).Milliseconds())
 
-	if err := <-serveErrCh; err != nil {
-		return fmt.Errorf("serve: %w", err)
+	var serveErr error
+	if coordinatorRuntime == nil {
+		serveErr = <-serveErrCh
+	} else {
+		select {
+		case serveErr = <-serveErrCh:
+		case coordinatorErr := <-coordinatorRuntime.Errors():
+			doShutdown("coordinator failure")
+			ipcErr := <-serveErrCh
+			return errors.Join(fmt.Errorf("coordinator runtime: %w", coordinatorErr), ipcErr)
+		}
+	}
+	if serveErr != nil {
+		return fmt.Errorf("serve: %w", serveErr)
 	}
 	doShutdown("listener closed")
 
@@ -383,7 +419,7 @@ func writeDaemonPIDFile(path string, record daemonPIDFile) error {
 // best-effort migrates gate bare repos in place so older installs pick up
 // the per-worktree hookspath isolation introduced for issue #122 when Git
 // supports config --worktree.
-func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktrees.Layout) {
+func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktrees.Layout, coordinatorCIWaitRuns []string) {
 	orphanStarted := time.Now()
 	reapOrphanedServers(p)
 	logStartupPhase("orphan_servers", orphanStarted)
@@ -429,7 +465,15 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager, layout *worktre
 	for _, plan := range plans {
 		preserved[plan.run.ID] = struct{}{}
 	}
-	logStartupPhase("parked_runs", parkedStarted, "preserved", len(plans))
+	coordinatorPreserved := 0
+	for _, id := range coordinatorCIWaitRuns {
+		if _, exists := preserved[id]; !exists {
+			coordinatorPreserved++
+		}
+		preserved[id] = struct{}{}
+	}
+	logStartupPhase("parked_runs", parkedStarted,
+		"preserved", len(plans), "coordinator_preserved", coordinatorPreserved)
 
 	// Read while the runs that were executing when this daemon started still say
 	// so: recovery below turns them terminal, and they are the ones whose

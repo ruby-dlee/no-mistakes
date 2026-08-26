@@ -4,11 +4,28 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+func activateCoordinatorCI(t *testing.T, database *DB, runID string) {
+	t.Helper()
+	step, err := database.InsertStepResult(runID, types.StepCI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatus(runID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateStepStatus(step.ID, types.StepStatusRunning); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestApplyCIReconciliationUsesExactBindingCAS(t *testing.T) {
 	database := openTestDB(t)
 	fixture := newPipelineJobFixture(t, database, false)
+	activateCoordinatorCI(t, database, fixture.run.ID)
 	start := time.Unix(1_800_000_000, 0)
 	state, _, _, err := database.AdvanceBranchDesiredState(BranchDesiredUpdate{
 		RepoID: fixture.run.RepoID, Branch: fixture.run.Branch, HeadSHA: fixture.run.HeadSHA,
@@ -66,6 +83,7 @@ func TestApplyCIReconciliationUsesExactBindingCAS(t *testing.T) {
 func TestApplyPendingCIReconciliationConsumesOnlyCurrentPoll(t *testing.T) {
 	database := openTestDB(t)
 	fixture := newPipelineJobFixture(t, database, false)
+	activateCoordinatorCI(t, database, fixture.run.ID)
 	start := time.Unix(1_800_000_000, 0)
 	state, _, _, err := database.AdvanceBranchDesiredState(BranchDesiredUpdate{
 		RepoID: fixture.run.RepoID, Branch: fixture.run.Branch, HeadSHA: fixture.run.HeadSHA,

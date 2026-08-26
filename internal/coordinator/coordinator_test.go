@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 const webhookSecret = "test-secret-not-persisted"
@@ -107,6 +108,16 @@ func addWait(t *testing.T, database *db.DB, index int, registered time.Time) wai
 	branch := fmt.Sprintf("review-%03d", index)
 	run, err := database.InsertRun(repoID, branch, head, strings.Repeat("0", 40))
 	if err != nil {
+		t.Fatal(err)
+	}
+	step, err := database.InsertStepResult(run.ID, types.StepCI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateStepStatus(step.ID, types.StepStatusRunning); err != nil {
 		t.Fatal(err)
 	}
 	input := strings.Repeat(fmt.Sprintf("%x", (index+5)%15+1), 64)
@@ -272,6 +283,19 @@ func TestServiceRecoversLostWebhooksAfterRestartWithBoundedConcurrencyAndNoLease
 		}
 		wantStatuses[fixture.waitID] = wantStatus
 	}
+	for i := 0; i < 17; i++ {
+		repoID := fmt.Sprintf("stale-repo-%03d", i)
+		if _, err := database.InsertRepoWithID(repoID, t.TempDir(), fmt.Sprintf("https://example.invalid/stale/%03d.git", i), "main"); err != nil {
+			t.Fatal(err)
+		}
+		run, err := database.InsertRun(repoID, fmt.Sprintf("stale-%03d", i), strings.Repeat("a", 40), strings.Repeat("0", 40))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := database.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -280,6 +304,10 @@ func TestServiceRecoversLostWebhooksAfterRestartWithBoundedConcurrencyAndNoLease
 		t.Fatal(err)
 	}
 	defer database.Close()
+	before, err := database.UpdaterPipelineLiveness(start)
+	if err != nil || len(before.ActiveWorkerLeases) != 0 || before.LegacyActiveRowsIgnored != 56 {
+		t.Fatalf("restart liveness=%+v err=%v", before, err)
+	}
 	client := &staticGitHubClient{states: states, requestPause: 2 * time.Millisecond}
 	service, err := NewService(ServiceOptions{
 		Store: database, GitHub: client, Reducer: stateReducer{}, BatchSize: 100,
@@ -307,7 +335,7 @@ func TestServiceRecoversLostWebhooksAfterRestartWithBoundedConcurrencyAndNoLease
 		t.Fatalf("completed waits left pending work=%d err=%v", len(pending), err)
 	}
 	liveness, err := database.UpdaterPipelineLiveness(start)
-	if err != nil || len(liveness.ActiveWorkerLeases) != 0 {
+	if err != nil || len(liveness.ActiveWorkerLeases) != 0 || liveness.LegacyActiveRowsIgnored != 43 {
 		t.Fatalf("liveness=%+v err=%v", liveness, err)
 	}
 

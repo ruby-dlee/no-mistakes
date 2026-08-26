@@ -35,6 +35,17 @@ Override how long a CLI client waits for an existing daemon socket to accept a c
 
 Takes precedence over `daemon_connect_timeout` in `config.yaml`. An empty, unparsable, or non-positive value is ignored and the config value (or its default) is used instead.
 
+## `NO_MISTAKES_GITHUB_WEBHOOK_SECRET`
+
+GitHub webhook HMAC secret read only when the trusted global [`coordinator`](/no-mistakes/reference/global-config/#coordinator) setting is explicitly enabled.
+
+|         |                                             |
+| ------- | ------------------------------------------- |
+| Type    | `string`                                    |
+| Default | (none; enabled coordinator startup refuses) |
+
+The global config may name a different environment key. The value must be 16 through 4096 bytes. It is held only in daemon memory and is never persisted or logged. Put it in the environment visible to the managed daemon, then restart the daemon. Do not write the value into `config.yaml`.
+
 ## `FORGEJO_BASE_URL`
 
 Canonical Forgejo web base URL used for provider discovery and forgejo-axi commands.

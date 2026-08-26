@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,6 +60,9 @@ const (
 	DefaultDaemonConnectTimeout = 3 * time.Second
 	// DefaultBranchSyncRemoteTimeout bounds each remote Git operation (ls-remote, fetch) in internal/branchsync. Global-config-only; a pushed branch cannot change it. Timeout still fails closed.
 	DefaultBranchSyncRemoteTimeout = 60 * time.Second
+	// DefaultCoordinatorReconcileInterval is the durable CI wait polling floor
+	// when the explicitly enabled daemon coordinator receives no webhook.
+	DefaultCoordinatorReconcileInterval = time.Minute
 	// CITimeoutUnlimited is the sentinel meaning "monitor until the PR is
 	// merged, closed, or the run is aborted - never self-terminate".
 	// Any non-positive ci_timeout, or the keywords "unlimited", "none",
@@ -155,6 +160,30 @@ type GlobalConfig struct {
 	// record replay provenance), never a repository policy. Keeping it out of
 	// RepoConfig means no pushed branch can enable, disable, or resize it.
 	Eval Eval
+	// Coordinator is global-only daemon infrastructure. Repository config can
+	// neither expose its listener nor select the environment variable carrying
+	// its webhook secret.
+	Coordinator Coordinator
+}
+
+// Coordinator configures the optional process-local webhook and CI reconciler.
+// The secret value itself is never configuration; only its environment key is.
+type Coordinator struct {
+	Enabled                bool
+	ListenAddress          string
+	GitHubWebhookSecretEnv string
+	ReconcileInterval      time.Duration
+	BatchSize              int
+	MaxConcurrency         int
+}
+
+type coordinatorRaw struct {
+	Enabled                *bool  `yaml:"enabled"`
+	ListenAddress          string `yaml:"listen_address"`
+	GitHubWebhookSecretEnv string `yaml:"github_webhook_secret_env"`
+	ReconcileInterval      string `yaml:"reconcile_interval"`
+	BatchSize              *int   `yaml:"batch_size"`
+	MaxConcurrency         *int   `yaml:"max_concurrency"`
 }
 
 // globalConfigRaw is the on-disk YAML representation with duration as string.
@@ -183,6 +212,7 @@ type globalConfigRaw struct {
 	Intent                  IntentRaw                  `yaml:"intent"`
 	Test                    TestRaw                    `yaml:"test"`
 	Eval                    EvalRaw                    `yaml:"eval"`
+	Coordinator             coordinatorRaw             `yaml:"coordinator"`
 }
 
 // RepoConfig represents .no-mistakes.yaml in a repo root.
@@ -763,6 +793,17 @@ daemon_connect_timeout: "3s"
 # Maximum time guarded branch synchronization waits for one remote Git operation
 # (ls-remote or fetch) before treating the target as offline. Global-only.
 branch_sync_remote_timeout: "60s"
+
+# Optional daemon coordinator. Disabled by default, so no TCP listener exists
+# unless the operator explicitly enables this trusted global setting. The
+# webhook secret value is read only from the named process environment variable.
+coordinator:
+  enabled: false
+  listen_address: "127.0.0.1:9783"
+  github_webhook_secret_env: "NO_MISTAKES_GITHUB_WEBHOOK_SECRET"
+  reconcile_interval: "60s"
+  batch_size: 100
+  max_concurrency: 4
 
 # Reuse a fixer session for the first semantic repair; a second repair resets the
 # persisted identity and starts fresh. Review turns always run session-free so a
@@ -1555,6 +1596,16 @@ func DefaultGlobalConfig() *GlobalConfig {
 		LogLevel:                "info",
 		SessionReuse:            true,
 		Eval:                    evalDefaults(),
+		Coordinator:             coordinatorDefaults(),
+	}
+}
+
+func coordinatorDefaults() Coordinator {
+	return Coordinator{
+		Enabled: false, ListenAddress: "127.0.0.1:9783",
+		GitHubWebhookSecretEnv: "NO_MISTAKES_GITHUB_WEBHOOK_SECRET",
+		ReconcileInterval:      DefaultCoordinatorReconcileInterval,
+		BatchSize:              100, MaxConcurrency: 4,
 	}
 }
 
@@ -1724,6 +1775,9 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	if err := validateEvalRaw(raw.Eval); err != nil {
 		return nil, fmt.Errorf("parse global config: %w", err)
 	}
+	if err := validateCoordinatorRaw(raw.Coordinator); err != nil {
+		return nil, fmt.Errorf("parse global config: %w", err)
+	}
 
 	if len(raw.Agent) > 0 {
 		cfg.Agents = copyAgents(raw.Agent)
@@ -1830,8 +1884,75 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	cfg.Intent = raw.Intent
 	cfg.Test = raw.Test
 	applyEvalOverrides(&cfg.Eval, &raw.Eval)
+	applyCoordinatorOverrides(&cfg.Coordinator, raw.Coordinator)
 
 	return cfg, nil
+}
+
+func validateCoordinatorRaw(raw coordinatorRaw) error {
+	resolved := coordinatorDefaults()
+	applyCoordinatorOverrides(&resolved, raw)
+	if _, port, err := net.SplitHostPort(resolved.ListenAddress); err != nil {
+		return fmt.Errorf("coordinator.listen_address %q must be host:port", resolved.ListenAddress)
+	} else if numeric, err := strconv.Atoi(port); err != nil || numeric < 1 || numeric > 65535 {
+		return fmt.Errorf("coordinator.listen_address %q must use port 1..65535", resolved.ListenAddress)
+	}
+	if !validEnvironmentKey(resolved.GitHubWebhookSecretEnv) || len(resolved.GitHubWebhookSecretEnv) > 64 {
+		return fmt.Errorf("coordinator.github_webhook_secret_env must be a bounded environment key")
+	}
+	if resolved.ReconcileInterval < time.Second || resolved.ReconcileInterval > 24*time.Hour {
+		return fmt.Errorf("coordinator.reconcile_interval must be 1s..24h")
+	}
+	if resolved.BatchSize < 1 || resolved.BatchSize > 100 {
+		return fmt.Errorf("coordinator.batch_size must be 1..100")
+	}
+	if resolved.MaxConcurrency < 1 || resolved.MaxConcurrency > 16 {
+		return fmt.Errorf("coordinator.max_concurrency must be 1..16")
+	}
+	return nil
+}
+
+func applyCoordinatorOverrides(dst *Coordinator, raw coordinatorRaw) {
+	if raw.Enabled != nil {
+		dst.Enabled = *raw.Enabled
+	}
+	if strings.TrimSpace(raw.ListenAddress) != "" {
+		dst.ListenAddress = strings.TrimSpace(raw.ListenAddress)
+	}
+	if strings.TrimSpace(raw.GitHubWebhookSecretEnv) != "" {
+		dst.GitHubWebhookSecretEnv = strings.TrimSpace(raw.GitHubWebhookSecretEnv)
+	}
+	if strings.TrimSpace(raw.ReconcileInterval) != "" {
+		if duration, err := time.ParseDuration(raw.ReconcileInterval); err == nil {
+			dst.ReconcileInterval = duration
+		} else {
+			dst.ReconcileInterval = 0
+		}
+	}
+	if raw.BatchSize != nil {
+		dst.BatchSize = *raw.BatchSize
+	}
+	if raw.MaxConcurrency != nil {
+		dst.MaxConcurrency = *raw.MaxConcurrency
+	}
+}
+
+func validEnvironmentKey(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index, char := range value {
+		if index == 0 {
+			if char != '_' && (char < 'A' || char > 'Z') {
+				return false
+			}
+			continue
+		}
+		if char != '_' && (char < 'A' || char > 'Z') && (char < '0' || char > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // parseCITimeout interprets the ci_timeout config value. The keyword

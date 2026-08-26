@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 var (
@@ -409,6 +411,39 @@ func (d *DB) GetCIWait(id string) (*CIWait, error) {
 	return item, nil
 }
 
+// RecoverableCIWaitRunIDs returns only active runs whose waiting coordinator
+// record still matches the current desired generation and one active CI step.
+// The daemon uses this exact set to keep coordinator-owned waits alive across
+// its generic crash recovery when the coordinator is explicitly enabled.
+func (d *DB) RecoverableCIWaitRunIDs() ([]string, error) {
+	rows, err := d.sql.Query(`SELECT DISTINCT w.run_id FROM ci_waits w
+		JOIN runs r ON r.id = w.run_id
+		JOIN branch_desired_state desired ON desired.repo_id = w.repo_id AND desired.branch = w.branch
+		WHERE w.status = ? AND r.status IN (?, ?)
+		AND r.repo_id = w.repo_id AND r.branch = w.branch AND r.head_sha = w.head_sha
+		AND desired.revision = w.desired_generation AND desired.head_sha = w.head_sha
+		AND desired.input_digest = w.input_digest
+		AND 1 = (SELECT COUNT(*) FROM step_results ci WHERE ci.run_id = w.run_id
+			AND ci.step_name = ? AND ci.status IN (?, ?, ?, ?))
+		ORDER BY w.run_id`,
+		CIWaitWaiting, types.RunPending, types.RunRunning, types.StepCI,
+		types.StepStatusRunning, types.StepStatusAwaitingApproval,
+		types.StepStatusFixing, types.StepStatusFixReview)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // ApplyCIReconciliation commits a terminal reducer result only while every
 // exact wait and desired-generation binding is still current. The durable
 // reconciliation record is deleted in the same transaction and only after
@@ -451,6 +486,9 @@ func (d *DB) ApplyCIReconciliation(result CIReconciliationResult) (bool, error) 
 	if count != 1 {
 		return false, errors.New("apply CI reconciliation: stale or missing exact binding")
 	}
+	if err := projectCIReconciliationTx(tx, result); err != nil {
+		return false, fmt.Errorf("apply CI reconciliation: %w", err)
+	}
 	deleted, err := tx.Exec(`DELETE FROM ci_reconciliations WHERE wait_id = ?`, result.WaitID)
 	if err != nil {
 		return false, err
@@ -466,6 +504,83 @@ func (d *DB) ApplyCIReconciliation(result CIReconciliationResult) (bool, error) 
 		return false, err
 	}
 	return true, nil
+}
+
+func projectCIReconciliationTx(tx *sql.Tx, result CIReconciliationResult) error {
+	var runID string
+	if err := tx.QueryRow(`SELECT run_id FROM ci_waits
+		WHERE id = ? AND repo_id = ? AND branch = ? AND pr_number = ? AND head_sha = ?
+		AND input_digest = ? AND desired_generation = ? AND status = ?`,
+		result.WaitID, result.RepoID, result.Branch, result.PRNumber, result.HeadSHA,
+		result.InputDigest, result.DesiredGeneration, result.Status).Scan(&runID); err != nil {
+		return errors.New("exact wait projection binding changed")
+	}
+	var activeCISteps int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM step_results
+		WHERE run_id = ? AND step_name = ? AND status IN (?, ?, ?, ?)`,
+		runID, types.StepCI, types.StepStatusRunning, types.StepStatusAwaitingApproval,
+		types.StepStatusFixing, types.StepStatusFixReview).Scan(&activeCISteps); err != nil {
+		return err
+	}
+	if activeCISteps != 1 {
+		return errors.New("exact active CI step is missing or ambiguous")
+	}
+	ts := result.AppliedAt.Unix()
+	switch result.Status {
+	case CIWaitWaiting:
+		return updateExactRunCIState(tx, runID, result, nil, false)
+	case CIWaitReady:
+		return updateExactRunCIState(tx, runID, result, ts, false)
+	case CIWaitFailed:
+		updated, err := tx.Exec(`UPDATE step_results SET status = ?, last_activity_at = ?,
+			last_activity = ?, agent_pid = NULL WHERE run_id = ? AND step_name = ? AND status IN (?, ?, ?)`,
+			types.StepStatusAwaitingApproval, ts, "status: awaiting_approval", runID, types.StepCI,
+			types.StepStatusRunning, types.StepStatusFixing, types.StepStatusFixReview)
+		if err != nil {
+			return err
+		}
+		if count, err := updated.RowsAffected(); err != nil || count != 1 {
+			return errors.New("failed CI step projection lost custody")
+		}
+		return updateExactRunCIState(tx, runID, result, nil, true)
+	case CIWaitClosed:
+		if err := finalizeTerminalPRRun(tx, runID, ts); err != nil {
+			return err
+		}
+		var completed int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM runs r JOIN step_results s ON s.run_id = r.id
+			WHERE r.id = ? AND r.repo_id = ? AND r.branch = ? AND r.head_sha = ?
+			AND r.status = ? AND s.step_name = ? AND s.status = ?`,
+			runID, result.RepoID, result.Branch, result.HeadSHA, types.RunCompleted,
+			types.StepCI, types.StepStatusCompleted).Scan(&completed); err != nil {
+			return err
+		}
+		if completed != 1 {
+			return errors.New("closed CI projection did not finalize exact run")
+		}
+		return nil
+	default:
+		return errors.New("unsupported CI projection status")
+	}
+}
+
+func updateExactRunCIState(tx *sql.Tx, runID string, result CIReconciliationResult, readyAt any, awaiting bool) error {
+	awaitingAt := any(nil)
+	if awaiting {
+		awaitingAt = result.AppliedAt.Unix()
+	}
+	updated, err := tx.Exec(`UPDATE runs SET ci_ready_at = ?, ci_ready_no_ci = 0,
+		awaiting_agent_since = ?, updated_at = ? WHERE id = ? AND repo_id = ?
+		AND branch = ? AND head_sha = ? AND status IN (?, ?)`,
+		readyAt, awaitingAt, result.AppliedAt.Unix(), runID, result.RepoID,
+		result.Branch, result.HeadSHA, types.RunPending, types.RunRunning)
+	if err != nil {
+		return err
+	}
+	if count, err := updated.RowsAffected(); err != nil || count != 1 {
+		return errors.New("exact run projection binding changed")
+	}
+	return nil
 }
 
 type UpdaterPipelineLiveness struct {
