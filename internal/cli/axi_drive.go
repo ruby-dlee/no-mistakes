@@ -927,10 +927,10 @@ func newAxiAbortCmd() *cobra.Command {
 			"current branch. Pass --run <id> to cancel a specific run by its id from\n" +
 			"anywhere - including outside its worktree - so an orphaned CI monitor\n" +
 			"(e.g. after a worktree was torn down) can be reaped deterministically.\n\n" +
-			"While a run is active, do NOT abort (or rerun) to go fix a finding\n" +
-			"yourself - that discards the pipeline's in-flight work and forces a full\n" +
-			"re-validation. abort and rerun are for between runs (after a failed or\n" +
-			"cancelled outcome), never to circumvent a gate.\n\n" +
+			"Normally, do NOT abort (or rerun) an active run to go fix a finding: use\n" +
+			"the gate response so pipeline work is preserved. When owner_fixes_only\n" +
+			"explicitly refuses repair, abort is the supported exception: follow any\n" +
+			"printed custody-recovery action, fix and commit locally, then start a fresh run.\n\n" +
 			preserveGateFixCommitsGuidance,
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,

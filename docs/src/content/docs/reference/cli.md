@@ -331,8 +331,8 @@ When the daemon is already running, `axi abort` can cancel an active run even if
 Both abort surfaces report a completed cancellation only after the exact run positively confirms a terminal state within the bounded wait; success then includes the terminal `run_status`, and branch-scoped abort renders the refreshed `branch_sync` object and its exact next action, if any.
 When terminal quiescence cannot be confirmed - the bounded wait expires, the wait is cancelled, or a status read fails - abort exits nonzero, states explicitly that cancellation was requested but terminal quiescence is unconfirmed, includes the last structured run state when one is available, and never claims `aborted: true` or presents user-owned or recoverable ownership guidance as authoritative; re-run the abort or watch `axi status --run <id>` until a terminal status is confirmed.
 Pipeline-created commits remain preserved in the gate and a recoverable cancellation points directly to `no-mistakes axi sync --recover`; when the submitted head never moved, cancellation instead reports `state: user_owned` with no sync action.
-While a run is active, do not use `axi abort` or `no-mistakes rerun` to go fix a finding yourself.
-That cancels the pipeline's in-flight work and forces a full re-validation; use `axi respond --action fix` at the gate so the pipeline applies and re-checks the fix.
+Normally, do not use `axi abort` or `no-mistakes rerun` to go fix a finding yourself; use `axi respond --action fix` so the pipeline preserves and re-checks its work.
+When the global `owner_fixes_only` policy explicitly refuses repair, abort is the supported exception: follow any printed custody-recovery action, fix and commit in the source worktree, then start a fresh validation run.
 
 ## no-mistakes eject
 
