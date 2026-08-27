@@ -1512,6 +1512,10 @@ func TestRecoverRebasedPreservedHeadAdoptsWithoutEscalating(t *testing.T) {
 	if isAncestor(f.ctx, f.local, f.submitted, f.preserved) || isAncestor(f.ctx, f.local, f.preserved, f.submitted) {
 		t.Fatal("fixture is not a rebase divergence: one head is an ancestor of the other")
 	}
+	// A pre-push cancellation can leave the intake branch at the submitted
+	// head while the run-specific recovery ref owns the rebased head.
+	mustRun(t, f.gate, "update-ref", f.anchorRef(), f.preserved)
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
 
 	state := f.service.Recover(f.ctx, false)
 	if !state.Recovered || !state.Changed {
@@ -1540,8 +1544,36 @@ func TestRecoverRebasedPreservedHeadAdoptsWithoutEscalating(t *testing.T) {
 	if got := mustRun(t, f.local, "rev-parse", f.localAnchorRef()); got != f.submitted {
 		t.Fatalf("pre-recovery local head was not anchored: %s, want %s", got, f.submitted)
 	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+		t.Fatalf("gate branch = %s, want recovered head %s", got, f.preserved)
+	}
 	if !f.custodyReturned() {
 		t.Fatal("custody not stamped")
+	}
+}
+
+func TestRecoverKeepLocalRepairsLegacyCustodyReturnedGate(t *testing.T) {
+	t.Parallel()
+
+	f := newRebasedRecoverFixture(t, types.RunCancelled)
+	state := f.service.Recover(f.ctx, false)
+	if !state.Recovered || !state.Changed {
+		t.Fatalf("initial rebased recovery = %#v", state)
+	}
+	// Recreate the production state left by the older implementation: custody
+	// was stamped and the worktree adopted the rebased head, but the private
+	// intake ref still named the original submitted commit.
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+
+	repaired := f.service.Recover(f.ctx, true)
+	if !repaired.Recovered || repaired.Changed {
+		t.Fatalf("legacy custody repair = %#v", repaired)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("repair moved local HEAD to %s", got)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+		t.Fatalf("gate branch = %s, want recovered head %s", got, f.preserved)
 	}
 }
 
