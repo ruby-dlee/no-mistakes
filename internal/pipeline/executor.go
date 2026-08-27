@@ -39,6 +39,8 @@ const (
 
 var errOwnerDecisionCancelled = errors.New(types.RunCancelReasonAbortedByUser)
 
+const ownerFixesOnlyRepairError = "owner_fixes_only is enabled: the calling agent owns code changes; abort this run, fix the reported findings in the source worktree, commit, and start a fresh validation run"
+
 type approvalResponse struct {
 	action        types.ApprovalAction
 	findingIDs    []string
@@ -179,6 +181,9 @@ func (e *Executor) OwnerDecisionChallenge(purpose string) (ownerdecision.Challen
 // releases the approval channel. Exact replay is idempotent; every mismatch
 // leaves the gate waiting.
 func (e *Executor) RespondAuthorized(envelope ownerdecision.Envelope) error {
+	if e.ownerFixesOnly() && envelope.Response.Action == types.ActionFix {
+		return errors.New(ownerFixesOnlyRepairError)
+	}
 	e.mu.Lock()
 	if e.ownerAuthority == nil || !e.ownerArmed {
 		e.mu.Unlock()
@@ -475,6 +480,9 @@ func (e *Executor) Respond(step types.StepName, action types.ApprovalAction, fin
 // instructions and user-authored findings. Both are merged into the round's
 // findings on a fix action before the fix agent runs.
 func (e *Executor) RespondWithOverrides(step types.StepName, action types.ApprovalAction, findingIDs []string, instructions map[string]string, addedFindings []types.Finding) error {
+	if e.ownerFixesOnly() && action == types.ActionFix {
+		return errors.New(ownerFixesOnlyRepairError)
+	}
 	e.mu.Lock()
 	if e.ownerAuthority != nil {
 		e.mu.Unlock()
@@ -916,6 +924,9 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusFailed), "", "aborted by user", &duration)
 		return e.failRun(run, repo, fmt.Errorf("step %s: aborted by user", gate.step.Name()), ctx)
 	case types.ActionFix:
+		if e.ownerFixesOnly() {
+			return e.failRun(run, repo, errors.New(ownerFixesOnlyRepairError), ctx)
+		}
 		telemetry.Track("fix", e.fixTelemetryFields("user", gate.step.Name(), selectedFindingCount(gate.findings, response.findingIDs), 0))
 		selected := filterFindingsJSON(gate.findings, response.findingIDs)
 		merged := mergeUserOverridesJSON(selected, response.instructions, response.addedFindings)
@@ -1544,6 +1555,9 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			return false, fmt.Errorf("step %s: aborted by user", stepName)
 
 		case types.ActionFix:
+			if e.ownerFixesOnly() {
+				return false, errors.New(ownerFixesOnlyRepairError)
+			}
 			telemetry.Track("fix", e.fixTelemetryFields("user", stepName, selectedFindingCount(outcome.Findings, response.findingIDs), 0))
 			// Fix - mark step as fixing, resume execution timer, re-execute.
 			phaseStart = time.Now()
@@ -1601,6 +1615,10 @@ done:
 	}
 	e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(status), "", "", &durationMS)
 	return skipRemaining, nil
+}
+
+func (e *Executor) ownerFixesOnly() bool {
+	return e != nil && e.config != nil && e.config.OwnerFixesOnly
 }
 
 // recordDeclinedRound persists an approve, skip, or abort resolution as a real

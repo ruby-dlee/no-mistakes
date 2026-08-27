@@ -70,6 +70,9 @@ func (e *Executor) SetRemoteStepRunner(runner RemoteStepRunner) {
 }
 
 func (e *Executor) executeRemoteStep(ctx context.Context, request RemoteStepRequest, runHead *string) (*StepOutcome, error) {
+	if request.Fixing && request.RecoveryJobID == "" && e.ownerFixesOnly() {
+		return nil, errors.New(ownerFixesOnlyRepairError)
+	}
 	if e.remoteSteps == nil {
 		return nil, errors.New("remote step runner is not configured")
 	}

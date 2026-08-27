@@ -146,7 +146,12 @@ type GlobalConfig struct {
 	// fixes it certifies. Default true; set
 	// session_reuse: false to force every invocation cold.
 	SessionReuse bool `yaml:"-"`
-	AutoFix      AutoFixRaw
+	// OwnerFixesOnly keeps validation, review, test, lint, push, PR, and CI
+	// progression in no-mistakes while reserving every finding-driven follow-up
+	// repair for the calling agent. It is global-only: a pushed branch cannot
+	// consume the shared repair lane by changing repository config.
+	OwnerFixesOnly bool `yaml:"-"`
+	AutoFix        AutoFixRaw
 	// CI is the operator's own CI-step floor. It is the only place the rerun
 	// budget can be set for a repository whose default branch this machine's
 	// user does not control (the common case when contributing to someone
@@ -202,6 +207,10 @@ type AzureWorkerConfig struct {
 	LeaseDuration     time.Duration
 	HeartbeatInterval time.Duration
 	Timeout           time.Duration
+	// OwnerFixesOnly is copied from the global policy and is not independently
+	// configurable inside azure_worker. Recovery may finish an already durable
+	// repair, but a new repair job is refused before enqueue.
+	OwnerFixesOnly bool
 }
 
 type azureWorkerRaw struct {
@@ -236,6 +245,7 @@ type globalConfigRaw struct {
 	TestAgentTimeout        string                     `yaml:"test_agent_timeout"`
 	LogLevel                string                     `yaml:"log_level"`
 	SessionReuse            *bool                      `yaml:"session_reuse"`
+	OwnerFixesOnly          bool                       `yaml:"owner_fixes_only"`
 	AutoFix                 AutoFixRaw                 `yaml:"auto_fix"`
 	CI                      CIRaw                      `yaml:"ci"`
 	Commit                  CommitRaw                  `yaml:"commit"`
@@ -545,6 +555,7 @@ type Config struct {
 	TestAgentTimeout      time.Duration
 	LogLevel              string
 	SessionReuse          bool
+	OwnerFixesOnly        bool
 	Eval                  Eval
 	Coordinator           Coordinator
 	AzureWorker           AzureWorkerConfig
@@ -790,6 +801,11 @@ forgejo_axi_path: forgejo-axi
 # acp_registry_overrides:
 #   local-gemini: node /opt/mock-acp-agent.mjs
 #   cursor: cursor-agent acp
+
+# Keep finding-driven follow-up repairs with the calling agent. Validation still
+# runs normally, but --yes, AXI fix responses, auto-fix loops, and new Azure
+# repair jobs are refused. Existing durable Azure repair jobs may finish recovery.
+owner_fixes_only: false
 
 # Maximum time the CI monitor babysits an open PR with no base-branch movement
 # before giving up. The monitor watches CI and auto-rebases when the base branch
@@ -1930,6 +1946,7 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	if raw.SessionReuse != nil {
 		cfg.SessionReuse = *raw.SessionReuse
 	}
+	cfg.OwnerFixesOnly = raw.OwnerFixesOnly
 	if raw.AutoFix.CI == nil {
 		raw.AutoFix.CI = raw.AutoFix.Babysit
 	}
@@ -1945,6 +1962,7 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 		return nil, err
 	}
 	cfg.AzureWorker = azureWorker
+	cfg.AzureWorker.OwnerFixesOnly = cfg.OwnerFixesOnly
 
 	return cfg, nil
 }
@@ -2597,6 +2615,9 @@ func applyAutoFixOverrides(dst *AutoFix, src *AutoFixRaw) {
 // AutoFixLimit returns the max auto-fix attempts for a given step.
 // Steps without auto-fix support return 0.
 func (c *Config) AutoFixLimit(step types.StepName) int {
+	if c == nil || c.OwnerFixesOnly {
+		return 0
+	}
 	switch step {
 	case types.StepLint:
 		return c.AutoFix.Lint
@@ -2622,6 +2643,9 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 	af := autoFixDefaults()
 	applyAutoFixOverrides(&af, &global.AutoFix)
 	applyAutoFixOverrides(&af, &repo.AutoFix)
+	if global.OwnerFixesOnly {
+		af = AutoFix{}
+	}
 
 	ci := ciDefaults()
 	// The operator's global value is a machine-wide floor they can always set;
@@ -2667,6 +2691,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		TestAgentTimeout:     global.TestAgentTimeout,
 		LogLevel:             global.LogLevel,
 		SessionReuse:         global.SessionReuse,
+		OwnerFixesOnly:       global.OwnerFixesOnly,
 		// Eval is global-only by design (see GlobalConfig.Eval), so it is
 		// copied straight through with no repository override step.
 		Eval:           global.Eval,

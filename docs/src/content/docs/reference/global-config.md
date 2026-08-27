@@ -62,6 +62,8 @@ log_level: info
 
 session_reuse: true
 
+owner_fixes_only: false
+
 worktree_roots:
   /Users/you/src/my-repo: /Users/you/work/my-repo-runs
 
@@ -470,6 +472,21 @@ When resume is unavailable or fails, the fix turn falls back to a cold run or a 
 Session identities are persisted only as minimum local resume metadata, never as prompts or transcripts; Pi's own session directory retains its native transcript. Keep Pi's session directory private, and keep any `--session-dir` or `PI_CODING_AGENT_SESSION_DIR` setting stable while a run is active so a daemon restart can find the fixer session.
 The [daemon crash-recovery reference](/no-mistakes/concepts/daemon/#crash-recovery) owns which parked gates can resume or reconcile after a restart.
 Set `false` to force every agent invocation cold.
+
+### owner_fixes_only
+
+Reserve finding-driven follow-up repairs for the calling agent while keeping the validation pipeline active.
+
+|         |         |
+| ------- | ------- |
+| Type    | `bool`  |
+| Default | `false` |
+
+When `true`, findings park with their evidence instead of starting a local or Azure repair. All per-step `auto_fix` limits resolve to zero, `axi run --yes`, `axi respond --yes`, and `axi respond --action fix` fail with a custody instruction, and the Azure controller refuses new repair jobs before enqueue. Read-only review and test jobs still use the configured Azure lanes, and clean steps continue normally.
+
+An already durable Azure repair may finish during restart recovery so enabling the policy does not strand work already in custody. The setting is global-only; repository config cannot weaken it.
+
+To act on a real finding, abort the parked run, make and commit the fix in the calling agent's source worktree, then start a fresh exact-head validation run. Follow any custody-recovery command printed by `axi abort` before editing if the pipeline had already advanced the branch head.
 
 ### worktree_roots
 

@@ -48,6 +48,30 @@ azure_worker:
 	}
 }
 
+func TestLoadGlobalOwnerFixesOnlyDisablesNewAzureRepairs(t *testing.T) {
+	cfg, err := LoadGlobalFromBytes([]byte(`
+agent: auto
+owner_fixes_only: true
+azure_worker:
+  enabled: true
+  runner_path: /opt/firstmate/bin/fm-no-mistakes-worker
+  config_path: /etc/firstmate/no-mistakes-worker.yaml
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.OwnerFixesOnly {
+		t.Fatal("owner_fixes_only was not loaded")
+	}
+	if !cfg.AzureWorker.OwnerFixesOnly {
+		t.Fatal("Azure worker did not inherit owner-fixes-only admission policy")
+	}
+	merged := Merge(cfg, &RepoConfig{})
+	if !merged.OwnerFixesOnly || !merged.AzureWorker.OwnerFixesOnly {
+		t.Fatalf("merged owner-fixes-only policy = %+v", merged)
+	}
+}
+
 func TestLoadGlobalAzureWorkerRejectsUnsafeOrUnboundedConfig(t *testing.T) {
 	tests := []string{
 		"enabled: true\n  runner_path: relative\n  config_path: /tmp/config\n",
