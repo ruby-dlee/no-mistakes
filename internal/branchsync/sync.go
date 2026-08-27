@@ -567,6 +567,19 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 	}
 	state, run, _ := s.inspect(ctx)
 	if run != nil && run.CustodyReturnedAt != nil {
+		// Older recovery builds could adopt a rebased pipeline head and stamp
+		// custody while leaving the private intake branch at the submitted
+		// commit. A fresh push is then correctly rejected as non-fast-forward.
+		// Repair only that exact stale shape; an independently moved gate is not
+		// ours to rewrite after custody has already returned.
+		if strings.TrimSpace(s.GateDir) != "" && run.SubmittedHeadSHA != nil && state.Local.Head != "" {
+			gateHead, err := git.Run(ctx, s.GateDir, "rev-parse", "refs/heads/"+state.Local.Branch+"^{commit}")
+			if err == nil && gateHead == *run.SubmittedHeadSHA && gateHead != state.Local.Head {
+				repaired := s.recoverKeepLocal(ctx, run, state, gateHead)
+				repaired.Changed = false
+				return repaired
+			}
+		}
 		state.Recovered = true
 		state.Changed = false
 		return state
@@ -636,7 +649,7 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 				return blockedPlan(state, StatePipelineOwned, "blocked_recover_anchor_mismatch", "the run recovery ref in the local gate conflicts with the recorded pipeline head; inspect both objects before returning custody; no files or refs were changed")
 			}
 		}
-		return s.finishRecover(ctx, run, false)
+		return s.finishRecoverFollowingGate(ctx, run, state, false)
 	}
 
 	if !gateAvailable {
@@ -684,7 +697,7 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 	case local == preserved, isAncestor(ctx, wd, preserved, local):
 		// Equal or ahead, discovered only after anchoring made the preserved
 		// head comparable locally.
-		return s.finishRecover(ctx, run, false)
+		return s.finishRecoverFollowingGate(ctx, run, state, false)
 	case isAncestor(ctx, wd, local, preserved):
 		if keepLocal {
 			gateHead, err := git.Run(ctx, gateDir, "rev-parse", "refs/heads/"+branch+"^{commit}")
@@ -808,7 +821,7 @@ func (s *Service) recoverFastForward(ctx context.Context, run *db.Run, state Sta
 		state.NextAction = &NextAction{Code: "inspect_worktree", Command: "git status"}
 		return state
 	}
-	return s.finishRecover(ctx, run, true)
+	return s.finishRecoverFollowingGate(ctx, run, state, true)
 }
 
 // preservedContainsLocalWork proves the preserved pipeline head already carries
@@ -970,7 +983,33 @@ func (s *Service) recoverAdoptPreserved(ctx context.Context, run *db.Run, state 
 		state.NextAction = &NextAction{Code: "inspect_worktree", Command: "git status"}
 		return state
 	}
-	return s.finishRecover(ctx, run, true)
+	return s.finishRecoverFollowingGate(ctx, run, state, true)
+}
+
+// finishRecoverFollowingGate makes successful custody return immediately
+// usable by the ordinary intake path. The gate-side fetch and compare-and-swap
+// are the same no-hook, fail-closed mechanism used by explicit keep-local
+// recovery; a concurrently moved gate wins, and its prior head is preserved.
+func (s *Service) finishRecoverFollowingGate(ctx context.Context, run *db.Run, state State, changed bool) State {
+	if strings.TrimSpace(s.GateDir) == "" {
+		return s.finishRecover(ctx, run, changed)
+	}
+	gateHead, err := git.Run(ctx, s.GateDir, "rev-parse", "refs/heads/"+state.Local.Branch+"^{commit}")
+	if err != nil {
+		// Equal/ahead recovery has always remained available without a readable
+		// gate. Preserve that contract; a missing branch can be created by the
+		// next ordinary intake.
+		return s.finishRecover(ctx, run, changed)
+	}
+	if gateHead != state.Local.Head && (run.SubmittedHeadSHA == nil || gateHead != *run.SubmittedHeadSHA) {
+		// A gate head that moved independently after submission may represent
+		// newer work. Preserve the existing recovery contract: default recovery
+		// never rewrites it. Only the exact stale submitted ref is normalized.
+		return s.finishRecover(ctx, run, changed)
+	}
+	recovered := s.recoverKeepLocal(ctx, run, state, gateHead)
+	recovered.Changed = changed
+	return recovered
 }
 
 func (s *Service) anchorReachablePreserved(ctx context.Context, state State, runID, preserved string) (State, bool) {
