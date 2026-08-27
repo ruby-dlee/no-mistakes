@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -156,6 +157,44 @@ func TestExecutor_AutoFixDisabledWithZero(t *testing.T) {
 	}
 
 	exec.Respond(types.StepReview, types.ActionApprove, nil)
+	waitExecutorDone(t, done)
+}
+
+func TestExecutor_OwnerFixesOnlyParksAndRefusesRepair(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+	cfg := &config.Config{
+		OwnerFixesOnly: true,
+		AutoFix:        config.AutoFix{Review: 3},
+	}
+
+	callCount := 0
+	step := &adaptiveCallStep{
+		name: types.StepReview,
+		fn: func(sctx *StepContext) (*StepOutcome, error) {
+			callCount++
+			return &StepOutcome{
+				NeedsApproval: true,
+				AutoFixable:   true,
+				Findings:      `{"findings":[{"id":"review-1","severity":"error","description":"bug","action":"auto-fix"}],"summary":"1 issue"}`,
+			}, nil
+		},
+	}
+
+	exec := NewExecutor(database, p, cfg, nil, []Step{step}, nil)
+	done, _ := startExecutor(t, exec, run, repo, workDir)
+	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
+
+	if callCount != 1 {
+		t.Fatalf("owner-fixes-only review calls = %d, want 1 with no repair round", callCount)
+	}
+	if err := exec.Respond(types.StepReview, types.ActionFix, []string{"review-1"}); err == nil || !strings.Contains(err.Error(), "owner_fixes_only") {
+		t.Fatalf("owner-fixes-only fix response error = %v", err)
+	}
+	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
+	if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+		t.Fatal(err)
+	}
 	waitExecutorDone(t, done)
 }
 

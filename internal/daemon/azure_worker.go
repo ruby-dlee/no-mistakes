@@ -22,15 +22,16 @@ import (
 )
 
 type azureWorkerRuntime struct {
-	database    *db.DB
-	store       *workertransport.DurableStore
-	service     *workertransport.Service
-	wake        map[db.PipelineJobKind]chan struct{}
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-	start       sync.Once
-	close       sync.Once
-	concurrency map[db.PipelineJobKind]int
+	database       *db.DB
+	store          *workertransport.DurableStore
+	service        *workertransport.Service
+	wake           map[db.PipelineJobKind]chan struct{}
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	start          sync.Once
+	close          sync.Once
+	concurrency    map[db.PipelineJobKind]int
+	ownerFixesOnly bool
 }
 
 type azureRemoteRecovery struct {
@@ -73,6 +74,7 @@ func newAzureWorkerRuntime(cfg config.AzureWorkerConfig, database *db.DB, p *pat
 	}
 	return &azureWorkerRuntime{
 		database: database, store: store, service: service,
+		ownerFixesOnly: cfg.OwnerFixesOnly,
 		concurrency: map[db.PipelineJobKind]int{
 			db.PipelineJobReview: reviewConcurrency,
 			db.PipelineJobRepair: repairConcurrency,
@@ -144,6 +146,9 @@ func (r *azureWorkerRuntime) Close() {
 }
 
 func (r *azureWorkerRuntime) ExecuteRemoteStep(ctx context.Context, request pipeline.RemoteStepRequest) (*pipeline.RemoteStepExecution, error) {
+	if r != nil && r.ownerFixesOnly && request.Fixing && request.RecoveryJobID == "" {
+		return nil, errors.New("owner_fixes_only is enabled: Azure refuses new repair jobs; the calling agent owns the fix")
+	}
 	if r == nil || r.service == nil {
 		return nil, errors.New("Azure worker runtime is unavailable")
 	}
@@ -283,6 +288,9 @@ func resolveAzureWorkerBaseSHA(ctx context.Context, request pipeline.RemoteStepR
 }
 
 func (r *azureWorkerRuntime) enqueueRemoteStep(request pipeline.RemoteStepRequest, kind db.PipelineJobKind) (*db.PipelineJob, error) {
+	if r.ownerFixesOnly && kind == db.PipelineJobRepair {
+		return nil, errors.New("owner_fixes_only is enabled: Azure refuses new repair jobs; the calling agent owns the fix")
+	}
 	inputBytes, err := json.Marshal(workertransport.StepInputEnvelope{
 		Schema: workertransport.StepInputSchema, RunID: request.RunID, RepoID: request.RepoID,
 		StepResultID: request.StepResultID, Step: request.Step, Round: request.Round,

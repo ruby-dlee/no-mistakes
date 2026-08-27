@@ -114,6 +114,10 @@ func runAxiRunProtected(cmd *cobra.Command, autoYes bool, skipSteps []types.Step
 		return emitError(cmd, 1, err.Error(), repoInitHelp(err)...)
 	}
 	defer env.close()
+	if autoYes && env.cfg != nil && env.cfg.OwnerFixesOnly {
+		return emitError(cmd, 2, "--yes is disabled by owner_fixes_only because it can request pipeline repairs",
+			"Run without `--yes`; when findings are returned, abort the run, fix them in this worktree, commit, and start a fresh validation run")
+	}
 
 	branch, err := git.CurrentBranch(ctx, ".")
 	if err != nil {
@@ -798,6 +802,16 @@ func runAxiRespond(cmd *cobra.Command, ra respondArgs) error {
 		return emitError(cmd, 1, err.Error(), repoInitHelp(err)...)
 	}
 	defer env.close()
+	if env.cfg != nil && env.cfg.OwnerFixesOnly {
+		if ra.autoYes {
+			return emitError(cmd, 2, "--yes is disabled by owner_fixes_only because it can request pipeline repairs",
+				"Continue one gate at a time; the calling agent owns every code change")
+		}
+		if act == types.ActionFix {
+			return emitError(cmd, 2, "--action fix is disabled by owner_fixes_only",
+				"Abort the run, fix the reported findings in this worktree, commit, and start a fresh validation run")
+		}
+	}
 	branch, err := git.CurrentBranch(ctx, ".")
 	if err != nil {
 		return emitError(cmd, 1, fmt.Sprintf("get current branch: %v", err))

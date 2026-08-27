@@ -135,6 +135,26 @@ func TestAzureWorkerRuntimeExecutesOneExactReviewThroughWrapper(t *testing.T) {
 	t.Fatal("Azure worker review did not complete")
 }
 
+func TestAzureWorkerOwnerFixesOnlyRejectsNewRepairBeforeEnqueue(t *testing.T) {
+	runtime := &azureWorkerRuntime{ownerFixesOnly: true}
+	_, err := runtime.ExecuteRemoteStep(context.Background(), pipeline.RemoteStepRequest{
+		Step: types.StepReview, Fixing: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "owner_fixes_only") {
+		t.Fatalf("owner-fixes-only Azure repair error = %v", err)
+	}
+}
+
+func TestAzureWorkerOwnerFixesOnlyDoesNotRejectDurableRepairRecovery(t *testing.T) {
+	runtime := &azureWorkerRuntime{ownerFixesOnly: true}
+	_, err := runtime.ExecuteRemoteStep(context.Background(), pipeline.RemoteStepRequest{
+		Step: types.StepReview, Fixing: true, RecoveryJobID: "repair-existing",
+	})
+	if err == nil || strings.Contains(err.Error(), "owner_fixes_only") {
+		t.Fatalf("durable Azure repair recovery was rejected by policy: %v", err)
+	}
+}
+
 func TestAzureWorkerRestart_ReattachesQueuedJob(t *testing.T) {
 	t.Setenv("NM_DEMO", "1")
 	p := paths.WithRoot(t.TempDir())

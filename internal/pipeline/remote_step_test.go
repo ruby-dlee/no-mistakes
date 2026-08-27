@@ -2,12 +2,14 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -16,6 +18,47 @@ type remoteStepRunnerFunc func(context.Context, RemoteStepRequest) (*RemoteStepE
 
 func (f remoteStepRunnerFunc) ExecuteRemoteStep(ctx context.Context, request RemoteStepRequest) (*RemoteStepExecution, error) {
 	return f(ctx, request)
+}
+
+func TestExecuteRemoteStep_OwnerFixesOnlyRejectsRepairBeforeAdmission(t *testing.T) {
+	database, p, _, _ := setupTest(t)
+	calls := 0
+	exec := NewExecutor(database, p, &config.Config{OwnerFixesOnly: true}, nil, nil, nil)
+	exec.SetRemoteStepRunner(remoteStepRunnerFunc(func(context.Context, RemoteStepRequest) (*RemoteStepExecution, error) {
+		calls++
+		return nil, errors.New("repair should not have reached the remote runner")
+	}))
+	head := strings.Repeat("a", 40)
+	_, err := exec.executeRemoteStep(context.Background(), RemoteStepRequest{
+		RunID: "run-1", Step: types.StepReview, Fixing: true, DesiredHeadSHA: head,
+	}, &head)
+	if err == nil || !strings.Contains(err.Error(), "owner_fixes_only") {
+		t.Fatalf("owner-fixes-only remote repair error = %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("remote repair admissions = %d, want 0", calls)
+	}
+}
+
+func TestExecuteRemoteStep_OwnerFixesOnlyAllowsDurableRepairRecovery(t *testing.T) {
+	database, p, _, _ := setupTest(t)
+	calls := 0
+	exec := NewExecutor(database, p, &config.Config{OwnerFixesOnly: true}, nil, nil, nil)
+	exec.SetRemoteStepRunner(remoteStepRunnerFunc(func(context.Context, RemoteStepRequest) (*RemoteStepExecution, error) {
+		calls++
+		return nil, errors.New("durable recovery reached remote runner")
+	}))
+	head := strings.Repeat("a", 40)
+	_, err := exec.executeRemoteStep(context.Background(), RemoteStepRequest{
+		RunID: "run-1", Step: types.StepReview, Fixing: true, DesiredHeadSHA: head,
+		RecoveryJobID: "repair-existing",
+	}, &head)
+	if err == nil || !strings.Contains(err.Error(), "durable recovery reached") {
+		t.Fatalf("durable recovery error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("durable recovery admissions = %d, want 1", calls)
+	}
 }
 
 func TestExecutorUsesRemoteReviewAndPreservesSemanticFinding(t *testing.T) {
