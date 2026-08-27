@@ -8,11 +8,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	gitpkg "github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -176,6 +178,11 @@ func (r *azureWorkerRuntime) ExecuteRemoteStep(ctx context.Context, request pipe
 			return nil, err
 		}
 	} else {
+		baseSHA, resolveErr := resolveAzureWorkerBaseSHA(ctx, request)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		request.BaseSHA = baseSHA
 		var err error
 		job, err = r.enqueueRemoteStep(request, kind)
 		if err != nil {
@@ -249,6 +256,30 @@ func (r *azureWorkerRuntime) ExecuteRemoteStep(ctx context.Context, request pipe
 		case <-ticker.C:
 		}
 	}
+}
+
+func resolveAzureWorkerBaseSHA(ctx context.Context, request pipeline.RemoteStepRequest) (string, error) {
+	if request.WorkDir == "" {
+		return "", errors.New("Azure worker request is missing its source worktree")
+	}
+	if defaultBranch := strings.TrimSpace(request.DefaultBranch); defaultBranch != "" {
+		for _, ref := range []string{"origin/" + defaultBranch, defaultBranch} {
+			baseSHA, err := gitpkg.Run(ctx, request.WorkDir, "merge-base", request.DesiredHeadSHA, ref)
+			if err == nil && baseSHA != "" {
+				return baseSHA, nil
+			}
+		}
+	}
+	if gitpkg.IsZeroSHA(request.BaseSHA) {
+		return "", errors.New("Azure worker could not resolve a commit base for the new branch")
+	}
+	if _, err := gitpkg.Run(ctx, request.WorkDir, "cat-file", "-e", request.BaseSHA+"^{commit}"); err != nil {
+		return "", errors.New("Azure worker fallback base commit is unavailable")
+	}
+	if _, err := gitpkg.Run(ctx, request.WorkDir, "merge-base", "--is-ancestor", request.BaseSHA, request.DesiredHeadSHA); err != nil {
+		return "", errors.New("Azure worker fallback base is not an ancestor of the exact head")
+	}
+	return request.BaseSHA, nil
 }
 
 func (r *azureWorkerRuntime) enqueueRemoteStep(request pipeline.RemoteStepRequest, kind db.PipelineJobKind) (*db.PipelineJob, error) {
