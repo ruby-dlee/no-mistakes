@@ -34,7 +34,7 @@ func TestAzureWorkerRuntimeExecutesOneExactReviewThroughWrapper(t *testing.T) {
 	}
 	t.Cleanup(func() { database.Close() })
 	repoDir := filepath.Join(t.TempDir(), "repo")
-	azureWorkerGit(t, "", "init", "-q", repoDir)
+	azureWorkerGit(t, "", "init", "-q", "--initial-branch=main", repoDir)
 	azureWorkerGit(t, repoDir, "config", "user.email", "worker@example.invalid")
 	azureWorkerGit(t, repoDir, "config", "user.name", "Worker Test")
 	if err := os.WriteFile(filepath.Join(repoDir, "source.txt"), []byte("source\n"), 0o600); err != nil {
@@ -42,6 +42,13 @@ func TestAzureWorkerRuntimeExecutesOneExactReviewThroughWrapper(t *testing.T) {
 	}
 	azureWorkerGit(t, repoDir, "add", "source.txt")
 	azureWorkerGit(t, repoDir, "commit", "-qm", "source")
+	base := azureWorkerGit(t, repoDir, "rev-parse", "HEAD")
+	azureWorkerGit(t, repoDir, "checkout", "-qb", "feature/runtime")
+	if err := os.WriteFile(filepath.Join(repoDir, "source.txt"), []byte("source\nfeature\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	azureWorkerGit(t, repoDir, "add", "source.txt")
+	azureWorkerGit(t, repoDir, "commit", "-qm", "feature")
 	head := azureWorkerGit(t, repoDir, "rev-parse", "HEAD")
 	repository, err := database.InsertRepo(repoDir, "https://example.invalid/runtime.git", "main")
 	if err != nil {
@@ -58,7 +65,7 @@ func TestAzureWorkerRuntimeExecutesOneExactReviewThroughWrapper(t *testing.T) {
 
 	runner := filepath.Join(t.TempDir(), "fm-no-mistakes-worker")
 	quotedSelf := "'" + strings.ReplaceAll(os.Args[0], "'", "'\\''") + "'"
-	if err := os.WriteFile(runner, []byte("#!/bin/sh\nexec "+quotedSelf+" -test.run=^TestFakeAzureWorkerWrapperProcess$ -- \"$@\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\nAZURE_WORKER_EXPECT_BASE="+base+" exec "+quotedSelf+" -test.run=^TestFakeAzureWorkerWrapperProcess$ -- \"$@\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	wrapperConfig := filepath.Join(t.TempDir(), "wrapper.json")
@@ -327,6 +334,13 @@ func TestFakeAzureWorkerWrapperProcess(t *testing.T) {
 	}
 	var request workertransport.Request
 	azureWorkerReadJSON(t, value("--request"), &request)
+	if expectedBase := os.Getenv("AZURE_WORKER_EXPECT_BASE"); expectedBase != "" {
+		var input workertransport.StepInputEnvelope
+		azureWorkerReadJSON(t, filepath.Join(value("--payload"), "brief.md"), &input)
+		if input.BaseSHA != expectedBase {
+			t.Fatalf("worker base = %q, want resolved branch base %q", input.BaseSHA, expectedBase)
+		}
+	}
 	outcome := workertransport.StepOutcomeEnvelope{
 		Schema: workertransport.StepOutcomeSchema, Step: workertransport.StepOutcomeReview,
 		ReviewApprovedHeadSHA: request.DesiredHeadSHA,
