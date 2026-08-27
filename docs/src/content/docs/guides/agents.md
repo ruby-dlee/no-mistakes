@@ -182,6 +182,8 @@ A `branch_sync.state` of `user_owned` means the run went terminal before changin
 When `next_action.code` is `continue_active_run`, run the reported command and keep driving the active run.
 If synchronization is blocked, process that state instead of improvising reset, stash, merge, rebase, force, or branch replacement.
 Then commit follow-up work on top so every pipeline fix commit remains in the branch.
+Outside the explicit `owner_fixes_only` caller-repair path, never abort-and-restart, reset, or replace the branch in a way that drops prior gate-fix commits.
+When `owner_fixes_only` refuses a repair, abort the parked run, follow any printed custody-recovery action, fix and commit in the source worktree, and start a fresh run without `--yes`.
 
 The full driving protocol - how to read the home view and `gate:` objects, when to respond, fix, approve, or relay `ask-user` findings, and how to interpret `axi status` fields like `awaiting_agent` and `active_steps` - is owned by the skill itself and by the live `axi` output.
 Each `axi` response carries version-matched `help` lines for its state, and `no-mistakes axi run --help` and `no-mistakes axi respond --help` describe the loop authoritatively for the installed binary, so agents driving a gate never need this page open.

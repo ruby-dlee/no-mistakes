@@ -192,15 +192,12 @@ Run the pipeline and decide on its findings as they come up:
    # skip this step
    no-mistakes axi respond --action skip
    ```
-   While a run is active, never fix findings by editing the code yourself -
-   the pipeline owns both the findings and the fixes. Your job at a gate is to
-   decide and respond; `--action fix` has the pipeline apply the fix and
-   re-review the result. For the same reason, while a run is active do **not**
-   `abort` or `rerun` to go fix a finding yourself - even a real bug in
-   your own code - because that discards the pipeline's in-flight work and
-   forces a full re-validation. `abort` and `rerun` are for *between*
-   runs (after a `failed` or `cancelled` outcome), never to circumvent a
-   gate.
+   Normally, while a run is active, never fix findings by editing the code
+   yourself: use `--action fix` so the pipeline preserves and re-checks its
+   work. When global `owner_fixes_only` explicitly refuses `--action fix`, this
+   is the supported exception: run `no-mistakes axi abort`, follow any printed
+   custody-recovery action, fix and commit in the source worktree, then start a
+   fresh validation run without `--yes`.
 
     Each `respond` blocks until the next `gate:`, `checks-passed` decision point, or final outcome.
 
@@ -337,7 +334,7 @@ help[6]:
   Run `no-mistakes axi respond --action skip` to skip this step
   Run `no-mistakes axi logs --step review --full` to read the full step log
   A long-running call is working, not stalled - background it if your harness needs to, but the run never advances past a gate on its own. Read every return; on a `gate:`, respond; loop until an `outcome:`.
-  Commit post-pipeline follow-up work on top of the existing branch so every pipeline fix commit remains present. Never abort-and-restart, reset, or replace the branch in a way that drops prior gate-fix commits.
+  Commit post-pipeline follow-up work on top of the existing branch so every pipeline fix commit remains present. Outside the explicit owner_fixes_only caller-repair path, never abort-and-restart, reset, or replace the branch in a way that drops prior gate-fix commits.
 ```
 
 Read the `action` column per row: decide `r1` (auto-fix) on your own

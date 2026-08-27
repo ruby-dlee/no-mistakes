@@ -33,6 +33,13 @@ var canonicalPreserveGateFixPhrases = []string{
 	"every pipeline fix commit",
 }
 
+var canonicalOwnerFixesOnlyRepairPhrases = []string{
+	"owner_fixes_only",
+	"abort",
+	"custody-recovery",
+	"fresh",
+}
+
 var canonicalBranchSyncPhrases = []string{
 	"branch_sync",
 	"no-mistakes axi sync",
@@ -122,6 +129,21 @@ func TestPreserveGateFixGuidance_SyncedAcrossSurfaces(t *testing.T) {
 		for _, phrase := range canonicalPreserveGateFixPhrases {
 			if !strings.Contains(content, phrase) {
 				t.Errorf("%s is missing the canonical preserve-gate-fix guidance phrase %q", name, phrase)
+			}
+		}
+	}
+}
+
+func TestOwnerFixesOnlyRepairGuidance_SyncedAcrossSurfaces(t *testing.T) {
+	surfaces := map[string]string{
+		"skill body":     skill.Markdown(),
+		"agents guide":   readAgentsGuide(t),
+		"axi abort help": newAxiAbortCmd().Long,
+	}
+	for name, content := range surfaces {
+		for _, phrase := range canonicalOwnerFixesOnlyRepairPhrases {
+			if !strings.Contains(content, phrase) {
+				t.Errorf("%s is missing owner-fixes-only repair guidance phrase %q", name, phrase)
 			}
 		}
 	}
