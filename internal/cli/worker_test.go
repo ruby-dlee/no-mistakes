@@ -169,6 +169,26 @@ func TestWorkerRunTestFindingSurvivesClosedOutcome(t *testing.T) {
 	}
 }
 
+func TestWorkerRunConfiguredTestFailureSurvivesClosedOutcome(t *testing.T) {
+	h := newWorkerHarness(t, true, "")
+	h.writeBrief(t, types.StepTest, false, "")
+	ag := &workerScriptAgent{runs: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+		t.Fatal("a failed configured test must return its failure without launching the evidence agent")
+		return nil, nil
+	}}
+	if err := runWorkerCommand(t, h, "test", ag); err != nil {
+		t.Fatal(err)
+	}
+	out := readWorkerOutcome(t, h.result)
+	findings, err := types.ParseFindingsJSON(out.FindingsJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.NeedsApproval || out.ExitCode == 0 || len(findings.Items) != 1 || findings.Items[0].Action != types.ActionAutoFix {
+		t.Fatalf("outcome = %+v findings = %+v", out, findings)
+	}
+}
+
 func TestWorkerRunReviewRepairCommitsDescendantAndRereviews(t *testing.T) {
 	h := newWorkerHarness(t, true, "")
 	previous := `{"findings":[{"severity":"warning","description":"bad value","action":"auto-fix","review_scope":"source","semantic_family":"local-mechanical","semantic_root":"value"}],"risk_level":"medium","risk_rationale":"bad","risk_scope":"source-or-external"}`
