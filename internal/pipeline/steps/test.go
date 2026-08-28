@@ -111,6 +111,7 @@ Previous test findings to address:
 			findings := Findings{
 				Items: []Finding{{
 					Severity:    "error",
+					Action:      types.ActionAutoFix,
 					Description: fmt.Sprintf("tests failed with exit code %d", exitCode),
 				}},
 				Summary: projectedOutput,
